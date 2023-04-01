@@ -1,0 +1,7 @@
+# Distributed MobilityDB Extension
+comment = 'Distributed Spatial and Spatiotemporal Database'
+default_version = '1.0'
+module_pathname = '$libdir/distributed_mobilitydb-1.0'
+relocatable = false
+# schema = public
+requires = 'postgis,mobilitydb,citus'

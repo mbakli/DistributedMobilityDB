@@ -1,0 +1,1 @@
+add_library(executor OBJECT spatiotemporal_executor.c)
