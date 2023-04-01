@@ -1,0 +1,3 @@
+comment = 'Distributed Spatial and Spatiotemporal Data Management in PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/distributed_mobilitydb'
