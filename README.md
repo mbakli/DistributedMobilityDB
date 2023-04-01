@@ -58,7 +58,14 @@ CREATE TABLE planet_osm_polygon (
 );
 
 -- Distribute the planet_osm_polygon table into 50 tiles using the spatial column: geometry(polygon)
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, table_name_out=>'planet_osm_point_50t', partitioning_method => 'crange');
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, table_name_out=>'planet_osm_polygon_50t', partitioning_method => 'crange');
+
+-- Distance Query: Find buildings that are built within 1km of the primary highways.
+SELECT distinct t1.name
+FROM planet_osm_polygon_50t t1, planet_osm_roads_30t t2
+WHERE t1.building = 'yes'
+  AND t2.highway = 'primary'
+  AND ST_dwithin(t1.way,t2.way, 1000);
 ```
 ### AIS Trajectory Data
 
@@ -71,10 +78,10 @@ CREATE TABLE ships (
 
 -- Distribute the ships table into 50 tiles using the spatiotemporal column: tgeompoint(sequence)
 -- Spatiotemporal tiling
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, table_name_out=>'planet_osm_point_50t', partitioning_method => 'crange', partitioning_type =>'spatiotemporal');
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, table_name_out=>'ships_50t', partitioning_method => 'crange', partitioning_type =>'spatiotemporal');
 -- Spatial tiling
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, table_name_out=>'planet_osm_point_50t', partitioning_method => 'crange', partitioning_type =>'spatial');
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, table_name_out=>'ships_50t', partitioning_method => 'crange', partitioning_type =>'spatial');
 -- Temporal tiling
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, table_name_out=>'planet_osm_point_50t', partitioning_method => 'crange', partitioning_type =>'temporal');
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, table_name_out=>'ships_50t', partitioning_method => 'crange', partitioning_type =>'temporal');
 ```
 ### BerlinMOD Benchmark
