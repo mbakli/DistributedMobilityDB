@@ -1,0 +1,4 @@
+#ifndef WORKER_OPERATIONS_H
+#define WORKER_OPERATIONS_H
+
+#endif /* WORKER_OPERATIONS_H */
