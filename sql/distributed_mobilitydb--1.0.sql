@@ -12,9 +12,34 @@ CREATE TYPE dist_mobilitydb.spatiotemporal_tiling_method AS ENUM (
     'crange',
     'hierarchical',
     'str',
+    'quadtree',
     'octree'
 );
 
+CREATE TYPE dist_mobilitydb.tiling AS (
+    type text,
+    method text,
+    numTiles int,
+    groupCol text,
+    isMobilityDB boolean,
+    disjointTiles boolean,
+    internalType text,
+    distColType text,
+    tileKey text,
+    granularity text,
+    segmentation boolean,
+    srid int,
+    distCol text
+);
+
+-- The other variables will be added during the execution of some tasks
+CREATE TYPE dist_mobilitydb.tileSize AS (
+    numShapes int,
+    numPoints  int
+    );
+
+ALTER TYPE dist_mobilitydb.tileSize
+SET SCHEMA pg_catalog;
 ---------------------------------------------------------------------------------
 -- Catalog Tables
 ---------------------------------------------------------------------------------
@@ -27,7 +52,7 @@ CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_tables(
     distcol varchar(20),
     distcoltype varchar(10),
     tilekey varchar(10),
-    trajectorySegmented boolean
+    shapeSegmented boolean
 );
 
 ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_tables
@@ -86,4 +111,6 @@ CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions(
     final text default NULL
 );
 ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions
+SET SCHEMA pg_catalog;
+ALTER TYPE dist_mobilitydb.tiling
 SET SCHEMA pg_catalog;
