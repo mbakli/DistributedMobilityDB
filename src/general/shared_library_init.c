@@ -4,7 +4,7 @@
 #include "commands/explain.h"
 #include "planner/spatiotemporal_planner.h"
 #include "planner/spatiotemporal_explain.h"
-
+PG_MODULE_MAGIC;
 
 /* shared library initialization function */
 void
