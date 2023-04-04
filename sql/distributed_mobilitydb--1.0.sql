@@ -12,8 +12,8 @@ CREATE TYPE dist_mobilitydb.spatiotemporal_tiling_method AS ENUM (
     'crange',
     'hierarchical',
     'str',
-    'octree',
-    'quadtree'
+    'quadtree',
+    'octree'
 );
 
 CREATE TYPE dist_mobilitydb.tiling AS (
@@ -31,23 +31,15 @@ CREATE TYPE dist_mobilitydb.tiling AS (
     srid int,
     distCol text
 );
-ALTER TYPE dist_mobilitydb.tiling SET SCHEMA pg_catalog;
 
-/*
-CREATE TYPE tileSize AS (
-    postgis_extent box2d,
-    mobilitydb_extent stbox,
+-- The other variables will be added during the execution of some tasks
+CREATE TYPE dist_mobilitydb.tileSize AS (
     numShapes int,
     numPoints  int
     );
 
-CREATE TYPE tile_size AS (
-    numShapes int,
-    numPoints  int
-    );
-
- */
-
+ALTER TYPE dist_mobilitydb.tileSize
+SET SCHEMA pg_catalog;
 ---------------------------------------------------------------------------------
 -- Catalog Tables
 ---------------------------------------------------------------------------------
@@ -119,4 +111,6 @@ CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions(
     final text default NULL
 );
 ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions
+SET SCHEMA pg_catalog;
+ALTER TYPE dist_mobilitydb.tiling
 SET SCHEMA pg_catalog;
