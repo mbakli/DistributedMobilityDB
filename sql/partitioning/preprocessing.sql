@@ -45,6 +45,37 @@ BEGIN
 END;
 $$ LANGUAGE 'plpgsql';
 
+CREATE OR REPLACE FUNCTION checkTileSizeCreations()
+    RETURNS boolean AS $$
+BEGIN
+    IF NOT EXISTS (
+            SELECT 1
+            FROM pg_type t
+                     JOIN pg_class c ON c.oid = t.typrelid
+                     JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE t.typname = 'tilesize'
+              AND a.attname = 'postgis_extent'
+        )
+    THEN
+        ALTER TYPE tileSize ADD ATTRIBUTE postgis_extent box2d;
+    END IF;
+    IF NOT EXISTS (
+            SELECT 1
+            FROM pg_type t
+                     JOIN pg_class c ON c.oid = t.typrelid
+                     JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE t.typname = 'tilesize'
+              AND a.attname = 'mobilitydb_extent'
+        )
+    THEN
+        ALTER TYPE tileSize ADD ATTRIBUTE mobilitydb_extent stbox;
+    END IF;
+
+    return true;
+END;
+$$ LANGUAGE 'plpgsql';
+
+
 CREATE OR REPLACE FUNCTION getCoordinateSystem(table_name_in text, spatiotemporal_col_name text, mobilitydb_type boolean)
     RETURNS int AS $$
 DECLARE
