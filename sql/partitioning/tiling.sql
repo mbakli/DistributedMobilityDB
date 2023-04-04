@@ -25,6 +25,7 @@ DECLARE
     temp text;
     tiling tiling;
 BEGIN
+    PERFORM checkTileSizeCreations();
     -- Check if the output table exists or not
     EXECUTE format('%s', concat('SELECT to_regclass(''public.', table_name_out, ''')'))
     INTO temp;
