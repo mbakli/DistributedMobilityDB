@@ -51,17 +51,18 @@ include_directories(SYSTEM ${GEOS_INCLUDE_DIR})
 # add the subdirectories that have the C/C++ code
 #-------------------
 include_directories("include")
-add_subdirectory("src")
+add_subdirectory( "src")
 add_subdirectory("sql")
 
 
 
 #set(PROJECT_OBJECTS "$<TARGET_OBJECTS:grid>" src/planning/planner.c include/planning/spatiotemporal_planner.h src/general/shared_library_init.c include/general/shared_library_init.h)
+set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:partitioning>" include/partitioning/tiling_utils.h)
 set(PROJECT_OBJECTS "$<TARGET_OBJECTS:general>")
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:partitioning>")
 set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:executor>" include/executor/spatiotemporal_executor.h)
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:planner>" include/general/metadata_management.h)
-# set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:distributed_functions>")
+set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:planner>" )
+set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:post_processing>" include/post_processing/post_processing.h)
+set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:distributed_functions>")
 
 set(POSTGRESQL_DYNLIB_DIR /usr/local/pgsql/lib)
 set(POSTGRESQL_SHARE_DIR /usr/local/pgsql/share)

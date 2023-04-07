@@ -1,4 +1,11 @@
-set(spatiotemporal_planner.c spatiotemporal_planner.c)
-
-
-ADD_LIBRARY(planner OBJECT ${spatiotemporal_planner.c} spatiotemporal_explain.c query_semantics_check.c join_processing.c post_processing.c)
+ADD_LIBRARY(planner OBJECT
+        planner_utils.c
+        spatiotemporal_planner.c
+        spatiotemporal_explain.c
+        query_semantics_check.c
+        join_processing.c
+        colocation.c
+        noncolocation.c
+        predicate_management.c
+        tile_scan_rebalancer.c
+        )
