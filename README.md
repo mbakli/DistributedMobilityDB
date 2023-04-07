@@ -1,4 +1,4 @@
-# Distributed MobilityDB
+# Distributed MobilityDB (Under Development)
 Distributed MobilityDB is a PostgreSQL extension that extends the open source databases PostGIS and MobilityDB to distribute spatial and spatiotemporal data and queries. It contains the following features:
 * Spatial and Spatiotemporal Data Partitioning
   * It partitions the input relation into shards that preserve spatiotemporal data locality and load balancing.
@@ -84,4 +84,3 @@ SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_til
 -- Temporal tiling
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, table_name_out=>'ships_50t', partitioning_method => 'crange', partitioning_type =>'temporal');
 ```
-### BerlinMOD Benchmark
