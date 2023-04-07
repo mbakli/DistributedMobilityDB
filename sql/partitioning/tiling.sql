@@ -54,15 +54,20 @@ BEGIN
         INTO tiling.type;
     END IF;
 
-    tiling.segmentation := shape_segmentation;
-
-
     -- Check whether the column is Postgis or Mobilitydb
     SELECT IsMobilityDBType(table_name_in, tiling)
     INTO tiling.isMobilityDB;
     -- Check the partitioning type: Single Point or Sequenece
     SELECT getDistributedColInternalType(table_name_in, tiling.distCol)
     INTO tiling.internalType;
+
+    IF shape_segmentation THEN
+        IF tiling.internaltype in ('point', 'instant') THEN
+            tiling.segmentation := false;
+        ELSE
+            tiling.segmentation := shape_segmentation;
+        end if;
+    end if;
     -- Get the tile key
     SELECT getTileKey(table_name_in)
     INTO tiling.tileKey;
