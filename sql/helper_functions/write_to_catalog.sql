@@ -43,3 +43,17 @@ BEGIN
     return table_out_id;
 END;
 $$ LANGUAGE 'plpgsql' STRICT;
+
+CREATE OR REPLACE FUNCTION update_catalog_oid(table_name_out varchar(250), table_id int)
+	RETURNS boolean AS $$
+DECLARE
+    oid int;
+BEGIN
+    SELECT table_name_out::regclass
+    INTO oid;
+    UPDATE pg_dist_spatiotemporal_tables
+    SET table_oid = oid
+    WHERE id = table_id;
+    RETURN true;
+END;
+$$ LANGUAGE 'plpgsql' STRICT;
