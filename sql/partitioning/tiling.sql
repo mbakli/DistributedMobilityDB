@@ -89,6 +89,7 @@ BEGIN
     -- Check if the table exists, tell the user to write another table name
     IF lower(tiling_method) = 'crange' THEN
         tiling.disjointTiles := TRUE;
+        tiling.method := 'crange';
         SELECT crange_method(table_name_in, table_name_out, tiling)
         INTO table_out_id;
     ELSIF lower(tiling_method) = 'colocation' THEN
