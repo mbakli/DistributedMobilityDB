@@ -8,7 +8,7 @@ Distributed MobilityDB is a PostgreSQL extension that extends the open source da
 * Declarative Query Language
   * It provides declarative SQL functions for data partitioning as well as mapping declarative SQL queries into distributed execution strategies.
 
-🚧 **We chose to release Distributed MobilityDB early as an invitation to the dev community to participate in it’s on-going development.  The extension is still under heavy development.** 🚧
+🚧 **The extension is still under heavy development.** 🚧
 
 # Prerequisites
 - PostgreSQL >= 13
