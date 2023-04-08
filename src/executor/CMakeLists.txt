@@ -1,1 +1,1 @@
-add_library(executor OBJECT spatiotemporal_executor.c)
+add_library(executor OBJECT multi_phase_executor.c)
