@@ -49,7 +49,7 @@ spatiotemporal_planner_internal(Query *parse, const char *query_string, int curs
     /* Get info about the user query */
     List *rangeTableList = ExtractRangeTableEntryList(parse);
     analyzeDistributedSpatiotemporalTables(rangeTableList, distPlan);
-    analyseSelectClause(parse, distPlan);
+    // analyseSelectClause(parse, distPlan);
     if (query_string!= NULL && distPlan->tablesList->length > 0 && !distPlan->queryContainsReshuffledTable)
     {
         /* TODO: Excluded for now and will be added after testing the main features */
@@ -161,30 +161,7 @@ PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
     distPlan->predicatesList->predicateInfo = palloc0(sizeof(PredicateInfo));
 }
 
-/*
- * analyseSelectClause analyses the select clause and
- * detects the distributed functions, segmented objects, etc
- */
-static void
-analyseSelectClause(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
-{
-    List *targetList = parse->targetList;
-    ListCell *targetEntryCell = NULL;
-    /* TODO: iterate through the select clause entries */
-    foreach(targetEntryCell, targetList)
-    {
-        /* TODO: Process aggregate functions */
-        TargetEntry *targetEntry = lfirst(targetEntryCell);
-        if (targetEntry->resname != NULL && IsAggregateFunction(targetEntry->resname))
-        {
-            distPlan->activate_post_processing_phase = true;
-            // Add the distributed function to the list of the post processing operations
-            DistributedFunction *dist_function = addDistributedFunction(targetEntry);
-            distPlan->postProcessing->functions = lappend(distPlan->postProcessing->functions,
-                                                          dist_function);
-        }
-    }
-}
+
 
 /*
  * checkQueryType analyses the query parameters to plan ahead the query type
