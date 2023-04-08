@@ -16,6 +16,9 @@ CREATE TYPE dist_mobilitydb.spatiotemporal_tiling_method AS ENUM (
     'octree'
 );
 
+ALTER TYPE dist_mobilitydb.spatiotemporal_tiling_method
+SET SCHEMA pg_catalog;
+
 CREATE TYPE dist_mobilitydb.tiling AS (
     type text,
     method text,
@@ -45,14 +48,19 @@ SET SCHEMA pg_catalog;
 ---------------------------------------------------------------------------------
 CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_tables(
     id serial,
-    table_oid oid,
-    table_name varchar(100) unique,
-    tiles_count integer,
-    disjoint_tiles boolean,
+    tblOid oid,
+    tableName varchar(100) unique,
+    numTiles integer,
+    tilingMethod varchar(100), /* TODO: Change it to ENUM*/
+    tilingType varchar(100), /* TODO: Change it to ENUM*/
+    granularity varchar(100), /* TODO: Change it to ENUM*/
+    disjoint boolean,
+    isMobilityDB boolean,
     distcol varchar(20),
     distcoltype varchar(10),
     tilekey varchar(10),
-    shapeSegmented boolean
+    shapeSegmented boolean,
+    srid int
 );
 
 ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_tables
