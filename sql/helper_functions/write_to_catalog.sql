@@ -12,19 +12,24 @@ BEGIN
         column_type := 'geometry';
     END IF;
     EXECUTE format('%s', concat('' ||
-                            'INSERT INTO pg_dist_spatiotemporal_tables (table_oid, table_name, tiles_count, disjoint_tiles, distcol, distcoltype, tilekey, shapeSegmented) ' ||
-                            'VALUES (',0,',''',table_name_out,''',',tiling.numTiles,',''',tiling.disjointTiles,''', ''',tiling.distCol,''', ''',tiling.distColType,''', ''',tiling.tileKey,''', ''',tiling.segmentation,''') ' ||
-                                                                                                                                                                                                           'ON CONFLICT (table_name) ' ||
+                            'INSERT INTO pg_dist_spatiotemporal_tables (tblOid, tableName, numTiles, tilingMethod, tilingType, granularity, disjoint, isMobilityDB, distcol, distcoltype, tilekey, shapeSegmented, srid) ' ||
+                            'VALUES (',0,',''',table_name_out,''',',tiling.numTiles,',''',tiling.method,''',''',tiling.type,''',''',tiling.granularity,''',''',tiling.disjointTiles,''',''',tiling.isMobilityDB,''', ''',tiling.distCol,''', ''',tiling.distColType,''', ''',tiling.tileKey,''', ''',tiling.segmentation,''', ',tiling.srid,') ' ||
+                                                                                                                                                                                                           'ON CONFLICT (tableName) ' ||
                                                                                                                                                                                                            'DO ' ||
-                                                                                                                                                                                                           'UPDATE set table_name = EXCLUDED.table_name,' ||
-                                                                                                                                                                                                           'tiles_count = EXCLUDED.tiles_count,' ||
-                                                                                                                                                                                                           'disjoint_tiles = EXCLUDED.disjoint_tiles,' ||
+                                                                                                                                                                                                           'UPDATE set tableName = EXCLUDED.tableName,' ||
+                                                                                                                                                                                                           'numTiles = EXCLUDED.numTiles,' ||
+                                                                                                                                                                                                            'tilingMethod = EXCLUDED.tilingMethod,' ||
+                                                                                                                                                                                                            'tilingType = EXCLUDED.tilingType,' ||
+                                                                                                                                                                                                            'granularity = EXCLUDED.granularity,' ||
+                                                                                                                                                                                                           'disjoint = EXCLUDED.disjoint,' ||
+                                                                                                                                                                                                            'isMobilityDB = EXCLUDED.isMobilityDB,' ||
                                                                                                                                                                                                            'distcol = EXCLUDED.distcol,' ||
                                                                                                                                                                                                            'distcoltype = EXCLUDED.distcoltype,' ||
                                                                                                                                                                                                            'tilekey = EXCLUDED.tilekey,' ||
-                                                                                                                                                                                                           'shapeSegmented = EXCLUDED.shapeSegmented'));
+                                                                                                                                                                                                           'shapeSegmented = EXCLUDED.shapeSegmented,' ||
+                                                                                                                                                                                                            'srid = EXCLUDED.srid'  ));
 
-    EXECUTE format('%s', concat('SELECT id FROM pg_dist_spatiotemporal_tables WHERE table_name = ''',table_name_out,''''))
+    EXECUTE format('%s', concat('SELECT id FROM pg_dist_spatiotemporal_tables WHERE tableName = ''',table_name_out,''''))
         INTO table_out_id;
 
     -- Insert the metadata into the catalog table
@@ -52,7 +57,7 @@ BEGIN
     SELECT table_name_out::regclass
     INTO oid;
     UPDATE pg_dist_spatiotemporal_tables
-    SET table_oid = oid
+    SET tblOid = oid
     WHERE id = table_id;
     RETURN true;
 END;
