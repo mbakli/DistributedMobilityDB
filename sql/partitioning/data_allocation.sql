@@ -63,11 +63,11 @@ BEGIN
     ELSE
         PERFORM shape_allocation(table_name_in, tiling, table_name_out, table_id, org_table_columns, group_by_clause);
     END IF;
-
+    -- Update the catalog to add the distributed table oid
+    PERFORM update_catalog_oid(table_name_out,table_id);
     return true;
 END;
 $$ LANGUAGE 'plpgsql';
-
 
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 -- Shape allocation

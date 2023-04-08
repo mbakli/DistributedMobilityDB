@@ -1,6 +1,6 @@
 SET(LOCAL_FILES
         write_to_catalog.sql
-        colocation.sql
+        colocation_utils.sql
         catalog_info_check.sql
         )
 

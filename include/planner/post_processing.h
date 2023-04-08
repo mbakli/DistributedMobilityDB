@@ -1,4 +1,0 @@
-#ifndef POST_PROCESSING_H
-#define POST_PROCESSING_H
-
-#endif /* POST_PROCESSING_H */

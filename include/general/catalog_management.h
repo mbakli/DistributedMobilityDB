@@ -9,19 +9,21 @@
 #include <catalog/pg_extension.h>
 #include "libpq-fe.h"
 #include "executor/spi.h"
-#include "planner/spatiotemporal_planner.h"
 #include <utils/snapmgr.h>
+#include "partitioning/tiling_utils.h"
 
-extern bool IsDistributedSpatiotemporalTable(Oid relationId);
 extern bool IsDistanceOperation(Oid operationId);
 extern bool IsIntersectionOperation(Oid operationId);
 extern Datum * GetDistributedTableMetadata(Oid relationId);
 extern bool IsReshuffledTable(Oid relationId);
-extern bool DistributedColumnType(Oid relationId);
+extern int DistributedColumnType(Oid relationId);
 extern  char * GetSpatiotemporalCol(Oid relationId);
 extern char * GetGlobalIndexInfo(Oid relid);
+extern Oid RelationId(const char *relationName);
 extern char* GetRandomTileId(Oid relationId);
 extern int TilingSearch(Oid relationId);
 extern int GetNumTiles(Oid relationId);
+extern bool IsDistributedSpatiotemporalTable(Oid relationId);
+
 
 #endif /* METADATA_MANAGEMENT_H */
