@@ -11,21 +11,11 @@
 #include "predicate_management.h"
 
 
-/* Planner strategies */
-typedef enum PlannerStrategy
-{
-    Colocation,
-    NonColocation,
-    TileScanRebalancer,
-    PredicatePushDown
-} PlannerStrategy;
-
 /* Filter Operation */
 typedef struct FilterOp
 {
     char *queryPredicate;
 } FilterOp;
-
 
 /*
  * DistributedSpatiotemporalQueryPlan contains all information necessary to execute a
@@ -49,7 +39,7 @@ typedef struct DistributedSpatiotemporalQueryPlan
     /* Determines the query processing type: 1 for spatial, 2 for temporal, 3 for spatotemporal, 4 for other */
     int query_type;
     /* Determines the plan strategy: colocated, non-colocated, tile scan rebalancer, filter and predicate pushdown */
-    PlannerStrategy strategy;
+    List *strategies;
     bool activate_post_processing_phase;
     Oid *tables_oid_cached;
     /* Distance value if exists which means that the required will need some of the data to be reshuffled before
@@ -70,6 +60,7 @@ typedef struct GeneralScan
 {
     Query *query;
     StringInfo query_string;
+    int length;
 } GeneralScan;
 
 extern PlannedStmt * spatiotemporal_planner(Query *parse, const char *query_string, int cursorOptions,
@@ -80,7 +71,4 @@ extern PlannedStmt *spatiotemporal_planner_internal(Query *parse, const char *qu
                                                     bool explain);
 extern DistributedSpatiotemporalQueryPlan *GetSpatiotemporalDistributedPlan(CustomScan *customScan);
 extern SpatiotemporalTableCatalog *GetSpatiotemporalCatalogTableInfo(RangeTblEntry *rangeTableEntry);
-extern void ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
-extern void NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
-extern void TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 #endif /* SPATIOTEMPORAL_PLANNER_H */

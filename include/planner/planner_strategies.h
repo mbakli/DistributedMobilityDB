@@ -14,4 +14,17 @@ typedef struct NeighborScan
     Node *predicateInfo;
 } NeighborScan;
 
+/* Planner strategies */
+typedef enum PlannerStrategy
+{
+    Colocation,
+    NonColocation,
+    TileScanRebalancer,
+    PredicatePushDown
+} PlannerStrategy;
+
+extern void ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
+extern void NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
+extern void TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
+
 #endif /* PLANNER_STRATEGIES_H */

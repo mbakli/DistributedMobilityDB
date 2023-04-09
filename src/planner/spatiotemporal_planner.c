@@ -15,7 +15,7 @@
 #include "planner/planner_utils.h"
 #include "partitioning/multirelation.h"
 #include "executor/multi_phase_executor.h"
-
+#include "planner/planner_strategies.h"
 
 
 static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
@@ -24,7 +24,7 @@ static void PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan);
 static void analyseSelectClause(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
 static void checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
 static bool needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distPlan);
-
+static void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, PlannerStrategy strategy);
 /* Distributed spatiotemporal planner hook */
 
 PlannedStmt *
@@ -49,7 +49,7 @@ spatiotemporal_planner_internal(Query *parse, const char *query_string, int curs
     /* Get info about the user query */
     List *rangeTableList = ExtractRangeTableEntryList(parse);
     analyzeDistributedSpatiotemporalTables(rangeTableList, distPlan);
-    // analyseSelectClause(parse, distPlan);
+    analyseSelectClause(parse, distPlan);
     if (query_string!= NULL && distPlan->tablesList->length > 0 && !distPlan->queryContainsReshuffledTable)
     {
         /* TODO: Excluded for now and will be added after testing the main features */
@@ -62,15 +62,19 @@ spatiotemporal_planner_internal(Query *parse, const char *query_string, int curs
         /* Keep the original query string for later */
         distPlan->org_query_string = palloc((strlen(query_string) + 1) * sizeof (char));
         strcpy(distPlan->org_query_string, toLower((char *)query_string));
-        /* TODO: Currently, the combination of different strategies will be added after testing the main features */
-        if (distPlan->strategy == Colocation)
-            ColocationStrategyPlan(distPlan);
-        else if (distPlan->strategy == NonColocation)
-            NonColocationStrategyPlan(distPlan);
-        else if (distPlan->strategy == TileScanRebalancer)
-            TileScanRebalanceStrategyPlan(distPlan);
-        else
-            ereport(ERROR, (errmsg("This query is not supported yet!")));
+        ListCell *cell = NULL;
+        foreach(cell, distPlan->strategies)
+        {
+            PlannerStrategy plannerStrategy = (PlannerStrategy) lfirst_int(cell);
+            if (plannerStrategy == Colocation)
+                ColocationStrategyPlan(distPlan);
+            else if (plannerStrategy == NonColocation)
+                NonColocationStrategyPlan(distPlan);
+            else if (plannerStrategy == TileScanRebalancer)
+                TileScanRebalanceStrategyPlan(distPlan);
+            else
+                ereport(ERROR, (errmsg("This query is not supported yet!")));
+        }
         /* Executor */
         GeneralScan *generalScan = QueryExecutor(distPlan, explain);
         result = distributed_planner(generalScan->query, generalScan->query_string->data,
@@ -159,9 +163,33 @@ PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
     distPlan->tablesList->length = 0;
     distPlan->predicatesList = palloc0(sizeof(PredicateInfo));
     distPlan->predicatesList->predicateInfo = palloc0(sizeof(PredicateInfo));
+    distPlan->strategies = NIL;
 }
 
-
+/*
+ * analyseSelectClause analyses the select clause and
+ * detects the distributed functions, segmented objects, etc
+ */
+static void
+analyseSelectClause(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
+{
+    List *targetList = parse->targetList;
+    ListCell *targetEntryCell = NULL;
+    /* TODO: iterate through the select clause entries */
+    foreach(targetEntryCell, targetList)
+    {
+        /* TODO: Process aggregate functions */
+        TargetEntry *targetEntry = lfirst(targetEntryCell);
+        if (targetEntry->resname != NULL && IsAggregateFunction(targetEntry->resname))
+        {
+            distPlan->activate_post_processing_phase = true;
+            // Add the distributed function to the list of the post processing operations
+            DistributedFunction *dist_function = addDistributedFunction(targetEntry);
+            distPlan->postProcessing->functions = lappend(distPlan->postProcessing->functions,
+                                                          dist_function);
+        }
+    }
+}
 
 /*
  * checkQueryType analyses the query parameters to plan ahead the query type
@@ -190,22 +218,23 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                 if (IsIntersectionOperation(opExpr->opno))
                 {
                     if (distPlan->tablesList->numDiffTables > 1)
-                        distPlan->strategy = NonColocation;
+                    {
+                        AddStrategy(distPlan, NonColocation);
+                    }
                     else if (distPlan->tablesList->length == 1)
                     {
-                        /* TODO: Excluded for now and will be added after testing the main features */
-                        distPlan->strategy = PredicatePushDown;
+                        AddStrategy(distPlan, PredicatePushDown);
                     }
                     else
                     {
                         /* By default */
-                        distPlan->strategy = Colocation;
+                        AddStrategy(distPlan, Colocation);
                     }
                 }
                 else if (IsDistanceOperation(opExpr->opno))
                 {
                     /* The NonColocation strategy is triggered by default until the analysis changes it */
-                    distPlan->strategy = NonColocation;
+                    AddStrategy(distPlan, NonColocation);
                     if(distPlan->predicatesList->predicateType == DISTANCE)
                     {
                         ereport(ERROR, (errmsg("Currently, we do not support using more than one distance operation!")));
@@ -224,7 +253,7 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                         if (IsDistanceOperation(arg_oid))
                         {
                             distPlan->predicatesList->predicateInfo->distancePredicate = analyseDistancePredicate(node);
-                            distPlan->strategy = NonColocation;
+                            AddStrategy(distPlan, NonColocation);
                             distPlan->predicatesList->predicateType = DISTANCE;
                         }
                     }
@@ -242,8 +271,13 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
 static bool
 needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distPlan)
 {
-    if (distPlan->tablesList->length > 1 && (distPlan->strategy >= 0 || distPlan->tablesList->numDiffTables > 1)
+    if (distPlan->tablesList->length > 1 && (list_length(distPlan->strategies) > 0 || distPlan->tablesList->numDiffTables > 1)
         && !distPlan->queryContainsReshuffledTable)
         return true;
     return false;
+}
+
+void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, PlannerStrategy strategy)
+{
+    distPlan->strategies = lappend(distPlan->strategies, (Datum *)strategy);
 }
