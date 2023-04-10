@@ -3,7 +3,7 @@
 
 typedef struct WorkerOperation
 {
-    char *opname;
+    Datum op;
 } WorkerOperation;
 
 #endif /* WORKER_OPERATIONS_H */
