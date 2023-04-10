@@ -106,17 +106,26 @@ CREATE TABLE dist_mobilitydb.pg_spatiotemporal_join_operations_desc(
     id serial primary key,
     op text,
     opid integer,
-    requireFullTrip boolean
+    requireFullShape boolean
 );
 
 ALTER TABLE dist_mobilitydb.pg_spatiotemporal_join_operations_desc SET SCHEMA pg_catalog;
 -- Create distributed functions for the MobilityDB query operations
+CREATE TABLE dist_mobilitydb.pg_execution_run(
+    id serial primary key,
+    sExec text default 'all'
+);
+
+INSERT INTO dist_mobilitydb.pg_execution_run (sExec) values('run-once'), ('all');
+ALTER TABLE dist_mobilitydb.pg_execution_run
+SET SCHEMA pg_catalog;
+
 CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions(
     id serial,
-    op_id_fk integer REFERENCES pg_spatiotemporal_join_operations_desc(id),
     worker text default NULL,
     combiner text default NULL,
-    final text default NULL
+    final text default NULL,
+    sExec_id integer REFERENCES pg_execution_run(id) default 2
 );
 ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions
 SET SCHEMA pg_catalog;
