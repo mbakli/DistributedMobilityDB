@@ -60,8 +60,17 @@ CREATE TABLE planet_osm_polygon (
   ...
 );
 
+CREATE TABLE planet_osm_roads (
+  osm_id bigint,
+  way geometry(linestring),
+  ...
+);
+
 -- Distribute the planet_osm_polygon table into 50 tiles using the spatial column: geometry(polygon)
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, table_name_out=>'planet_osm_polygon_50t', partitioning_method => 'crange');
+
+-- Distribute the planet_osm_roads table into 30 tiles using the spatial column: geometry(polygon)
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_roads', num_tiles =>30, table_name_out=>'planet_osm_roads_30t', partitioning_method => 'crange');
 
 -- Distance Query: Find buildings that are built within 1km of the primary highways.
 SELECT distinct t1.name
