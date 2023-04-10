@@ -1,5 +1,6 @@
 add_subdirectory("helper_functions")
 add_subdirectory("partitioning")
+add_subdirectory("distributed_functions")
 
 # Add the main sql file to the temporary file
 configure_file(distributed_mobilitydb--1.0.sql ${CMAKE_CURRENT_BINARY_DIR}/${DISTRIBUTED_MOBILITYDB_EXTENSION_FILE}.in)
