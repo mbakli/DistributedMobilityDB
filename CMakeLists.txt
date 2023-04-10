@@ -60,7 +60,7 @@ add_subdirectory("sql")
 set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:partitioning>" include/partitioning/tiling_utils.h include/partitioning/multirelation.h)
 set(PROJECT_OBJECTS "$<TARGET_OBJECTS:general>")
 set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:executor>" include/executor/multi_phase_executor.h)
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:planner>" include/planner/predicate_management.h)
+set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:planner>" include/planner/predicate_management.h include/planner/spatiotemporal_planner.h)
 set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:post_processing>" include/post_processing/post_processing.h)
 set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:distributed_functions>")
 
