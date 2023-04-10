@@ -4,6 +4,14 @@
 #include "coordinator_operations.h"
 #include "worker_operations.h"
 #include "optimizer/planner.h"
+#include "utils/builtins.h"
+
+
+/* constants for distributed functions.options */
+#define Natts_DistFun 5
+#define Anum_DistFun_worker 2
+#define Anum_DistFun_combiner 3
+#define Anum_DistFun_final 4
 
 typedef struct DistributedFunction
 {
@@ -13,5 +21,5 @@ typedef struct DistributedFunction
 } DistributedFunction;
 
 extern DistributedFunction *addDistributedFunction(TargetEntry *operation);
-
+extern bool IsDistFunc(TargetEntry *targetEntry);
 #endif /* DISTRIBUTED_FUNCTION_H */

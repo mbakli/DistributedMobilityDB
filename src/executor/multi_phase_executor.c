@@ -16,7 +16,6 @@ static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *di
                                            MultiPhaseExecutor *multiPhaseExecutor);
 static char *taskQuery (List *tasks, ExecTaskType taskType);
 static Datum AddTilingKey(SpatiotemporalTableCatalog tblCatalog, char * query_string);
-
 /* QueryExecutor */
 extern GeneralScan *
 QueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
@@ -226,6 +225,18 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
     return generalScan;
 }
 
+static Datum
+AddTilingKey(SpatiotemporalTableCatalog tblCatalog, char * query_string)
+{
+    StringInfo tmp = makeStringInfo();
+    StringInfo task_prep = makeStringInfo();
+    appendStringInfo(tmp,"%s.%s", Var_Schema, tblCatalog.reshuffledTable);
+    appendStringInfo(task_prep, "%s",replaceWord((char *)query_string,
+                                                 get_rel_name(tblCatalog.table_oid), tmp->data));
+    return CStringGetDatum(replaceWord(
+            replaceWord(task_prep->data,"where", "WHERE T1.tile_key = T2.tile_key AND "), ";", " "));
+}
+
 static char *
 taskQuery (List *tasks, ExecTaskType taskType)
 {
@@ -238,16 +249,4 @@ taskQuery (List *tasks, ExecTaskType taskType)
         else
             continue;
     }
-}
-
-static Datum
-AddTilingKey(SpatiotemporalTableCatalog tblCatalog, char * query_string)
-{
-    StringInfo tmp = makeStringInfo();
-    StringInfo task_prep = makeStringInfo();
-    appendStringInfo(tmp,"%s.%s", Var_Schema, tblCatalog.reshuffledTable);
-    appendStringInfo(task_prep, "%s",replaceWord((char *)query_string,
-                                                 get_rel_name(tblCatalog.table_oid), tmp->data));
-    return CStringGetDatum(replaceWord(
-            replaceWord(task_prep->data,"where", "WHERE T1.tile_key = T2.tile_key AND "), ";", " "));
 }

@@ -3,8 +3,8 @@
 
 typedef struct CoordinatorOperation
 {
-    char *intermediate_opname;
-    char *final_opname;
+    Datum intermediate_op;
+    Datum final_op;
 } CoordinatorOperation;
 
 #endif /* COORDINATOR_OPERATIONS_H */

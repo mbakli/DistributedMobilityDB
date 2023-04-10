@@ -6,27 +6,6 @@
 #include <executor/spi.h>
 #include <utils/lsyscache.h>
 
-typedef struct CollectOperator
-{
-    bool active;
-
-} CollectOperator;
-
-typedef struct MergeOperator
-{
-    bool active;
-
-} MergeOperator;
-
-typedef struct WorkerLevelOperator
-{
-    bool active;
-} WorkerLevelOperator;
-
-typedef struct RemDupOperator
-{
-    bool active;
-} RemDupOperator;
 
 /* Planner strategies */
 typedef enum ExecTaskType
@@ -41,13 +20,6 @@ typedef struct ExecutorTask
     ExecTaskType taskType;
 } ExecutorTask;
 
-typedef struct CoordinatorLevelOperator
-{
-    MergeOperator *mergeOperator;
-    RemDupOperator * dupRemOperator;
-} CoordinatorLevelOperator;
-
-
 /*
  * MultiPhaseExecutor
  */
@@ -58,8 +30,7 @@ typedef struct MultiPhaseExecutor
     int numCores;
     bool dataReshuffled;
     bool table_created;
-    CoordinatorLevelOperator *coordinatorLevelOperator;
-    WorkerLevelOperator  *workerLevelOperator;
+    PostProcessing postProcessing;
 } MultiPhaseExecutor;
 
 extern GeneralScan * QueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain);
