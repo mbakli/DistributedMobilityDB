@@ -1,12 +1,5 @@
 #include "planner/planner_utils.h"
 
-extern bool
-IsAggregateFunction(char *opname)
-{
-    if (strcasecmp(opname, "count") == 0)
-        return true;
-    return false;
-}
 extern SpatiotemporalTableCatalog
 GetTilingSchemeInfo(Oid relationId)
 {
@@ -58,4 +51,11 @@ extern Oid
 MTSTilesRelationId()
 {
     return RelationId("pg_dist_spatiotemporal_tiles");
+}
+
+/* return oid of the distributed functions */
+extern Oid
+DisFuncRelationId()
+{
+    return RelationId("pg_dist_spatiotemporal_dist_functions");
 }

@@ -40,8 +40,8 @@
 
 #define Var_Schema "dist_mobilitydb"
 
-extern bool IsAggregateFunction(char *opname);
 extern SpatiotemporalTableCatalog GetTilingSchemeInfo(Oid relationId);
 extern Oid MTSRelationId();
 extern Oid MTSTilesRelationId();
+extern Oid DisFuncRelationId();
 #endif /* PLANNER_UTILS_H */
