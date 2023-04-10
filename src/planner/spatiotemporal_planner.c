@@ -6,16 +6,15 @@
  *-------------------------------------------------------------------------
  */
 
-#include "planner/spatiotemporal_planner.h"
 #include "distributed/distributed_planner.h"
 #include "general/catalog_management.h"
 #include "distributed/multi_executor.h"
 #include "nodes/nodeFuncs.h"
 #include "distributed_functions/distributed_function.h"
 #include "planner/planner_utils.h"
-#include "partitioning/multirelation.h"
 #include "executor/multi_phase_executor.h"
 #include "planner/planner_strategies.h"
+#include "planner/spatiotemporal_planner.h"
 
 
 static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
@@ -25,6 +24,8 @@ static void analyseSelectClause(Query *parse, DistributedSpatiotemporalQueryPlan
 static void checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
 static bool needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distPlan);
 static void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, PlannerStrategy strategy);
+static PlannedStmt * EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions,
+                                     ParamListInfo boundParams);
 /* Distributed spatiotemporal planner hook */
 
 PlannedStmt *
@@ -33,7 +34,6 @@ spatiotemporal_planner(Query *parse, const char *query_string, int cursorOptions
 {
     DistributedSpatiotemporalQueryPlan *distributedSpatiotemporalPlan = (DistributedSpatiotemporalQueryPlan *)
             palloc0(sizeof(DistributedSpatiotemporalQueryPlan));
-    PlanInitialization(distributedSpatiotemporalPlan);
     return spatiotemporal_planner_internal(parse, query_string, cursorOptions, boundParams,
                                            distributedSpatiotemporalPlan, false);
 }
@@ -45,10 +45,15 @@ spatiotemporal_planner_internal(Query *parse, const char *query_string, int curs
 {
     PlannedStmt *result = NULL;
     bool needsSpatiotemporalPlanning = false;
-
+    PlanInitialization(distPlan);
+    result = EarlyQueryCheck(parse, query_string, cursorOptions, boundParams);
+    if (result != NULL)
+        return result;
     /* Get info about the user query */
     List *rangeTableList = ExtractRangeTableEntryList(parse);
     analyzeDistributedSpatiotemporalTables(rangeTableList, distPlan);
+    if (distPlan->tablesList->length == 0 || query_string == NULL)
+        return distributed_planner(parse, query_string, cursorOptions, boundParams);
     analyseSelectClause(parse, distPlan);
     if (query_string!= NULL && distPlan->tablesList->length > 0 && !distPlan->queryContainsReshuffledTable)
     {
@@ -135,9 +140,14 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                         (SpatiotemporalTable *) palloc0(sizeof(SpatiotemporalTable));
                 spatiotemporal_table->shapeType = shapeType;
                 spatiotemporal_table->col = GetSpatiotemporalCol(rangeTableEntry->relid);
+                spatiotemporal_table->localIndex = GetLocalIndex(rangeTableEntry->relid,
+                                                                 spatiotemporal_table->col);
                 spatiotemporal_table->catalogTableInfo = GetTilingSchemeInfo(rangeTableEntry->relid);
                 if (curr_relid != rangeTableEntry->relid)
+                {
                     distPlan->tablesList->numDiffTables++;
+                    distPlan->joining_col = spatiotemporal_table->col;
+                }
                 else
                     distPlan->tablesList->numSimTables++;
                 curr_relid = rangeTableEntry->relid;
@@ -147,6 +157,17 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
         }
     }
     distPlan->tablesList->tables = spatiotemporal_tables;
+}
+
+static PlannedStmt *
+EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
+{
+    PlannedStmt *result = NULL;
+    /* TODO: Add the check for the other query types. Loop through all input tables if not distributed, then return null */
+    if (query_string == NULL)
+        return result;
+    //result = distributed_planner(parse, query_string, cursorOptions, boundParams);
+    return result;
 }
 
 /* PlanInitialization initializes the distributed plan */

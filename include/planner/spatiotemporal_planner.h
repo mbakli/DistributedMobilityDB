@@ -38,6 +38,7 @@ typedef struct DistributedSpatiotemporalQueryPlan
     int srid;
     /* Determines the query processing type: 1 for spatial, 2 for temporal, 3 for spatotemporal, 4 for other */
     int query_type;
+    char * joining_col;
     /* Determines the plan strategy: colocated, non-colocated, tile scan rebalancer, filter and predicate pushdown */
     List *strategies;
     bool activate_post_processing_phase;

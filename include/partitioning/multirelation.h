@@ -32,6 +32,7 @@ typedef struct SpatiotemporalTable
     ShapeType shapeType;
     char *col;
     int srid;
+    char *localIndex;
 } SpatiotemporalTable;
 
 typedef struct SpatiotemporalTables
@@ -43,5 +44,5 @@ typedef struct SpatiotemporalTables
 } SpatiotemporalTables;
 
 extern bool IsDistributedSpatiotemporalTable(Oid relationId);
-
+extern char *GetLocalIndex(Oid relationId, char * col);
 #endif /* MULTIRELATION_H */

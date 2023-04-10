@@ -124,7 +124,7 @@ DistributedColumnType(Oid relationId)
     /* Read back the PROJ text */
     if (spi_result == SPI_OK_SELECT)
     {
-        const char * columnType = DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
+        const char * columnType = (char *)DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
                                                                SPI_tuptable->tupdesc,
                                                                1));
         spi_result = SPI_finish();
@@ -152,6 +152,7 @@ char *
 GetSpatiotemporalCol(Oid relationId)
 {
     int spi_result;
+    bool isNull = false;
     /* Connect */
     spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
@@ -168,16 +169,16 @@ GetSpatiotemporalCol(Oid relationId)
     /* Read back the PROJ text */
     if (spi_result == SPI_OK_SELECT)
     {
-        char * distcol = DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
-                                                      SPI_tuptable->tupdesc,
-                                                      1));
+        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
+        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
+        Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
         spi_result = SPI_finish();
 
         if (spi_result != SPI_OK_FINISH)
         {
             elog(ERROR, "Could not disconnect from database using SPI");
         }
-        return distcol;
+        return DatumToString(distcol, TEXTOID);;
     }
     return NULL;
 }
@@ -191,4 +192,44 @@ IsDistributedSpatiotemporalTable(Oid relationId)
 {
     // TODO: I have to see first whether the table is spatiotemporal distributed or not.
     return LookupCitusTableCacheEntry(relationId) != NULL;
+}
+
+extern char *
+GetLocalIndex(Oid relationId, char * col)
+{
+    int spi_result;
+    bool isNull = false;
+    /* Connect */
+    spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    /* Execute the query, noting the readonly status of this SQL */
+    StringInfo catalogQuery = makeStringInfo();
+    appendStringInfo(catalogQuery, "select ic.relname as index_name\n"
+                                   "        from pg_index ix\n"
+                                   "join pg_class ic on ix.indexrelid = ic.oid\n"
+                                   "join pg_attribute a on a.attrelid = ic.oid\n"
+                                   "where ix.indrelid = '%s'::regclass\n"
+                                   "        and attname = '%s'\n"
+                                   "        and not ix.indisunique;",
+                     get_rel_name(relationId), col);
+
+    spi_result = SPI_execute(catalogQuery->data, true, 1);
+    /* Read back the PROJ text */
+    if (spi_result == SPI_OK_SELECT)
+    {
+        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
+        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
+        Datum localIndex = SPI_getbinval(row, rowDescriptor, 1, &isNull);
+        spi_result = SPI_finish();
+        if (spi_result != SPI_OK_FINISH)
+        {
+            elog(ERROR, "Could not disconnect from database using SPI");
+        }
+        return (char *)localIndex;
+    }
+    return NULL;
 }

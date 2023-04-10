@@ -20,7 +20,8 @@ typedef enum PlannerStrategy
     Colocation,
     NonColocation,
     TileScanRebalancer,
-    PredicatePushDown
+    PredicatePushDown,
+    KNN
 } PlannerStrategy;
 
 extern void ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
