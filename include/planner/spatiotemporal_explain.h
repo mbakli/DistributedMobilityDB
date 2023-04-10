@@ -8,10 +8,11 @@
 #include "libpq-fe.h"
 #include "miscadmin.h"
 
-void spatiotemporal_explain(Query *query, int cursorOptions, IntoClause *into,
+extern void spatiotemporal_explain(Query *query, int cursorOptions, IntoClause *into,
                             ExplainState *es, const char *queryString, ParamListInfo params,
                             QueryEnvironment *queryEnv);
-void RegisterSpatiotemporalPlanMethods(void);
+extern void RegisterSpatiotemporalPlanMethods(void);
+extern bool IsReshufflingRequired(List *strategies);
 
 typedef struct SpatiotemporalScanState
 {
@@ -26,4 +27,14 @@ typedef struct SpatiotemporalScanState
     bool finishedRemoteScan;          /* flag to check if remote scan is finished */
     Tuplestorestate *tuplestorestate; /* tuple store to store distributed results */
 } SpatiotemporalScanState;
+
+
+typedef struct DistributedQueryExplain
+{
+    Query *query;
+    char *query_string;
+
+}DistributedQueryExplain;
+
+
 #endif /* SPATIOTEMPORAL_EXPLAIN_H */
