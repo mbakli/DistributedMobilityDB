@@ -32,6 +32,12 @@ CustomScanMethods SpatiotemporalExecutorMethod = {
         SpatiotemporalExecutorCreateScan
 };
 
+/*
+ * Define executor methods for the different executor types.
+ */
+static CustomExecMethods SpatiotemporalExecutorMethods = {
+        .CustomName = "SpatiotemporalExecutorScan"
+};
 
 /*
  * spatiotemporal_explain is the executor hook that is called when
