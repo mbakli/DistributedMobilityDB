@@ -20,6 +20,8 @@ NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     planReshufflingQuery(distPlan);
 }
 
+
+
 /* Reshuffling Query Plan */
 static void
 planReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan)
@@ -57,17 +59,14 @@ chooseReshuffledTable(DistributedSpatiotemporalQueryPlan *distPlan)
 static void
 createReshufflingTablePlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
-    if (distPlan->strategy == NonColocation)
+    if (distPlan->predicatesList->predicateType == DISTANCE)
     {
-        if (distPlan->predicatesList->predicateType == DISTANCE)
-        {
-            /* This plan requires expanding the bounding box of each tile using the given distance */
-            DistanceReshufflingPlan(distPlan);
-        }
-        else
-        {
-            OtherReshufflingPlan(distPlan);
-        }
+        /* This plan requires expanding the bounding box of each tile using the given distance */
+        DistanceReshufflingPlan(distPlan);
+    }
+    else
+    {
+        OtherReshufflingPlan(distPlan);
     }
 }
 
