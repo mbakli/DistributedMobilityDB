@@ -2,9 +2,11 @@
 #include "miscadmin.h"
 #include "utils/elog.h"
 #include "commands/explain.h"
-#include "planner/spatiotemporal_planner.h"
-#include "planner/spatiotemporal_explain.h"
+#include "planner/distributed_mobilitydb_planner.h"
+#include "planner/distributed_mobilitydb_explain.h"
+/* PostgreSQL Includes */
 PG_MODULE_MAGIC;
+void _PG_init(void);
 
 /* shared library initialization function */
 void
@@ -17,8 +19,7 @@ _PG_init(void)
     RegisterSpatiotemporalPlanMethods();
 
     /* intercept planner */
-    planner_hook = spatiotemporal_planner;
+    planner_hook = distributed_mobilitydb_planner;
 
-    ExplainOneQuery_hook = spatiotemporal_explain;
-
+    ExplainOneQuery_hook = distributed_mobilitydb_explain;
 }
