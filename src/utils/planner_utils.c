@@ -1,4 +1,7 @@
-#include "planner/planner_utils.h"
+#include "catalog/table_ops.h"
+#include <distributed/multi_logical_planner.h>
+#include "utils/planner_utils.h"
+#include "catalog/pg_dist_spatiotemporal_dist_functions.h"
 
 extern SpatiotemporalTableCatalog
 GetTilingSchemeInfo(Oid relationId)
@@ -43,19 +46,47 @@ GetTilingSchemeInfo(Oid relationId)
 extern Oid
 MTSRelationId()
 {
-    return RelationId("pg_dist_spatiotemporal_tables");
+    return RelationId(Var_Dist_Tables);
+}
+
+/* return oid of the worker nodes */
+extern Oid
+DistNodeId()
+{
+    return RelationId("pg_dist_node");
 }
 
 /* return oid of the MTS tiles */
 extern Oid
 MTSTilesRelationId()
 {
-    return RelationId("pg_dist_spatiotemporal_tiles");
+    return RelationId(Var_Table_Tiles);
 }
 
 /* return oid of the distributed functions */
 extern Oid
 DisFuncRelationId()
 {
-    return RelationId("pg_dist_spatiotemporal_dist_functions");
+    return RelationId(Tbl_Dist_Functions);
+}
+
+extern void
+AddCatalogFilterInfo(SpatiotemporalTableCatalog tbl, CatalogFilter *catalogFilter, Node *node,
+                     PredicateType predType, bool IsConst)
+{
+    if (node == NULL)
+    {
+        catalogFilter->candidates = tbl.numTiles;
+        catalogFilter->tileExpand = false;
+    }
+    else
+    {
+        /* To be added after testing the other strategies: Tile Scan Rebalancer Job */
+        if (predType == DISTANCE)
+            catalogFilter->tileExpand = true;
+        else
+            catalogFilter->tileExpand = false;
+        catalogFilter->candidates = tbl.numTiles;
+        catalogFilter->predicate = (Datum) predType;
+    }
 }

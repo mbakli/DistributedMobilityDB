@@ -23,6 +23,15 @@ typedef struct SpatiotemporalTableCatalog
     char *reshuffledTable;
 } SpatiotemporalTableCatalog;
 
+/* Catalog Filter */
+typedef struct CatalogFilter
+{
+    Datum predicate;
+    int candidates;
+    bool tileExpand;
+    float expandValue;
+} CatalogFilter;
+
 /* Spatiotemporal Table Information */
 typedef struct SpatiotemporalTable
 {
@@ -33,6 +42,8 @@ typedef struct SpatiotemporalTable
     char *col;
     int srid;
     char *localIndex;
+    Alias *alias;
+    CatalogFilter *catalogFilter;
 } SpatiotemporalTable;
 
 typedef struct SpatiotemporalTables
@@ -42,6 +53,8 @@ typedef struct SpatiotemporalTables
     int numSimTables;
     int length;
 } SpatiotemporalTables;
+
+
 
 extern bool IsDistributedSpatiotemporalTable(Oid relationId);
 extern char *GetLocalIndex(Oid relationId, char * col);

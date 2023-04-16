@@ -1,4 +1,4 @@
-#include "general/helper_functions.h"
+#include "utils/helper_functions.h"
 
 extern
 char* replaceWord( char* s,  char* oldW,  char* newW)
@@ -40,6 +40,24 @@ char * extract_between(const char *str, const char *p1, const char *p2) {
     }
 }
 
+extern char *
+change_sentence (char *sentence, char *find, char *replace)
+{
+    char *dest = malloc (strlen(sentence)-strlen(find)+strlen(replace)+1);
+    char *ptr;
+
+    strcpy (dest, sentence);
+
+    ptr = strstr (dest, find);
+    if (ptr)
+    {
+        memmove (ptr+strlen(replace), ptr+strlen(find), strlen(ptr+strlen(find))+1);
+        strncpy (ptr, replace, strlen(replace));
+    }
+
+    return dest;
+}
+
 extern
 char *toLower(char *str)
 {
@@ -50,4 +68,12 @@ char *toLower(char *str)
         str_l[i] = tolower((unsigned char)str[i]);
     }
     return str_l;
+}
+
+extern bool
+IsDatumEmpty(Datum val)
+{
+    if (val == 0)
+        return true;
+    return false;
 }
