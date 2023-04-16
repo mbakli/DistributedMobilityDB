@@ -13,7 +13,7 @@ static void SpatiotemporalPreExecutionScan(SpatiotemporalScanState *scanState);
 static void SpatiotemporalExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es);
 static void ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, ExplainState *es,
                               const char *queryString, ParamListInfo params, QueryEnvironment *queryEnv,
-                              const instr_time *planduration, double *executionDurationMillisec);
+                              const instr_time *planduration);
 static void InitializeDistributedQueryExplain(DistributedQueryExplain *distributedQueryExplain,
                                               ExplainState *es, const char *queryString);
 static void ExplainQueryType(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es);
@@ -44,11 +44,10 @@ static CustomExecMethods SpatiotemporalExecutorMethods = {
  * postgres wants to explain a query.
  */
 extern void
-spatiotemporal_explain(Query *query, int cursorOptions, IntoClause *into,
+distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into,
                        ExplainState *es, const char *queryString, ParamListInfo params,
                        QueryEnvironment *queryEnv)
 {
-    int first_group = 2, second_group = 4, third_group = 6;
     DistributedSpatiotemporalQueryPlan *distPlan = (DistributedSpatiotemporalQueryPlan *)
             palloc0(sizeof(DistributedSpatiotemporalQueryPlan));
     DistributedQueryExplain *curDistributedQueryExplain = (DistributedQueryExplain *)
@@ -59,14 +58,17 @@ spatiotemporal_explain(Query *query, int cursorOptions, IntoClause *into,
                                                           cursorOptions, params,
                                                           distPlan, true);
 
+    /* Delegating it to Citus*/
+    if (result != NULL)
+        CitusExplainOneQuery(query,cursorOptions,into,es,queryString,params,queryEnv);
+
+    /* Explain using Distributed MobilityDB  */
     ExplainOpenGroup("DistributedQueryExplain", "Distributed Query", true, es);
     ExplainQueryType(distPlan,es);
-    ExplainQueryParameters(distPlan, es, first_group);
-    ExplainQueryPlan(distPlan, es, first_group);
+    ExplainQueryParameters(distPlan, es, 2);
+    ExplainQueryPlan(distPlan, es, 2);
     ExplainCloseGroup("DistributedQueryExplain", "Distributed Query", true, es);
 
-    /* Delegating it to Citus*/
-    //CitusExplainOneQuery(query,cursorOptions,into,es,queryString,params,queryEnv);
 }
 /*
  * Let PostgreSQL know about the custom scan nodes.
@@ -77,9 +79,6 @@ RegisterSpatiotemporalPlanMethods(void)
     RegisterCustomScanMethods(&SpatiotemporalExecutorMethod);
 }
 
-/*
- * AdaptiveExecutorCreateScan creates the scan state for the adaptive executor.
- */
 static Node *
 SpatiotemporalExecutorCreateScan(CustomScan *scan)
 {
@@ -88,8 +87,6 @@ SpatiotemporalExecutorCreateScan(CustomScan *scan)
     scanState->customScanState.ss.ps.type = T_CustomScanState;
     scanState->distributedSpatiotemporalPlan = GetSpatiotemporalDistributedPlan(scan);
     scanState->customScanState.methods = &SpatiotemporalExecutorMethods;
-    //scanState->PreExecScan = &SpatiotemporalPreExecutionScan;
-
     scanState->finishedPreScan = false;
     scanState->finishedRemoteScan = false;
 
@@ -247,7 +244,7 @@ ExplainOneTask(ExecutorTask *task, ExplainState *es, int indent_group)
     es->indent += 6;
     DestReceiver *tupleStoreDest = CreateTuplestoreDestReceiver();
     ExplainWorkerPlan(plan, tupleStoreDest, es, OneTileQuery, NULL, NULL,
-                      &planduration, 0);
+                      &planduration);
     ExplainEndOutput(es);
 }
 
@@ -276,7 +273,8 @@ GetLocalQuery(char *query_string, ExecTaskType taskType)
             StringInfo  t = makeStringInfo();
             appendStringInfo(t, "%s ", get_rel_name(rangeTableEntry->relid));
             // Replace it in the query string
-            appendStringInfo(replace, "%s ", replaceWord(final_query->data, t->data, tileId->data));
+            appendStringInfo(replace, "%s ", replaceWord(final_query->data, t->data,
+                                                         tileId->data));
             resetStringInfo(t);
             resetStringInfo(final_query);
             appendStringInfo(final_query, "%s", replace->data);
@@ -302,7 +300,7 @@ GetLocalQuery(char *query_string, ExecTaskType taskType)
 static void
 ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, ExplainState *es,
                   const char *queryString, ParamListInfo params, QueryEnvironment *queryEnv,
-                  const instr_time *planduration, double *executionDurationMillisec)
+                  const instr_time *planduration)
 {
     QueryDesc  *queryDesc;
     instr_time	starttime;
@@ -361,9 +359,6 @@ ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, ExplainState *es
 
         /* run cleanup too */
         ExecutorFinish(queryDesc);
-
-        /* We can't run ExecutorEnd 'till we're done printing the stats... */
-        //totaltime += elapsed_time(&starttime);
     }
 
     ExplainOpenGroup("Query", NULL, true, es);

@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * spatiotemporal_planner.c
+ * distributed_mobilitydb_planner.c
  *	  General Distributed MobilityDB planner code.
  *
  *-------------------------------------------------------------------------
@@ -32,17 +32,17 @@ static PlannedStmt * EarlyQueryCheck(Query *parse, const char *query_string, int
 
 /* Distributed spatiotemporal planner */
 PlannedStmt *
-spatiotemporal_planner(Query *parse, const char *query_string, int cursorOptions,
+distributed_mobilitydb_planner(Query *parse, const char *query_string, int cursorOptions,
                        ParamListInfo boundParams)
 {
     DistributedSpatiotemporalQueryPlan *distributedSpatiotemporalPlan = (DistributedSpatiotemporalQueryPlan *)
             palloc0(sizeof(DistributedSpatiotemporalQueryPlan));
-    return spatiotemporal_planner_internal(parse, query_string, cursorOptions, boundParams,
+    return distributed_mobilitydb_planner_internal(parse, query_string, cursorOptions, boundParams,
                                            distributedSpatiotemporalPlan, false);
 }
 
 PlannedStmt *
-spatiotemporal_planner_internal(Query *parse, const char *query_string, int cursorOptions,
+distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, int cursorOptions,
                                 ParamListInfo boundParams,
                                 DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
 {
@@ -172,11 +172,12 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                 spatiotemporal_table->catalogTableInfo = GetTilingSchemeInfo(rangeTableEntry->relid);
                 if (curr_relid != rangeTableEntry->relid)
                 {
-                    distPlan->tablesList->numDiffTables++;
+                    distPlan->tablesList->diffCount++;
                     distPlan->joining_col = spatiotemporal_table->col;
                 }
                 else
-                    distPlan->tablesList->numSimTables++;
+                    distPlan->tablesList->simCount++;
+
                 curr_relid = rangeTableEntry->relid;
 
                 spatiotemporal_table->catalogFilter = AnalyseCatalog(spatiotemporal_table,
@@ -214,8 +215,8 @@ static void
 PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
 {
     distPlan->tablesList = (SpatiotemporalTables *) palloc0(sizeof(SpatiotemporalTables));
-    distPlan->tablesList->numDiffTables = 0;
-    distPlan->tablesList->numSimTables = 0;
+    distPlan->tablesList->diffCount = 0;
+    distPlan->tablesList->simCount = 0;
     distPlan->queryContainsReshuffledTable = false;
     distPlan->tablesList->tables = NIL;
     distPlan->postProcessing =  (PostProcessing *) palloc0(sizeof(PostProcessing));
@@ -257,7 +258,7 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
             {
                 if (IsIntersectionOperation(opExpr->opno))
                 {
-                    if (distPlan->tablesList->numDiffTables > 1)
+                    if (distPlan->tablesList->diffCount > 1)
                     {
                         AddStrategy(distPlan, NonColocation);
                     }
@@ -274,14 +275,16 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                 else if (IsDistanceOperation(opExpr->opno))
                 {
                     /* The NonColocation strategy is triggered by default until the analysis changes it */
-                    if (distPlan->tablesList->numSimTables >= 1)
+                    if (distPlan->tablesList->simCount >= 1)
                         AddStrategy(distPlan, Colocation);
                     AddStrategy(distPlan, NonColocation);
                     if(distPlan->predicatesList->predicateType == DISTANCE)
                     {
-                        ereport(ERROR, (errmsg("Currently, we do not support using more than one distance operation!")));
+                        ereport(ERROR, (errmsg("Currently, we do not support using more than "
+                                               "one distance operation in the same query !")));
                     }
-                    distPlan->predicatesList->predicateInfo->distancePredicate = (DistancePredicate *)palloc0(sizeof(DistancePredicate));
+                    distPlan->predicatesList->predicateInfo->distancePredicate = (DistancePredicate *)palloc0(
+                            sizeof(DistancePredicate));
                     distPlan->predicatesList->predicateInfo->distancePredicate = analyseDistancePredicate(clause);
                     distPlan->predicatesList->predicateType = DISTANCE;
                 }
@@ -294,9 +297,10 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                         Oid arg_oid = ((Const *)node)->consttype;
                         if (IsDistanceOperation(arg_oid))
                         {
-                            if (distPlan->tablesList->numSimTables >= 1)
+                            if (distPlan->tablesList->simCount >= 1)
                                 AddStrategy(distPlan, Colocation);
-                            distPlan->predicatesList->predicateInfo->distancePredicate = analyseDistancePredicate(node);
+                            distPlan->predicatesList->predicateInfo->distancePredicate =
+                                    analyseDistancePredicate(node);
                             AddStrategy(distPlan, NonColocation);
                             distPlan->predicatesList->predicateType = DISTANCE;
                         }
@@ -317,7 +321,7 @@ needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distP
 {
     bool res = false;
     if (((distPlan->tablesList->length > 1 && (
-            list_length(distPlan->strategies) > 0 || distPlan->tablesList->numDiffTables > 1))
+            list_length(distPlan->strategies) > 0 || distPlan->tablesList->diffCount > 1))
             || list_length(distPlan->postProcessing->distfuns) > 0)
             && !distPlan->queryContainsReshuffledTable)
         res = true;
