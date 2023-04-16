@@ -1,7 +1,7 @@
 #ifndef MULTIRELATION_H
 #define MULTIRELATION_H
 
-#include "partitioning/tiling_utils.h"
+#include "multirelation/tiling_utils.h"
 #include "distributed/listutils.h"
 
 typedef struct SpatiotemporalTableCatalog
@@ -49,8 +49,8 @@ typedef struct SpatiotemporalTable
 typedef struct SpatiotemporalTables
 {
     List *tables;
-    int numDiffTables;
-    int numSimTables;
+    int diffCount;
+    int simCount;
     int length;
 } SpatiotemporalTables;
 
