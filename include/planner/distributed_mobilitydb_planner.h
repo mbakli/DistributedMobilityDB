@@ -56,12 +56,12 @@ typedef struct GeneralScan
     int length;
 } GeneralScan;
 
-extern PlannedStmt * spatiotemporal_planner(Query *parse, const char *query_string, int cursorOptions,
+extern PlannedStmt * distributed_mobilitydb_planner(Query *parse, const char *query_string, int cursorOptions,
                                             ParamListInfo boundParams);
-extern PlannedStmt *spatiotemporal_planner_internal(Query *parse, const char *query_string, int cursorOptions,
-                                                    ParamListInfo boundParams,
-                                                    DistributedSpatiotemporalQueryPlan *distributedSpatiotemporalPlan,
-                                                    bool explain);
+extern PlannedStmt *distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, int cursorOptions,
+                                                            ParamListInfo boundParams,
+                                                            DistributedSpatiotemporalQueryPlan *distributedSpatiotemporalPlan,
+                                                            bool explain);
 extern DistributedSpatiotemporalQueryPlan *GetSpatiotemporalDistributedPlan(CustomScan *customScan);
 extern SpatiotemporalTableCatalog *GetSpatiotemporalCatalogTableInfo(RangeTblEntry *rangeTableEntry);
 

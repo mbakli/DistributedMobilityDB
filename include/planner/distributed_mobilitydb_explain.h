@@ -2,7 +2,7 @@
 #define SPATIOTEMPORAL_EXPLAIN_H
 
 #include "postgres.h"
-#include "dist_mobilitydb_planner.h"
+#include "distributed_mobilitydb_planner.h"
 #include <distributed/multi_executor.h>
 #include "executor/tstoreReceiver.h"
 #include "libpq-fe.h"
@@ -10,7 +10,7 @@
 #include "catalog/nodes.h"
 #include "executor/multi_phase_executor.h"
 
-extern void spatiotemporal_explain(Query *query, int cursorOptions, IntoClause *into,
+extern void distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into,
                             ExplainState *es, const char *queryString, ParamListInfo params,
                             QueryEnvironment *queryEnv);
 extern void RegisterSpatiotemporalPlanMethods(void);
