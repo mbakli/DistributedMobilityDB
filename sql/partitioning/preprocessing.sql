@@ -2,7 +2,7 @@ CREATE OR REPLACE FUNCTION create_temporary_points_table(table_name_in varchar(2
     RETURNS boolean AS $$
 DECLARE
 BEGIN
-    -- Distribute the table using hash partitioning
+    -- Distribute the table using hash multirelation
     IF tiling.isMobilityDB THEN
         EXECUTE format('%s', concat('CREATE TABLE ',table_name_out,' (',tiling.groupCol,' integer, ',tiling.distCol,' tgeompoint); '));
         EXECUTE format('%s', concat('INSERT INTO ', table_name_out , ' ' ||

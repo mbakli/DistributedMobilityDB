@@ -33,7 +33,7 @@ END;
 $$ LANGUAGE 'plpgsql' STRICT;
 
 ----------------------------------------------------------------------------------------------------------------------
--- partitioning_column_type returns the type of the partitioning column
+-- partitioning_column_type returns the type of the multirelation column
 ----------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION getDistributedColInternalType(table_name_in varchar(250), spatiotemporal_col_name varchar(30))
     RETURNS varchar(10) AS $$
@@ -88,7 +88,7 @@ END;
 $$ LANGUAGE 'plpgsql' STRICT;
 
 ----------------------------------------------------------------------------------------------------------------------
--- partitioning_column_name returns the partitioning column of the given table
+-- partitioning_column_name returns the multirelation column of the given table
 ----------------------------------------------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION getDistributedCol(table_name_in varchar(250))
     RETURNS varchar(30) AS $$
