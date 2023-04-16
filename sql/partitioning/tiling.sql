@@ -57,7 +57,7 @@ BEGIN
     -- Check whether the column is Postgis or Mobilitydb
     SELECT IsMobilityDBType(table_name_in, tiling)
     INTO tiling.isMobilityDB;
-    -- Check the partitioning type: Single Point or Sequenece
+    -- Check the multirelation type: Single Point or Sequenece
     SELECT getDistributedColInternalType(table_name_in, tiling.distCol)
     INTO tiling.internalType;
 
@@ -106,9 +106,9 @@ BEGIN
         start_time := clock_timestamp();
         PERFORM spatiotemporal_data_allocation(table_name_in, tiling, table_name_out, table_out_id);
         IF tiling.internaltype in ('sequence', 'sequenceset', 'linestring', 'polygon') or position('temp' in table_name_in) > 0 THEN
-            RAISE INFO 'Run-time for constructing and partitioning segments:%', (clock_timestamp() - start_time);
+            RAISE INFO 'Run-time for constructing and multirelation segments:%', (clock_timestamp() - start_time);
         ELSIF tiling.internaltype in ('instant','point') THEN
-            RAISE INFO 'Run-time for partitioning:%', (clock_timestamp() - start_time);
+            RAISE INFO 'Run-time for multirelation:%', (clock_timestamp() - start_time);
         END IF;
     END IF;
     IF tiling.internaltype not in ('instant', 'point') and tiling.granularity = 'point-based' THEN

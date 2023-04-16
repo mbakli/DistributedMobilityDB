@@ -1,9 +1,9 @@
 #ifndef PLANNER_STRATEGIES_H
 #define PLANNER_STRATEGIES_H
 #include "planner/predicate_management.h"
-#include "planner/planner_utils.h"
-#include "planner/spatiotemporal_planner.h"
-
+#include "utils/planner_utils.h"
+#include "planner/distributed_mobilitydb_planner.h"
+#define Var_Temp_Reshuffled "_reshuffled"
 
 /*
  * NeighborScan
@@ -15,17 +15,25 @@ typedef struct NeighborScan
 } NeighborScan;
 
 /* Planner strategies */
-typedef enum PlannerStrategy
+typedef enum StrategyType
 {
     Colocation,
     NonColocation,
     TileScanRebalancer,
     PredicatePushDown,
     KNN
-} PlannerStrategy;
+} StrategyType;
+
+typedef struct PlanTask
+{
+    StrategyType type;
+    SpatiotemporalTable *tbl1;
+    SpatiotemporalTable *tbl2;
+    Datum tileKey;
+} PlanTask;
 
 extern void ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
-
+extern void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type);
 #endif /* PLANNER_STRATEGIES_H */

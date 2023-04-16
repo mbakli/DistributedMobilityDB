@@ -1,15 +1,18 @@
 #ifndef PLANNER_UTILS_H
 #define PLANNER_UTILS_H
 #include "postgres.h"
-#include "partitioning/multirelation.h"
-
-#include "general/catalog_management.h"
+#include "multirelation/multirelation_utils.h"
+#include "planner/predicate_management.h"
 #include <access/skey.h>
 #include <access/genam.h>
 #include <utils/fmgroids.h>
 #include <access/table.h>
 #include <access/relation.h>
 #include <utils/rel.h>
+
+
+
+
 
 /* constants for tiles.options */
 #define Natts_MTS 14
@@ -38,10 +41,13 @@
 #define Var_Dist_Tables "pg_dist_spatiotemporal_tables"
 #define Var_Table_Tiles "pg_dist_spatiotemporal_tiles"
 
-#define Var_Schema "dist_mobilitydb"
+
 
 extern SpatiotemporalTableCatalog GetTilingSchemeInfo(Oid relationId);
 extern Oid MTSRelationId();
 extern Oid MTSTilesRelationId();
 extern Oid DisFuncRelationId();
+extern Oid DistNodeId();
+extern void AddCatalogFilterInfo(SpatiotemporalTableCatalog tbl, CatalogFilter *catalogFilter, Node *node,
+                                 PredicateType predType, bool IsConst);
 #endif /* PLANNER_UTILS_H */

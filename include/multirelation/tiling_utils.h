@@ -1,6 +1,7 @@
 #ifndef MD_TILING_H
 #define MD_TILING_H
 #include "postgres.h"
+#include "general/general_types.h"
 
 /* In-memory representation of a typed tuple in pg_dist_spatiotemporal_tiles. */
 typedef struct TileSize
@@ -24,13 +25,6 @@ typedef enum TilingGranularity
     SHAPE_BASED
 } TilingGranularity;
 
-/* Shape Type */
-typedef enum ShapeType
-{
-    SPATIAL,
-    SPATIOTEMPORAL,
-    DIFFTYPE
-} ShapeType;
 
 /* In-memory representation of a typed tuple in pg_dist_spatiotemporal_tables. */
 typedef struct MTS

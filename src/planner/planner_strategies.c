@@ -2,7 +2,7 @@
 #include "planner/planner_strategies.h"
 #include <utils/lsyscache.h>
 #include <executor/spi.h>
-
+#include <distributed/multi_executor.h>
 
 static void planReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan);
 static void chooseReshuffledTable(DistributedSpatiotemporalQueryPlan *distPlan);
@@ -12,15 +12,20 @@ static void OtherReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 static void ConstructReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan);
 static char *getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan);
 
-
+/* Non colocated Query Plan */
 extern void
 NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
     /* Create a reshuffling plan */
     planReshufflingQuery(distPlan);
+    PlanTask * strategy = (PlanTask *) palloc0(sizeof(PlanTask));
+    /* Strategy type */
+    strategy->type = NonColocation;
+    strategy->tbl1 = distPlan->reshuffled_table_base;
+    strategy->tbl2 = distPlan->reshuffledTable;
+    strategy->tileKey = (Datum) distPlan->reshuffledTable->catalogTableInfo.tileKey;
+    distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
 }
-
-
 
 /* Reshuffling Query Plan */
 static void
@@ -50,8 +55,8 @@ chooseReshuffledTable(DistributedSpatiotemporalQueryPlan *distPlan)
             distPlan->reshuffledTable = (SpatiotemporalTable *) lfirst(rangeTableCell);
     }
     StringInfo tableName = makeStringInfo();
-    appendStringInfo(tableName, "%s_reshuffled",
-                     get_rel_name(distPlan->reshuffledTable->catalogTableInfo.table_oid));
+    appendStringInfo(tableName, "%s%s",
+                     get_rel_name(distPlan->reshuffledTable->catalogTableInfo.table_oid), Var_Temp_Reshuffled);
     distPlan->reshuffledTable->catalogTableInfo.reshuffledTable = tableName->data;
 }
 
@@ -101,7 +106,8 @@ DistanceReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     appendStringInfo(catalogQuery, "FROM %s T1, %s S1, %s T2, %s S2 ",
                      Var_Dist_Tables, Var_Table_Tiles, Var_Dist_Tables, Var_Table_Tiles);
     // Prepare the where clause
-    appendStringInfo(catalogQuery, "WHERE T1.tableName='%s' AND t2.tableName='%s' AND T1.id = S1.table_id AND T2.id = S2.table_id "
+    appendStringInfo(catalogQuery, "WHERE T1.tableName='%s' AND t2.tableName='%s' AND T1.id = S1.table_id "
+                                   "AND T2.id = S2.table_id "
                                    "%s AND S2.%s && %s(S1.%s,%f) ORDER BY id1,id2 ",
                      get_rel_name(distPlan->reshuffled_table_base->catalogTableInfo.table_oid),
                      get_rel_name(distPlan->reshuffledTable->catalogTableInfo.table_oid),
@@ -140,7 +146,8 @@ OtherReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     appendStringInfo(catalogQuery, "FROM %s T1, %s S1, %s T2, %s S2 ",
                      Var_Dist_Tables, Var_Table_Tiles, Var_Dist_Tables, Var_Table_Tiles);
     // Prepare the where clause
-    appendStringInfo(catalogQuery, "WHERE T1.tbloid=%d AND t2.tbloid=%d AND T1.id = S1.table_id AND T2.id = S2.table_id "
+    appendStringInfo(catalogQuery, "WHERE T1.tbloid=%d AND t2.tbloid=%d AND T1.id = S1.table_id AND "
+                                   "T2.id = S2.table_id "
                                    "%s AND S2.%s && S1.%s ORDER BY id1,id2 ",
                      distPlan->reshuffled_table_base->catalogTableInfo.table_oid,
                      distPlan->reshuffledTable->catalogTableInfo.table_oid,
@@ -180,7 +187,9 @@ static char *
 getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan)
 {
     StringInfo catalogQuery = makeStringInfo();
-    appendStringInfo(catalogQuery, "SELECT array_to_string(array_agg(concat('\"',column_name,'\"'))::text[], ',') FROM information_schema.columns WHERE table_schema = 'public' AND table_name  = '%s' and column_name not in ('tile_key') ",
+    appendStringInfo(catalogQuery, "SELECT array_to_string(array_agg(concat('\"',column_name,'\"'))::text[], "
+                                   "',') FROM information_schema.columns WHERE table_schema = 'public' AND "
+                                   "table_name  = '%s' and column_name not in ('tile_key') ",
                      get_rel_name(distPlan->reshuffledTable->catalogTableInfo.table_oid));
     int spi_result;
     /* Connect */
@@ -211,11 +220,21 @@ getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan)
 extern void
 ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
-
+    PlanTask * strategy = (PlanTask *) palloc0(sizeof(PlanTask));
+    strategy->type = Colocation;
+    strategy->tbl1 = (SpatiotemporalTable *) list_nth(distPlan->tablesList->tables, 0);
+    strategy->tbl2 = (SpatiotemporalTable *) list_nth(distPlan->tablesList->tables, 1);
+    strategy->tileKey = (Datum) Var_Catalog_Tile_Key;
+    distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
 }
 
 extern void
 TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
-
+    /* To be added later */
+}
+extern
+void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type)
+{
+    distPlan->strategies = lappend(distPlan->strategies, (Datum *)type);
 }

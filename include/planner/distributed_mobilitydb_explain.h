@@ -2,13 +2,15 @@
 #define SPATIOTEMPORAL_EXPLAIN_H
 
 #include "postgres.h"
-#include "spatiotemporal_planner.h"
+#include "distributed_mobilitydb_planner.h"
 #include <distributed/multi_executor.h>
 #include "executor/tstoreReceiver.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "catalog/nodes.h"
+#include "executor/multi_phase_executor.h"
 
-extern void spatiotemporal_explain(Query *query, int cursorOptions, IntoClause *into,
+extern void distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into,
                             ExplainState *es, const char *queryString, ParamListInfo params,
                             QueryEnvironment *queryEnv);
 extern void RegisterSpatiotemporalPlanMethods(void);
@@ -20,10 +22,9 @@ typedef struct SpatiotemporalScanState
 
     /* function that gets called before postgres starts its execution */
     bool finishedPreScan;          /* flag to check if the pre scan is finished */
-    //void (*PreExecScan)(struct SpatiotemporalScanState *scanState);
+    void (*PreExecScan)(struct SpatiotemporalScanState *scanState);
 
     DistributedSpatiotemporalQueryPlan *distributedSpatiotemporalPlan; /* distributed execution plan */
-    //SpatiotemporalExecutorType executorType;   /* distributed executor type */
     bool finishedRemoteScan;          /* flag to check if remote scan is finished */
     Tuplestorestate *tuplestorestate; /* tuple store to store distributed results */
 } SpatiotemporalScanState;
@@ -36,5 +37,6 @@ typedef struct DistributedQueryExplain
 
 }DistributedQueryExplain;
 
+extern void ExplainQueryParameters(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
 
 #endif /* SPATIOTEMPORAL_EXPLAIN_H */

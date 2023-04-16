@@ -19,7 +19,7 @@ BEGIN
     ELSE
         RAISE INFO 'PostGIS Column: % - Geometry(%)', spatiotemporal_col_name, column_sub_type;
     END IF;
-    -- Check the partitioning type: Single Point or Sequenece
+    -- Check the multirelation type: Single Point or Sequenece
     SELECT partitioning_column_type(colocation_table, colocation_column)
     INTO colocation_column_sub_type;
 

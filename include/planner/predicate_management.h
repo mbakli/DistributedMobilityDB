@@ -1,13 +1,15 @@
 #ifndef PREDICATE_MANAGMENT_H
 #define PREDICATE_MANAGMENT_H
+#include "postgres.h"
 #include <nodes/nodes.h>
-
+#include <access/htup_details.h>
 
 typedef enum PredicateType
 {
     INTERSECTION,
     DISTANCE,
-    RANGE
+    RANGE,
+    OTHER
 } PredicateType;
 
 typedef struct RangePredicate
@@ -43,5 +45,7 @@ typedef struct Predicates
 } Predicates;
 
 extern DistancePredicate *analyseDistancePredicate(Node *clause);
-
+extern HeapTuple PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance);
+extern bool IsDistanceOperation(Oid operationId);
+extern bool IsIntersectionOperation(Oid operationId);
 #endif /* PREDICATE_MANAGMENT_H */

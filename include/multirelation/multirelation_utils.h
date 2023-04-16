@@ -1,7 +1,7 @@
 #ifndef MULTIRELATION_H
 #define MULTIRELATION_H
 
-#include "partitioning/tiling_utils.h"
+#include "multirelation/tiling_utils.h"
 #include "distributed/listutils.h"
 
 typedef struct SpatiotemporalTableCatalog
@@ -23,6 +23,15 @@ typedef struct SpatiotemporalTableCatalog
     char *reshuffledTable;
 } SpatiotemporalTableCatalog;
 
+/* Catalog Filter */
+typedef struct CatalogFilter
+{
+    Datum predicate;
+    int candidates;
+    bool tileExpand;
+    float expandValue;
+} CatalogFilter;
+
 /* Spatiotemporal Table Information */
 typedef struct SpatiotemporalTable
 {
@@ -33,15 +42,19 @@ typedef struct SpatiotemporalTable
     char *col;
     int srid;
     char *localIndex;
+    Alias *alias;
+    CatalogFilter *catalogFilter;
 } SpatiotemporalTable;
 
 typedef struct SpatiotemporalTables
 {
     List *tables;
-    int numDiffTables;
-    int numSimTables;
+    int diffCount;
+    int simCount;
     int length;
 } SpatiotemporalTables;
+
+
 
 extern bool IsDistributedSpatiotemporalTable(Oid relationId);
 extern char *GetLocalIndex(Oid relationId, char * col);

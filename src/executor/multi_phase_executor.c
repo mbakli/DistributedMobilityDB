@@ -1,60 +1,86 @@
+/*-------------------------------------------------------------------------
+ *
+ * multi_phase_executor.c
+ *	  General Distributed MobilityDB executor code.
+ *
+ *-------------------------------------------------------------------------
+ */
+
+#include "postgres.h"
+#include "executor/executor_tasks.h"
+#include "executor/multi_phase_executor.h"
 #include <distributed/multi_join_order.h>
 #include <distributed/multi_executor.h>
-#include "executor/multi_phase_executor.h"
-#include "planner/planner_utils.h"
+#include "utils/planner_utils.h"
 #include "planner/planner_strategies.h"
 
 static void ConstructNeighborScanQuery(SpatiotemporalTable *tbl, char * query_string,
                                        MultiPhaseExecutor *multiPhaseExecutor);
-static void ConstructSelfTilingScanQuery(char *query_string,
+static void ConstructSelfTilingScanQuery(PlanTask *plan, char *query_string,
                                          MultiPhaseExecutor *multiPhaseExecutor);
 static void ReshuffleData(char * query_string, MultiPhaseExecutor *multiPhaseExecutor);
 extern bool createReshuffledTable(SpatiotemporalTable *base, SpatiotemporalTable *other);
 static void DistributeReshuffledTable(int numTiles, char *tileKey, char *reshuffledTable);
-static void RearrangeTiles(Oid relid, int numTiles, char *reshuffledTable);
 static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan,
                                            MultiPhaseExecutor *multiPhaseExecutor);
-static char *taskQuery (List *tasks, ExecTaskType taskType);
-static Datum AddTilingKey(SpatiotemporalTableCatalog tblCatalog, char * query_string);
+static void IndexReshuffledData(SpatiotemporalTable *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
+static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor);
+
+
+
 /* QueryExecutor */
 extern GeneralScan *
 QueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
+{
+    MultiPhaseExecutor *multiPhaseExecutor = RunQueryExecutor(distPlan, explain);
+    GeneralScan *generalScan = ConstructGeneralQuery(distPlan, multiPhaseExecutor);
+    return generalScan;
+}
+
+/* RunQueryExecutor */
+extern MultiPhaseExecutor *
+RunQueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
 {
     MultiPhaseExecutor *multiPhaseExecutor = (MultiPhaseExecutor *) palloc0(sizeof(MultiPhaseExecutor));
     multiPhaseExecutor->tasks = NIL;
     strcpy((char *)distPlan->org_query_string,toLower((char *) distPlan->org_query_string));
     /* Loop through all strategies */
     ListCell *cell = NULL;
-    foreach(cell, distPlan->strategies)
+    foreach(cell, distPlan->strategyPlans)
     {
-        PlannerStrategy strategy = (PlannerStrategy) lfirst_int(cell);
-        if (strategy == NonColocation)
+        PlanTask *task = (PlanTask *) lfirst(cell);
+        if (task->type == NonColocation)
         {
             /* Neighbor Scan */
-            multiPhaseExecutor->table_created = createReshuffledTable( distPlan->reshuffled_table_base,
+            multiPhaseExecutor->tableCreated = createReshuffledTable( distPlan->reshuffled_table_base,
                                                                        distPlan->reshuffledTable);
-            if (multiPhaseExecutor->table_created)
+            if (multiPhaseExecutor->tableCreated)
             {
-                ReshuffleData(distPlan->reshuffling_query, multiPhaseExecutor);
-                if (multiPhaseExecutor->dataReshuffled)
-                    ConstructNeighborScanQuery(distPlan->reshuffledTable,distPlan->org_query_string, multiPhaseExecutor);
+                if (!explain)
+                    ReshuffleData(distPlan->reshuffling_query, multiPhaseExecutor);
+
+                IndexReshuffledData(distPlan->reshuffledTable, multiPhaseExecutor);
+                if (multiPhaseExecutor->dataReshuffled || explain)
+                    ConstructNeighborScanQuery(distPlan->reshuffledTable,distPlan->org_query_string,
+                                               multiPhaseExecutor);
                 else
                     elog(ERROR, "Could not reshuffle data!");
             }
             else
                 elog(ERROR, "Could not reshuffle data!");
         }
-        else if (strategy == Colocation)
+        else if (task->type == Colocation)
         {
             /* Self Tiling Scan */
-            ConstructSelfTilingScanQuery(distPlan->org_query_string, multiPhaseExecutor);
+            ConstructSelfTilingScanQuery(task, distPlan->org_query_string,
+                                         multiPhaseExecutor);
         }
     }
 
-    GeneralScan *generalScan = ConstructGeneralQuery(distPlan, multiPhaseExecutor);
-    return generalScan;
+    /* Post processing processing */
+    ConstructPostProcessingPhase(distPlan->postProcessing->coordinatorLevelOperator, multiPhaseExecutor);
+    return multiPhaseExecutor;
 }
-
 
 /* Executor Job: Create the reshuffling table */
 extern bool
@@ -123,46 +149,38 @@ CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table)
     PushActiveSnapshot(GetTransactionSnapshot());
 }
 
-/* Executor Job: Rearrange the generated tiles */
-static void
-RearrangeTiles(Oid relid, int numTiles, char *reshuffledTable)
-{
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
-    StringInfo reshuffledTablesQuery = makeStringInfo();
-    appendStringInfo(reshuffledTablesQuery,
-                     "SELECT create_reshuffled_multirelation(tablename=> '%s', "
-                     "shards=>%d , reshuffled_table=> '%s.%s');",
-                     get_rel_name(relid) ,
-                     numTiles, Var_Schema, reshuffledTable);
-    ExecuteQueryViaSPI(reshuffledTablesQuery->data, SPI_OK_SELECT);
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
-}
-
+/* Executor Job: Construct the neighbor scan */
 static void
 ConstructNeighborScanQuery(SpatiotemporalTable *tbl, char * query_string, MultiPhaseExecutor *multiPhaseExecutor)
 {
     ExecutorTask *task = (ExecutorTask *) palloc0(sizeof(ExecutorTask));
+    task->catalog_filtered = tbl->catalogFilter;
+    task->numCores = tbl->catalogTableInfo.numTiles;
+    /* Add the catalog filter */
+    if (tbl->catalogFilter->candidates > tbl->catalogTableInfo.numTiles)
+        task->catalog_filtered = tbl->catalogFilter;
     task->taskType = NeighborTilingScan;
     task->taskQuery = makeStringInfo();
     appendStringInfo(task->taskQuery, "%s",
-                     DatumGetCString(AddTilingKey(tbl->catalogTableInfo, query_string)));
+                     DatumGetCString(AddTilingKey(tbl->catalogTableInfo, tbl->alias, query_string)));
     multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
+/* Executor Job: Construct the self tiling scan */
 static void
-ConstructSelfTilingScanQuery(char * query_string, MultiPhaseExecutor *multiPhaseExecutor)
+ConstructSelfTilingScanQuery(PlanTask *plan, char * query_string, MultiPhaseExecutor *multiPhaseExecutor)
 {
     ExecutorTask *task = (ExecutorTask *) palloc0(sizeof(ExecutorTask));
     task->taskType = SelfTilingScan;
+    task->catalog_filtered = plan->tbl1->catalogFilter;
+    task->numCores = plan->tbl1->catalogTableInfo.numTiles;
     task->taskQuery = makeStringInfo();
-    appendStringInfo(task->taskQuery, "%s", replaceWord(query_string,
-                                                        "where", "WHERE T1.tile_key = T2.tile_key AND "));
+    StringInfo key = makeStringInfo();
+    appendStringInfo(key, "WHERE %s.%s = %s.%s AND ",
+                     plan->tbl1->alias->aliasname, Var_Catalog_Tile_Key,
+                     plan->tbl2->alias->aliasname, Var_Catalog_Tile_Key);
+    appendStringInfo(task->taskQuery, "%s",replaceWord(query_string,
+                                                        "where", key->data));
     multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
@@ -190,6 +208,35 @@ ReshuffleData(char *query_string, MultiPhaseExecutor *multiPhaseExecutor)
         multiPhaseExecutor->dataReshuffled = false;
 }
 
+/* Executor Job: Index the reshuffled data */
+static void
+IndexReshuffledData(SpatiotemporalTable *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor)
+{
+    int spi_result;
+    StringInfo val = makeStringInfo();
+    spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+    appendStringInfo(val, "CREATE INDEX %s_%s_idx on %s.%s USING %s(%s);",
+                     reshuffledTable->catalogTableInfo.reshuffledTable,
+                     reshuffledTable->col, Var_Schema, reshuffledTable->catalogTableInfo.reshuffledTable,
+                     Var_Spatiotemporal_Index, reshuffledTable->col);
+    spi_result = SPI_execute(val->data, false, 1);
+    if (spi_result == SPI_OK_INSERT)
+    {
+        spi_result = SPI_finish();
+        multiPhaseExecutor->indexCreated = true;
+        if (spi_result != SPI_OK_FINISH)
+        {
+            elog(ERROR, "Could not disconnect from database using SPI");
+        }
+    }
+    else
+        multiPhaseExecutor->indexCreated = false;
+}
+
 /* Executor Job: GeneralScan */
 static GeneralScan *
 ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseExecutor *multiPhaseExecutor)
@@ -198,13 +245,15 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
     generalScan->length = 0;
     generalScan->query_string = makeStringInfo();
     ListCell *cell = NULL;
+
+    /* Loop through current plan strategies involved in this query */
     foreach(cell, distPlan->strategies)
     {
-        PlannerStrategy strategy = (PlannerStrategy) lfirst_int(cell);
+        StrategyType strategy = (StrategyType) lfirst_int(cell);
         if (strategy == NonColocation)
         {
             if (generalScan->length > 0)
-                appendStringInfo(generalScan->query_string, "%s", "UNION ALL ");
+                appendStringInfo(generalScan->query_string, "%s", " UNION ");
             appendStringInfo(generalScan->query_string, "%s",
                              taskQuery(multiPhaseExecutor->tasks, NeighborTilingScan));
             generalScan->length++;
@@ -212,7 +261,7 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
         else if (strategy == Colocation)
         {
             if (generalScan->length > 0)
-                appendStringInfo(generalScan->query_string, "%s", "UNION ALL ");
+                appendStringInfo(generalScan->query_string, "%s", " UNION ");
             appendStringInfo(generalScan->query_string, "%s",
                              taskQuery(multiPhaseExecutor->tasks, SelfTilingScan));
             generalScan->length++;
@@ -220,33 +269,48 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
         else
             elog(ERROR, "The query executor could not identify the planner strategy");
     }
+    /* Loop though the post processing tasks */
+    if (generalScan->length == 0)
+        appendStringInfo(generalScan->query_string,"%s",
+                         distPlan->postProcessing->worker);
+    foreach(cell, multiPhaseExecutor->coordTasks)
+    {
+        ExecutorTask *task = (ExecutorTask *) lfirst(cell);
+        if (task->taskType == FINALScan)
+        {
+            StringInfo temp = makeStringInfo();
+            appendStringInfo(temp, "%s", change_sentence(task->taskQuery->data,
+                                                     "intermediate", generalScan->query_string->data));
+            resetStringInfo(generalScan->query_string);
+            appendStringInfo(generalScan->query_string, "%s", temp->data);
+        }
+    }
     generalScan->query = ParseQueryString(generalScan->query_string->data,
                                           NULL, 0);
     return generalScan;
 }
 
-static Datum
-AddTilingKey(SpatiotemporalTableCatalog tblCatalog, char * query_string)
+extern Datum
+GetTaskType(ExecutorTask *task)
 {
-    StringInfo tmp = makeStringInfo();
-    StringInfo task_prep = makeStringInfo();
-    appendStringInfo(tmp,"%s.%s", Var_Schema, tblCatalog.reshuffledTable);
-    appendStringInfo(task_prep, "%s",replaceWord((char *)query_string,
-                                                 get_rel_name(tblCatalog.table_oid), tmp->data));
-    return CStringGetDatum(replaceWord(
-            replaceWord(task_prep->data,"where", "WHERE T1.tile_key = T2.tile_key AND "), ";", " "));
+    if (task->taskType == NeighborTilingScan)
+        return CStringGetDatum("Neighbor Scan");
+    else if (task->taskType == SelfTilingScan)
+        return CStringGetDatum("Self Tiling Scan");
 }
 
-static char *
-taskQuery (List *tasks, ExecTaskType taskType)
+static void
+ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor)
 {
-    ListCell *cell = NULL;
-    foreach(cell, tasks)
+    if (list_length(coordOp->intermediateOp) > 0)
     {
-        ExecutorTask *task = (ExecutorTask *) lfirst(cell);
-        if (task->taskType == taskType)
-            return task->taskQuery->data;
-        else
-            continue;
+        ExecutorTask *task = ProcessIntermediateTasks(coordOp->intermediateOp);
+        multiPhaseExecutor->coordTasks = lappend(multiPhaseExecutor->coordTasks, task);
+    }
+    if (list_length(coordOp->finalOp) > 0)
+    {
+        ExecutorTask *task = ProcessFinalTasks(coordOp->finalOp);
+        multiPhaseExecutor->coordTasks = lappend(multiPhaseExecutor->coordTasks, task);
     }
 }
+

@@ -56,7 +56,7 @@ BEGIN
         IF tiling.isMobilityDB THEN
             RAISE INFO 'Generate Temporal Partitions';
         ELSE
-            RAISE Exception 'The temporal partitioning can not be applied on a spatial type!';
+            RAISE Exception 'The temporal multirelation can not be applied on a spatial type!';
         END IF;
     ELSIF tiling.type = 'spatial' THEN
         RAISE INFO 'Generate Spatial Partitions';
@@ -64,7 +64,7 @@ BEGIN
         IF tiling.isMobilityDB THEN
             RAISE INFO 'Generate Spatiotemporal Partitions:';
         ELSE
-            RAISE Exception 'The spatiotemporal partitioning can not be applied on a spatial type!';
+            RAISE Exception 'The spatiotemporal multirelation can not be applied on a spatial type!';
         END IF;
     ELSE
         RAISE Exception 'Please choose one of the following: temporal, spatial, or spatiotemporal';

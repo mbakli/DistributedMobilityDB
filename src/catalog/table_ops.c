@@ -1,16 +1,15 @@
-#include "general/catalog_management.h"
-#include "distributed/metadata_cache.h"
+#include "catalog/table_ops.h"
+#include "general/general_types.h"
+#include <distributed/metadata_cache.h>
+#include <utils/fmgroids.h>
+#include "catalog/pg_namespace.h"
+#include <distributed/metadata_utility.h>
+#include <catalog/pg_extension.h>
+#include <utils/lsyscache.h>
+#include <executor/spi.h>
+#include <access/genam.h>
 
-static HeapTuple PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance);
 static Datum *PgDistSpatiotemporalTableTupleViaCatalog(Oid relationId);
-
-/* constants for columnar.options */
-#define Anum_pg_spatiotemporal_join_operations_oid 3
-#define Anum_pg_spatiotemporal_join_operations_distance 4
-#define Anum_pg_dist_spatiotemporal_tables_oid 2
-#define Anum_pg_dist_spatiotemporal_table_name 3
-#define Natts_pg_dist_spatiotemporal_tables 9
-
 
 /*
  * PgSpatiotemporalJoinOperationTupleViaCatalog is a helper function that searches
@@ -19,7 +18,7 @@ static Datum *PgDistSpatiotemporalTableTupleViaCatalog(Oid relationId);
  * its fields.
  */
 
-static HeapTuple
+extern HeapTuple
 PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance)
 {
     const int scanKeyCount = 2;
@@ -52,60 +51,10 @@ PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance)
 }
 
 /*
- * IsDistanceOperation returns whether the given operation is a
- * distance operation or not.
- *
- * It does so by searching pg_spatiotemporal_join_operations.
- */
-bool
-IsDistanceOperation(Oid operationId)
-{
-    HeapTuple heapTuple = PgSpatiotemporalJoinOperationTupleViaCatalog(operationId, true);
-
-    bool heapTupleIsValid = HeapTupleIsValid(heapTuple);
-
-    if (heapTupleIsValid)
-    {
-        heap_freetuple(heapTuple);
-    }
-    return heapTupleIsValid;
-}
-
-/*
- * IsIntersectionOperation returns whether the given operation is an
- * intersection operation or not.
- *
- * It does so by searching pg_spatiotemporal_join_operations.
- */
-bool
-IsIntersectionOperation(Oid operationId)
-{
-    HeapTuple heapTuple = PgSpatiotemporalJoinOperationTupleViaCatalog(operationId, false);
-
-    bool heapTupleIsValid = HeapTupleIsValid(heapTuple);
-
-    if (heapTupleIsValid)
-    {
-        heap_freetuple(heapTuple);
-    }
-    return heapTupleIsValid;
-}
-
-/*
- * IsReshuffledTable returns whether relationId is a reshuffled relation or not.
- */
-
-bool
-IsReshuffledTable(Oid relationId)
-{
-    return strstr(get_rel_name(relationId), "reshuffled") != NULL;
-}
-
-/*
  * DistributedColumnType returns the distributed column type
  * Needs some improvement
  */
-int
+extern int
 DistributedColumnType(Oid relationId)
 {
     int spi_result;
@@ -119,14 +68,14 @@ DistributedColumnType(Oid relationId)
     /* Execute the query, noting the readonly status of this SQL */
     StringInfo catalogQuery = makeStringInfo();
     appendStringInfo(catalogQuery, "select distcoltype from pg_dist_spatiotemporal_tables WHERE tableName= '%s' ",
-                         get_rel_name(relationId));
+                     get_rel_name(relationId));
     spi_result = SPI_execute(catalogQuery->data, false, 1);
     /* Read back the PROJ text */
     if (spi_result == SPI_OK_SELECT)
     {
         const char * columnType = (char *)DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
-                                                               SPI_tuptable->tupdesc,
-                                                               1));
+                                                                       SPI_tuptable->tupdesc,
+                                                                       1));
         spi_result = SPI_finish();
 
         if (spi_result != SPI_OK_FINISH)
@@ -139,6 +88,16 @@ DistributedColumnType(Oid relationId)
             return SPATIOTEMPORAL;
     }
     return DIFFTYPE;
+}
+
+/*
+ * IsReshuffledTable returns whether relationId is a reshuffled relation or not.
+ */
+
+bool
+IsReshuffledTable(Oid relationId)
+{
+    return strstr(get_rel_name(relationId), "reshuffled") != NULL;
 }
 
 /* return oid of any catalog relation */

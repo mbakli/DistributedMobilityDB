@@ -27,9 +27,9 @@ BEGIN
     END IF;
     -- Add the distributed column
     EXECUTE format('%s', concat('ALTER TABLE ',table_name_out, ' ADD column ',tiling.tileKey,' integer'));
-    -- Distribute the table using range partitioning
+    -- Distribute the table using range multirelation
     EXECUTE format('%s', concat('SELECT create_distributed_table(''', table_name_out,''', ''',tiling.tileKey,''', ''range'');'));
-    -- Modify the shard ranges in the Citus Catalog as Citus does not support range partitioning by default
+    -- Modify the shard ranges in the Citus Catalog as Citus does not support range multirelation by default
     EXECUTE format('%s', concat('SELECT create_range_shards(', tiling.numTiles,' , ''', table_name_out, ''');'));
     -- Get the table columns
     IF tiling.isMobilityDB THEN
