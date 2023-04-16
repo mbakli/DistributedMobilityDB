@@ -40,29 +40,48 @@ include(TestBigEndian)
 TEST_BIG_ENDIAN(IS_BIG_ENDIAN)
 
 include_directories(SYSTEM ${GEOS_INCLUDE_DIR})
+include_directories("/usr/local/include")
 
 # libpq-fe
-# include_directories(SYSTEM ${PROJ_INCLUDE_DIRS})
+include_directories(SYSTEM ${PROJ_INCLUDE_DIRS})
 # math(EXPR POSTGIS_PROJ_VERSION "${PROJ_VERSION_MAJOR} * 10 + ${PROJ_VERSION_MINOR}")
 # message(STATUS "POSTGIS_PROJ_VERSION: ${POSTGIS_PROJ_VERSION}")
 
 
 #-------------------
+# add the MobilityDB link
+#-------------------
+include_directories("/usr/local/include/meos")
+#-------------------
 # add the subdirectories that have the C/C++ code
 #-------------------
+
 include_directories("include")
+
 add_subdirectory( "src")
 add_subdirectory("sql")
 
 
+#-------------------
+# Distributed MobilityDB objects to be linked
+#-------------------
+set (DistMobilityDB_SOURCE_NAMES
+        general
+        catalog
+        utils
+        post_processing
+        distributed_functions
+        planner
+        executor
+        )
 
-#set(PROJECT_OBJECTS "$<TARGET_OBJECTS:grid>" src/planning/planner.c include/planning/spatiotemporal_planner.h src/general/shared_library_init.c include/general/shared_library_init.h)
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:partitioning>" include/partitioning/tiling_utils.h include/partitioning/multirelation.h)
-set(PROJECT_OBJECTS "$<TARGET_OBJECTS:general>")
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:executor>" include/executor/multi_phase_executor.h)
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:planner>" include/planner/predicate_management.h include/planner/spatiotemporal_planner.h)
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:post_processing>" include/post_processing/post_processing.h)
-set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:distributed_functions>")
+#-------------------
+# Link Distributed MobilityDB Objects
+#-------------------
+foreach (subdir ${DistMobilityDB_SOURCE_NAMES} )
+    set(PROJECT_OBJECTS ${PROJECT_OBJECTS} "$<TARGET_OBJECTS:${subdir}>")
+endforeach()
+
 
 set(POSTGRESQL_DYNLIB_DIR /usr/local/pgsql/lib)
 set(POSTGRESQL_SHARE_DIR /usr/local/pgsql/share)
@@ -70,11 +89,14 @@ set(POSTGRESQL_SHARE_DIR /usr/local/pgsql/share)
 set(MOBILITYDB_LIB_NAME "${CMAKE_PROJECT_NAME}-1.0")
 add_library(${MOBILITYDB_LIB_NAME} MODULE ${PROJECT_OBJECTS})
 
+
 # Generate the .control and .sql files and put them in the build directory
+
 add_custom_target(sqlscript ALL DEPENDS ${CMAKE_BINARY_DIR}/${DISTRIBUTED_MOBILITYDB_EXTENSION_FILE})
 add_custom_target(control ALL DEPENDS ${CMAKE_BINARY_DIR}/distributed_mobilitydb.control)
 
 
 install(TARGETS ${MOBILITYDB_LIB_NAME} DESTINATION "${POSTGRESQL_DYNLIB_DIR}")
-install(FILES "${CMAKE_BINARY_DIR}/distributed_mobilitydb.control"  "${CMAKE_BINARY_DIR}/${DISTRIBUTED_MOBILITYDB_EXTENSION_FILE}"
+install(FILES "${CMAKE_BINARY_DIR}/distributed_mobilitydb.control"
+        "${CMAKE_BINARY_DIR}/${DISTRIBUTED_MOBILITYDB_EXTENSION_FILE}"
         DESTINATION "${POSTGRESQL_SHARE_DIR}/extension")
