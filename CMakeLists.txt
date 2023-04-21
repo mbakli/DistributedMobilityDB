@@ -31,7 +31,19 @@ endif()
 set(PG_MIN_MAJOR_VERSION "13")
 set(PG_MAX_MAJOR_VERSION "14")
 
-find_package(PostgreSQL ${PG_MIN_MAJOR_VERSION} REQUIRED)
+find_path(PostgreSQL_TYPE_INCLUDE_DIR
+        NAMES catalog/pg_type.h
+        PATHS
+        # Look in other places.
+        ${PostgreSQL_ROOT_DIRECTORIES}
+        PATH_SUFFIXES
+        postgresql
+        pgsql/server
+        postgresql/server
+        include/server
+        # Help the user find it if we cannot.
+        DOC "The ${PostgreSQL_INCLUDE_DIR_MESSAGE}"
+        )
 
 if(POSTGRESQL_BIN)
     # Checking POSTGRESQL_PG_CONFIG
@@ -57,9 +69,17 @@ find_program(POSTGRESQL_EXECUTABLE NAMES postgres
         ${T_POSTGRESQL_BIN}
         NO_DEFAULT_PATH
         )
+
+if (PostgreSQL_INCLUDE_DIRS)
+    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIRS}")
+else()
+    find_package(PostgreSQL ${PG_MIN_MAJOR_VERSION} REQUIRED)
+    set (PostgreSQL_INCLUDE_DIRS /usr/local/pgsql/include)
+    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIRS}")
+    include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS}/server)
+endif()
+
 include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS})
-message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIRS}")
-include_directories(SYSTEM /usr/local/pgsql/include/server)
 
 #---------------------------------------------
 # library directory
@@ -92,8 +112,7 @@ else(SHARE_DIR)
 endif(SHARE_DIR)
 
 
-message(${POSTGRESQL_PG_CONFIG})
-include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS}/server)
+#include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS}/server)
 
 # For explain
 include_directories(SYSTEM /usr/include/libsafec)
@@ -105,12 +124,11 @@ TEST_BIG_ENDIAN(IS_BIG_ENDIAN)
 
 include_directories(SYSTEM ${GEOS_INCLUDE_DIR})
 
-
 # libpq-fe
-include_directories(SYSTEM ${PROJ_INCLUDE_DIRS})
-# math(EXPR POSTGIS_PROJ_VERSION "${PROJ_VERSION_MAJOR} * 10 + ${PROJ_VERSION_MINOR}")
-# message(STATUS "POSTGIS_PROJ_VERSION: ${POSTGIS_PROJ_VERSION}")
-
+if(PROJ_INCLUDE_DIRS)
+    include_directories(SYSTEM ${PROJ_INCLUDE_DIRS})
+    message(STATUS "POSTGIS_PROJ_VERSION: ${POSTGIS_PROJ_VERSION}")
+endif()
 
 #-------------------
 # add the MobilityDB link
@@ -164,4 +182,3 @@ install(TARGETS ${MOBILITYDB_LIB_NAME} DESTINATION "${POSTGRESQL_DYNLIB_DIR}")
 install(FILES "${CMAKE_BINARY_DIR}/distributed_mobilitydb.control"
         "${CMAKE_BINARY_DIR}/${DISTRIBUTED_MOBILITYDB_EXTENSION_FILE}"
         DESTINATION "${POSTGRESQL_SHARE_DIR}/extension")
- 
