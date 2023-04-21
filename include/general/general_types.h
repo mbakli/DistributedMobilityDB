@@ -1,6 +1,8 @@
 #ifndef GENERAL_TYPES_H
 #define GENERAL_TYPES_H
 
+#include "postgres.h"
+
 /* Shape Type */
 typedef enum ShapeType
 {

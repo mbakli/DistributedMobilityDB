@@ -5,9 +5,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <liblwgeom.h>
 #include "distributed/distributed_planner.h"
 #include "planner/query_semantics.h"
 #include "distributed/multi_executor.h"
+#include "general/general_types.h"
 #include "distributed_functions/distributed_function.h"
 #include "executor/multi_phase_executor.h"
 #include "planner/planner_strategies.h"
@@ -20,6 +22,7 @@
 #include "distributed_functions/coordinator_operations.h"
 #include "distributed_functions/worker_operations.h"
 #include "nodes/makefuncs.h"
+#include "general/spatiotemporal_processing.h"
 
 
 static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
@@ -94,6 +97,8 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
                 NonColocationStrategyPlan(distPlan);
             else if (type == TileScanRebalancer)
                 TileScanRebalanceStrategyPlan(distPlan);
+            else if (type == PredicatePushDown)
+                PredicatePushDownStrategyPlan(distPlan);
             else
                 ereport(ERROR, (errmsg("This query is not supported yet!")));
         }
@@ -264,7 +269,15 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                     }
                     else if (distPlan->tablesList->length == 1)
                     {
-                        AddStrategy(distPlan, PredicatePushDown);
+                        Datum rangeBox = get_query_range(distPlan->tablesList, opExpr);
+                        if (!IsDatumEmpty(rangeBox) &&
+                            CheckTileRebalancerActivation(distPlan->tablesList, opExpr, rangeBox))
+                        {
+                            AddStrategy(distPlan, TileScanRebalancer);
+                            distPlan->range_bbox = rangeBox;
+                        }
+                        else
+                            AddStrategy(distPlan, PredicatePushDown);
                     }
                     else
                     {
@@ -290,6 +303,9 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                 }
                 else
                 {
+
+
+
                     ListCell *arg;
                     foreach(arg, opExpr->args)
                     {

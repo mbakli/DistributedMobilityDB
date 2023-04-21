@@ -1,6 +1,8 @@
 #include "postgres.h"
 #include "planner/predicate_management.h"
 #include "optimizer/planner.h"
+#include "postgresql/liblwgeom.h"
+#include "general/spatiotemporal_processing.h"
 #include <utils/timestamp.h>
 
 
@@ -69,4 +71,28 @@ IsDistanceOperation(Oid operationId)
         heap_freetuple(heapTuple);
     }
     return heapTupleIsValid;
+}
+
+extern Datum
+get_query_range(SpatiotemporalTables *tbls, OpExpr *opExpr)
+{
+    ListCell *arg;
+    foreach(arg, opExpr->args)
+    {
+        Node *dist_node = (Node *) lfirst(arg);
+        if (IsA(dist_node, Const))
+        {
+            /* TODO: replace the GBOX with STBOX when I fix the conflicts caused by meos.h */
+            GBOX * gbox = S_BOX_PTR(((Const *)dist_node)->constvalue);
+            return BOX_GET_DATUM(gbox);
+        }
+    }
+    return 0;
+}
+
+extern bool
+CheckTileRebalancerActivation(SpatiotemporalTables *tbls, OpExpr *opExpr, Datum box)
+{
+    /* Currently I removed the rebalacer to fix the citus issue */
+    return false;
 }

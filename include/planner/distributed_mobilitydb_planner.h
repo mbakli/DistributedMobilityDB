@@ -45,6 +45,7 @@ typedef struct DistributedSpatiotemporalQueryPlan
     char *catalog_query_string;
     /* It is just for visualization in the explain command */
     char *org_query_string;
+    Datum range_bbox;
     PostProcessing *postProcessing;
 } DistributedSpatiotemporalQueryPlan;
 

@@ -35,5 +35,6 @@ typedef struct PlanTask
 extern void ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
+extern void PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type);
 #endif /* PLANNER_STRATEGIES_H */

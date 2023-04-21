@@ -233,6 +233,17 @@ TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
     /* To be added later */
 }
+
+extern void
+PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
+{
+    PlanTask * strategy = (PlanTask *) palloc0(sizeof(PlanTask));
+    strategy->type = PredicatePushDown;
+    strategy->tbl1 = (SpatiotemporalTable *) list_nth(distPlan->tablesList->tables, 0);
+    strategy->tbl2 = (SpatiotemporalTable *) list_nth(distPlan->tablesList->tables, 1);
+    strategy->tileKey = (Datum) Var_Catalog_Tile_Key;
+    distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
+}
 extern
 void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type)
 {

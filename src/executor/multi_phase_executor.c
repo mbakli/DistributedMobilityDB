@@ -21,6 +21,8 @@ static void ConstructSelfTilingScanQuery(PlanTask *plan, char *query_string,
 static void ReshuffleData(char * query_string, MultiPhaseExecutor *multiPhaseExecutor);
 extern bool createReshuffledTable(SpatiotemporalTable *base, SpatiotemporalTable *other);
 static void DistributeReshuffledTable(int numTiles, char *tileKey, char *reshuffledTable);
+static void ConstructPredicatePushDownQuery(PlanTask *plan, char * query_string,
+                                            MultiPhaseExecutor *multiPhaseExecutor);
 static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan,
                                            MultiPhaseExecutor *multiPhaseExecutor);
 static void IndexReshuffledData(SpatiotemporalTable *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
@@ -73,6 +75,12 @@ RunQueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
         {
             /* Self Tiling Scan */
             ConstructSelfTilingScanQuery(task, distPlan->org_query_string,
+                                         multiPhaseExecutor);
+        }
+        else if (task->type == PredicatePushDown)
+        {
+            /* Predicate Push Down Scan */
+            ConstructPredicatePushDownQuery(task, distPlan->org_query_string,
                                          multiPhaseExecutor);
         }
     }
@@ -266,6 +274,14 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
                              taskQuery(multiPhaseExecutor->tasks, SelfTilingScan));
             generalScan->length++;
         }
+        else if (strategy == PredicatePushDown)
+        {
+            if (generalScan->length > 0)
+                appendStringInfo(generalScan->query_string, "%s", " UNION ");
+            appendStringInfo(generalScan->query_string, "%s",
+                             taskQuery(multiPhaseExecutor->tasks, PushDownScan));
+            generalScan->length++;
+        }
         else
             elog(ERROR, "The query executor could not identify the planner strategy");
     }
@@ -288,6 +304,19 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
     generalScan->query = ParseQueryString(generalScan->query_string->data,
                                           NULL, 0);
     return generalScan;
+}
+
+/* Executor Job: Construct the self tiling scan */
+static void
+ConstructPredicatePushDownQuery(PlanTask *plan, char * query_string, MultiPhaseExecutor *multiPhaseExecutor)
+{
+    ExecutorTask *task = (ExecutorTask *) palloc0(sizeof(ExecutorTask));
+    task->taskType = PushDownScan;
+    task->catalog_filtered = plan->tbl1->catalogFilter;
+    task->numCores = plan->tbl1->catalogTableInfo.numTiles;
+    task->taskQuery = makeStringInfo();
+    appendStringInfo(task->taskQuery, "%s",query_string);
+    multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
 extern Datum

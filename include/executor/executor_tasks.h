@@ -8,6 +8,7 @@ typedef enum ExecTaskType
 {
     NeighborTilingScan,
     SelfTilingScan,
+    PushDownScan,
     INTERMEDIATEScan,
     FINALScan
 } ExecTaskType;
