@@ -1,7 +1,6 @@
 #include "postgres.h"
 #include <distributed/multi_logical_planner.h>
 #include "planner/query_semantics.h"
-#include "planner/predicate_management.h"
 #include "utils/planner_utils.h"
 
 
