@@ -3,6 +3,7 @@
 #include <distributed/metadata_cache.h>
 #include <utils/fmgroids.h>
 #include "catalog/pg_namespace.h"
+#include "utils/planner_utils.h"
 #include <distributed/metadata_utility.h>
 #include <catalog/pg_extension.h>
 #include <utils/lsyscache.h>
@@ -150,7 +151,27 @@ extern bool
 IsDistributedSpatiotemporalTable(Oid relationId)
 {
     // TODO: I have to see first whether the table is spatiotemporal distributed or not.
-    return LookupCitusTableCacheEntry(relationId) != NULL;
+    if (LookupCitusTableCacheEntry(relationId) != NULL)
+    {
+        ScanKeyData scanKey[1];
+        bool indexOK = false;
+        Relation multirelation = table_open(MTSRelationId(), RowExclusiveLock);
+        ScanKeyInit(&scanKey[0], Anum_MTS_oid + 1,
+                    BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(relationId));
+
+        SysScanDesc scanDescriptor = systable_beginscan(multirelation,
+                                                        DistPlacementPlacementidIndexId(),
+                                                        indexOK,
+                                                        NULL, 1, scanKey);
+
+        HeapTuple heapTuple = systable_getnext(scanDescriptor);
+
+        bool heapTupleIsValid = HeapTupleIsValid(heapTuple);
+        systable_endscan(scanDescriptor);
+        table_close(multirelation, AccessShareLock);
+        return heapTupleIsValid;
+    }
+    return false;
 }
 
 extern char *
@@ -189,6 +210,41 @@ GetLocalIndex(Oid relationId, char * col)
             elog(ERROR, "Could not disconnect from database using SPI");
         }
         return (char *)localIndex;
+    }
+    return NULL;
+}
+
+char *
+GetShapeCol(Oid relationId)
+{
+    int spi_result;
+    bool isNull = false;
+    /* Connect */
+    spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    /* Execute the query, noting the readonly status of this SQL */
+    StringInfo catalogQuery = makeStringInfo();
+    appendStringInfo(catalogQuery, "select getDistributedCol('%s');",
+                     get_rel_name(relationId));
+
+    spi_result = SPI_execute(catalogQuery->data, true, 1);
+    /* Read back the PROJ text */
+    if (spi_result == SPI_OK_SELECT)
+    {
+        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
+        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
+        Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
+        spi_result = SPI_finish();
+
+        if (spi_result != SPI_OK_FINISH)
+        {
+            elog(ERROR, "Could not disconnect from database using SPI");
+        }
+        return DatumToString(distcol, TEXTOID);;
     }
     return NULL;
 }

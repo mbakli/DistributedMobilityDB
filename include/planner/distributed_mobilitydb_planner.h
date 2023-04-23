@@ -9,6 +9,7 @@
 #include "predicate_management.h"
 #include "nodes/makefuncs.h"
 #include "catalog/table_ops.h"
+#include "general/rte.h"
 
 
 /*
@@ -18,11 +19,11 @@
 typedef struct DistributedSpatiotemporalQueryPlan
 {
     /* reshuffled relation of one or more tables */
-    SpatiotemporalTable *reshuffledTable;
+    Rte *reshuffledTable;
     /* The base table for reshuffling */
-    SpatiotemporalTable *reshuffled_table_base;
+    STMultirelation *reshuffled_table_base;
     /* which spatiotemporal relations are accessed by this distributed plan */
-    SpatiotemporalTables *tablesList;
+    STMultirelations *tablesList;
     Predicates *predicatesList;
     Query *query;
     bool queryContainsReshuffledTable;
@@ -64,7 +65,7 @@ extern PlannedStmt *distributed_mobilitydb_planner_internal(Query *parse, const 
                                                             DistributedSpatiotemporalQueryPlan *distributedSpatiotemporalPlan,
                                                             bool explain);
 extern DistributedSpatiotemporalQueryPlan *GetSpatiotemporalDistributedPlan(CustomScan *customScan);
-extern SpatiotemporalTableCatalog *GetSpatiotemporalCatalogTableInfo(RangeTblEntry *rangeTableEntry);
+extern STMultirelationCatalog *GetSpatiotemporalCatalogTableInfo(RangeTblEntry *rangeTableEntry);
 
 
 #endif /* SPATIOTEMPORAL_PLANNER_H */

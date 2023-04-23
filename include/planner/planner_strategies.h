@@ -27,8 +27,8 @@ typedef enum StrategyType
 typedef struct PlanTask
 {
     StrategyType type;
-    SpatiotemporalTable *tbl1;
-    SpatiotemporalTable *tbl2;
+    STMultirelation *tbl1;
+    STMultirelation *tbl2;
     Datum tileKey;
 } PlanTask;
 
@@ -37,4 +37,5 @@ extern void NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPl
 extern void TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type);
+extern ReshufflingRte *GetReshufflingRte(STMultirelations *rtes);
 #endif /* PLANNER_STRATEGIES_H */

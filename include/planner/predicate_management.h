@@ -49,6 +49,6 @@ extern DistancePredicate *analyseDistancePredicate(Node *clause);
 extern HeapTuple PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance);
 extern bool IsDistanceOperation(Oid operationId);
 extern bool IsIntersectionOperation(Oid operationId);
-extern Datum get_query_range(SpatiotemporalTables *tbls, OpExpr *opExpr);
-extern bool CheckTileRebalancerActivation(SpatiotemporalTables *tbls, OpExpr *opExpr, Datum box);
+extern Datum get_query_range(STMultirelations *tbls, OpExpr *opExpr);
+extern bool CheckTileRebalancerActivation(STMultirelations *tbls, OpExpr *opExpr, Datum box);
 #endif /* PREDICATE_MANAGMENT_H */

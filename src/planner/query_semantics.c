@@ -28,7 +28,7 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
 }
 
 extern CatalogFilter *
-AnalyseCatalog(SpatiotemporalTable *tbl, FromExpr * fromExpr)
+AnalyseCatalog(STMultirelation *tbl, FromExpr * fromExpr)
 {
     CatalogFilter *catalogFilter = (CatalogFilter *) palloc0(sizeof(CatalogFilter));
     List *clauseList = WhereClauseList(fromExpr);

@@ -4,6 +4,8 @@
 #include <executor/spi.h>
 #include "executor/tile_tasks.h"
 #include "utils/helper_functions.h"
+#include "general/rte.h"
+#include "utils/planner_utils.h"
 
 char *
 taskQuery (List *tasks, ExecTaskType taskType)
@@ -41,7 +43,7 @@ RearrangeTiles(Oid relid, int numTiles, char *reshuffledTable)
 }
 
 Datum
-AddTilingKey(SpatiotemporalTableCatalog tblCatalog, Alias *alias ,char * query_string)
+AddTilingKey(STMultirelationCatalog tblCatalog, Alias *alias ,char * query_string)
 {
     StringInfo tmp = makeStringInfo();
     StringInfo task_prep = makeStringInfo();
@@ -53,4 +55,25 @@ AddTilingKey(SpatiotemporalTableCatalog tblCatalog, Alias *alias ,char * query_s
     appendStringInfo(tmp, "WHERE %s.%s = %s.%s AND", alias->aliasname, tblCatalog.tileKey,
                      alias->aliasname, tblCatalog.tileKey);
     return CStringGetDatum(replaceWord( replaceWord(task_prep->data,"where", tmp->data), ";", " "));
+}
+
+Datum
+AddNonStRteTilingKey(Rte *tbl, Alias *alias ,char * query_string)
+{
+    if(tbl->RteType == CitusRte)
+    {
+        CitusRteNode *citusRteNode = (CitusRteNode *)tbl->rte;
+        RangeTblEntry * cell = (RangeTblEntry *) lfirst(citusRteNode->rangeTableCell);
+        StringInfo tmp = makeStringInfo();
+        StringInfo task_prep = makeStringInfo();
+        appendStringInfo(tmp,"%s.%s", Var_Schema, citusRteNode->reshuffledTable);
+        appendStringInfo(task_prep, "%s",replaceWord((char *)query_string,
+                                                     get_rel_name(cell->relid), tmp->data));
+
+        resetStringInfo(tmp);
+        appendStringInfo(tmp, "WHERE %s.%s = %s.%s AND", cell->alias->aliasname, Var_Catalog_Tile_Key,
+                         alias->aliasname, Var_Catalog_Tile_Key);
+        return CStringGetDatum(replaceWord( replaceWord(task_prep->data,"where", tmp->data), ";", " "));
+    }
+    return 0;
 }

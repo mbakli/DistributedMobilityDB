@@ -3,10 +3,10 @@
 #include "utils/planner_utils.h"
 #include "catalog/pg_dist_spatiotemporal_dist_functions.h"
 
-extern SpatiotemporalTableCatalog
+extern STMultirelationCatalog
 GetTilingSchemeInfo(Oid relationId)
 {
-    SpatiotemporalTableCatalog catalog;
+    STMultirelationCatalog catalog;
     Datum datumArray[Natts_MTS];
     bool isNullArray[Natts_MTS];
     ScanKeyData scanKey[1];
@@ -63,6 +63,7 @@ MTSTilesRelationId()
     return RelationId(Var_Table_Tiles);
 }
 
+
 /* return oid of the distributed functions */
 extern Oid
 DisFuncRelationId()
@@ -71,7 +72,7 @@ DisFuncRelationId()
 }
 
 extern void
-AddCatalogFilterInfo(SpatiotemporalTableCatalog tbl, CatalogFilter *catalogFilter, Node *node,
+AddCatalogFilterInfo(STMultirelationCatalog tbl, CatalogFilter *catalogFilter, Node *node,
                      PredicateType predType, bool IsConst)
 {
     if (node == NULL)

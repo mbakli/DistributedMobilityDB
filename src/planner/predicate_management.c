@@ -74,7 +74,7 @@ IsDistanceOperation(Oid operationId)
 }
 
 extern Datum
-get_query_range(SpatiotemporalTables *tbls, OpExpr *opExpr)
+get_query_range(STMultirelations *tbls, OpExpr *opExpr)
 {
     ListCell *arg;
     foreach(arg, opExpr->args)
@@ -91,7 +91,7 @@ get_query_range(SpatiotemporalTables *tbls, OpExpr *opExpr)
 }
 
 extern bool
-CheckTileRebalancerActivation(SpatiotemporalTables *tbls, OpExpr *opExpr, Datum box)
+CheckTileRebalancerActivation(STMultirelations *tbls, OpExpr *opExpr, Datum box)
 {
     /* Currently I removed the rebalacer to fix the citus issue */
     return false;

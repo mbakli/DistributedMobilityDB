@@ -25,6 +25,7 @@ typedef struct MultiPhaseExecutor
 extern GeneralScan * QueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain);
 extern MultiPhaseExecutor * RunQueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain);
 extern void DropReshuffledTableIfExists(char * reshuffled_table);
-extern void CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table);
+extern void CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table, bool tile_key);
 extern Datum GetTaskType(ExecutorTask *task);
+extern bool ColocateRte(STMultirelation *base, Rte *other);
 #endif /* SPATIOTEMPORAL_EXECUTOR_H */

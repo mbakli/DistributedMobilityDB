@@ -14,18 +14,18 @@
 #include "utils/planner_utils.h"
 #include "planner/planner_strategies.h"
 
-static void ConstructNeighborScanQuery(SpatiotemporalTable *tbl, char * query_string,
+static void ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,
                                        MultiPhaseExecutor *multiPhaseExecutor);
 static void ConstructSelfTilingScanQuery(PlanTask *plan, char *query_string,
                                          MultiPhaseExecutor *multiPhaseExecutor);
 static void ReshuffleData(char * query_string, MultiPhaseExecutor *multiPhaseExecutor);
-extern bool createReshuffledTable(SpatiotemporalTable *base, SpatiotemporalTable *other);
+extern bool createReshuffledTable(STMultirelation *base, STMultirelation *other);
 static void DistributeReshuffledTable(int numTiles, char *tileKey, char *reshuffledTable);
 static void ConstructPredicatePushDownQuery(PlanTask *plan, char * query_string,
                                             MultiPhaseExecutor *multiPhaseExecutor);
 static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan,
                                            MultiPhaseExecutor *multiPhaseExecutor);
-static void IndexReshuffledData(SpatiotemporalTable *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
+static void IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
 static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor);
 
 
@@ -54,16 +54,21 @@ RunQueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
         if (task->type == NonColocation)
         {
             /* Neighbor Scan */
-            multiPhaseExecutor->tableCreated = createReshuffledTable( distPlan->reshuffled_table_base,
-                                                                       distPlan->reshuffledTable);
+            if (distPlan->reshuffledTable->RteType == STRte)
+                multiPhaseExecutor->tableCreated = createReshuffledTable( distPlan->reshuffled_table_base,
+                                                                          (STMultirelation *)distPlan->reshuffledTable->rte);
+            else if (distPlan->reshuffledTable->RteType == CitusRte)
+                multiPhaseExecutor->tableCreated = ColocateRte( distPlan->reshuffled_table_base,
+                                                                          distPlan->reshuffledTable);
             if (multiPhaseExecutor->tableCreated)
             {
                 if (!explain)
                     ReshuffleData(distPlan->reshuffling_query, multiPhaseExecutor);
-
                 IndexReshuffledData(distPlan->reshuffledTable, multiPhaseExecutor);
                 if (multiPhaseExecutor->dataReshuffled || explain)
-                    ConstructNeighborScanQuery(distPlan->reshuffledTable,distPlan->org_query_string,
+                    ConstructNeighborScanQuery(distPlan->reshuffledTable,
+                                               distPlan->org_query_string,
+                                               distPlan->reshuffled_table_base,
                                                multiPhaseExecutor);
                 else
                     elog(ERROR, "Could not reshuffle data!");
@@ -90,9 +95,50 @@ RunQueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
     return multiPhaseExecutor;
 }
 
+
+/* Executor Job: Colocation  */
+extern bool
+ColocateRte(STMultirelation *base, Rte *other)
+{
+    SetConfigOption("allow_system_table_mods", "true", PGC_POSTMASTER,
+                    PGC_S_OVERRIDE);
+    if (other->RteType == CitusRte)
+    {
+        CitusRteNode *citusRteNode = (CitusRteNode *)other->rte;
+        RangeTblEntry * cell = (RangeTblEntry *) lfirst(citusRteNode->rangeTableCell);
+        /* Prepare the reshuffled table Query */
+        char *reshuffled_table = get_rel_name(cell->relid);
+        Var *distributionColumn = DistPartitionKey(base->catalogTableInfo.table_oid);
+        int shardCount = ShardIntervalCount(base->catalogTableInfo.table_oid);
+        char *parentRelationName = NULL;
+
+        DropReshuffledTableIfExists(citusRteNode->reshuffledTable);
+        CreateReshuffledTableIfNotExists(citusRteNode->reshuffledTable,
+                                         reshuffled_table, true);
+        Oid reshuffled_table_oid = get_relname_relid(citusRteNode->reshuffledTable,
+                                                     get_namespace_oid(Var_Schema, false));
+        Relation relation = try_relation_open(reshuffled_table_oid, ExclusiveLock);
+        if (relation == NULL)
+        {
+            ereport(ERROR, (errmsg("could not create distributed table: "
+                                   "relation %s does not exist", get_rel_name(reshuffled_table_oid))));
+        }
+        relation_close(relation, NoLock);
+        CreateDistributedTable(reshuffled_table_oid, distributionColumn,
+                               DISTRIBUTE_BY_RANGE, shardCount, true,
+                               parentRelationName, true);
+
+        RearrangeTiles(base->catalogTableInfo.table_oid, base->catalogTableInfo.numTiles,
+                       citusRteNode->reshuffledTable);
+        return true;
+    }
+    return false;
+
+}
+
 /* Executor Job: Create the reshuffling table */
 extern bool
-createReshuffledTable(SpatiotemporalTable *base, SpatiotemporalTable *other)
+createReshuffledTable(STMultirelation *base, STMultirelation *other)
 {
     SetConfigOption("allow_system_table_mods", "true", PGC_POSTMASTER,
                     PGC_S_OVERRIDE);
@@ -104,7 +150,7 @@ createReshuffledTable(SpatiotemporalTable *base, SpatiotemporalTable *other)
 
     DropReshuffledTableIfExists(other->catalogTableInfo.reshuffledTable);
     CreateReshuffledTableIfNotExists(other->catalogTableInfo.reshuffledTable,
-                                     reshuffled_table);
+                                     reshuffled_table, false);
     Oid reshuffled_table_oid = get_relname_relid(other->catalogTableInfo.reshuffledTable,
                                                  get_namespace_oid(Var_Schema, false));
     Relation relation = try_relation_open(reshuffled_table_oid, ExclusiveLock);
@@ -142,7 +188,7 @@ DropReshuffledTableIfExists(char * reshuffled_table)
 
 /* Executor Job: Create the reshuffled table if not exists */
 extern void
-CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table)
+CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table, bool tile_key)
 {
     PopActiveSnapshot();
     CommitTransactionCommand();
@@ -150,6 +196,9 @@ CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table)
     PushActiveSnapshot(GetTransactionSnapshot());
     StringInfo query = makeStringInfo();
     appendStringInfo(query, "CREATE TABLE %s.%s(LIKE %s);", Var_Schema,reshuffled_table, org_table);
+    if(tile_key)
+        appendStringInfo(query, "ALTER TABLE %s.%s ADD COLUMN %s integer;", Var_Schema,reshuffled_table,
+                         Var_Catalog_Tile_Key);
     ExecuteQueryViaSPI(query->data, SPI_OK_UTILITY);
     PopActiveSnapshot();
     CommitTransactionCommand();
@@ -159,18 +208,32 @@ CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table)
 
 /* Executor Job: Construct the neighbor scan */
 static void
-ConstructNeighborScanQuery(SpatiotemporalTable *tbl, char * query_string, MultiPhaseExecutor *multiPhaseExecutor)
+ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,MultiPhaseExecutor *multiPhaseExecutor)
 {
     ExecutorTask *task = (ExecutorTask *) palloc0(sizeof(ExecutorTask));
-    task->catalog_filtered = tbl->catalogFilter;
-    task->numCores = tbl->catalogTableInfo.numTiles;
-    /* Add the catalog filter */
-    if (tbl->catalogFilter->candidates > tbl->catalogTableInfo.numTiles)
-        task->catalog_filtered = tbl->catalogFilter;
     task->taskType = NeighborTilingScan;
     task->taskQuery = makeStringInfo();
-    appendStringInfo(task->taskQuery, "%s",
-                     DatumGetCString(AddTilingKey(tbl->catalogTableInfo, tbl->alias, query_string)));
+    if (tbl->RteType == STRte)
+    {
+        STMultirelation *stMultirelation = (STMultirelation *)tbl->rte;
+        task->catalog_filtered = stMultirelation->catalogFilter;
+        task->numCores = stMultirelation->catalogTableInfo.numTiles;
+        /* Add the catalog filter */
+        if (stMultirelation->catalogFilter->candidates > stMultirelation->catalogTableInfo.numTiles)
+            task->catalog_filtered = stMultirelation->catalogFilter;
+        appendStringInfo(task->taskQuery, "%s",
+                         DatumGetCString(AddTilingKey(stMultirelation->catalogTableInfo, tbl->alias, query_string)));
+    }
+    else if (tbl->RteType == CitusRte)
+    {
+        task->catalog_filtered = base->catalogFilter;
+        task->numCores = base->catalogTableInfo.numTiles;
+        /* Add the catalog filter */
+        if (base->catalogFilter->candidates > base->catalogTableInfo.numTiles)
+            task->catalog_filtered = base->catalogFilter;
+        appendStringInfo(task->taskQuery, "%s",
+                         DatumGetCString( AddNonStRteTilingKey(tbl, base->alias, query_string)));
+    }
     multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
@@ -180,8 +243,16 @@ ConstructSelfTilingScanQuery(PlanTask *plan, char * query_string, MultiPhaseExec
 {
     ExecutorTask *task = (ExecutorTask *) palloc0(sizeof(ExecutorTask));
     task->taskType = SelfTilingScan;
-    task->catalog_filtered = plan->tbl1->catalogFilter;
-    task->numCores = plan->tbl1->catalogTableInfo.numTiles;
+    if (plan->tbl1->catalogFilter == NULL)
+    {
+        task->catalog_filtered = plan->tbl2->catalogFilter;
+        task->numCores = plan->tbl2->catalogTableInfo.numTiles;
+    }
+    else
+    {
+        task->catalog_filtered = plan->tbl1->catalogFilter;
+        task->numCores = plan->tbl1->catalogTableInfo.numTiles;
+    }
     task->taskQuery = makeStringInfo();
     StringInfo key = makeStringInfo();
     appendStringInfo(key, "WHERE %s.%s = %s.%s AND ",
@@ -218,7 +289,7 @@ ReshuffleData(char *query_string, MultiPhaseExecutor *multiPhaseExecutor)
 
 /* Executor Job: Index the reshuffled data */
 static void
-IndexReshuffledData(SpatiotemporalTable *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor)
+IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor)
 {
     int spi_result;
     StringInfo val = makeStringInfo();
@@ -227,10 +298,23 @@ IndexReshuffledData(SpatiotemporalTable *reshuffledTable, MultiPhaseExecutor *mu
     {
         elog(ERROR, "Could not connect to database using SPI");
     }
-    appendStringInfo(val, "CREATE INDEX %s_%s_idx on %s.%s USING %s(%s);",
-                     reshuffledTable->catalogTableInfo.reshuffledTable,
-                     reshuffledTable->col, Var_Schema, reshuffledTable->catalogTableInfo.reshuffledTable,
-                     Var_Spatiotemporal_Index, reshuffledTable->col);
+    if (reshuffledTable->RteType == STRte)
+    {
+        STMultirelation *stMultirelation = (STMultirelation *)reshuffledTable->rte;
+        appendStringInfo(val, "CREATE INDEX %s_%s_idx on %s.%s USING %s(%s);",
+                         stMultirelation->catalogTableInfo.reshuffledTable,
+                         stMultirelation->col, Var_Schema, stMultirelation->catalogTableInfo.reshuffledTable,
+                         Var_Spatiotemporal_Index, stMultirelation->col);
+    }
+    else if (reshuffledTable->RteType == CitusRte)
+    {
+        CitusRteNode *citusRteNode = (CitusRteNode *)reshuffledTable->rte;
+        appendStringInfo(val, "CREATE INDEX %s_%s_idx on %s.%s USING %s(%s);",
+                         citusRteNode->reshuffledTable,
+                         citusRteNode->col, Var_Schema, citusRteNode->reshuffledTable,
+                         Var_Spatiotemporal_Index, citusRteNode->col);
+
+    }
     spi_result = SPI_execute(val->data, false, 1);
     if (spi_result == SPI_OK_INSERT)
     {
