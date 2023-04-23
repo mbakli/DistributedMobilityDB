@@ -1,6 +1,7 @@
 #ifndef PREDICATE_MANAGMENT_H
 #define PREDICATE_MANAGMENT_H
 #include "postgres.h"
+#include "multirelation/multirelation_utils.h"
 #include <nodes/nodes.h>
 #include <access/htup_details.h>
 
@@ -48,4 +49,6 @@ extern DistancePredicate *analyseDistancePredicate(Node *clause);
 extern HeapTuple PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance);
 extern bool IsDistanceOperation(Oid operationId);
 extern bool IsIntersectionOperation(Oid operationId);
+extern Datum get_query_range(STMultirelations *tbls, OpExpr *opExpr);
+extern bool CheckTileRebalancerActivation(STMultirelations *tbls, OpExpr *opExpr, Datum box);
 #endif /* PREDICATE_MANAGMENT_H */

@@ -56,10 +56,10 @@ char * GetRandomTileId(Oid relationId, ExecTaskType taskType)
 
     /* Execute the query, noting the readonly status of this SQL */
     StringInfo logicalrel = makeStringInfo();
-    if (taskType == NeighborTilingScan)
+    /*if (taskType == NeighborTilingScan)
         appendStringInfo(logicalrel, "%s.%s", Var_Schema, get_rel_name(relationId));
-    else
-        appendStringInfo(logicalrel, "%s", get_rel_name(relationId));
+    else*/
+    appendStringInfo(logicalrel, "%s", get_rel_name(relationId));
     StringInfo catalogQuery = makeStringInfo();
     appendStringInfo(catalogQuery, "SELECT concat('%s_',shard.shardid,' ')\n"
                                    "FROM pg_dist_placement AS placement, pg_dist_node AS node, pg_dist_shard As shard\n"

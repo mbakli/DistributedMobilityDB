@@ -43,11 +43,11 @@
 
 
 
-extern SpatiotemporalTableCatalog GetTilingSchemeInfo(Oid relationId);
+extern STMultirelationCatalog GetTilingSchemeInfo(Oid relationId);
 extern Oid MTSRelationId();
 extern Oid MTSTilesRelationId();
 extern Oid DisFuncRelationId();
 extern Oid DistNodeId();
-extern void AddCatalogFilterInfo(SpatiotemporalTableCatalog tbl, CatalogFilter *catalogFilter, Node *node,
+extern void AddCatalogFilterInfo(STMultirelationCatalog tbl, CatalogFilter *catalogFilter, Node *node,
                                  PredicateType predType, bool IsConst);
 #endif /* PLANNER_UTILS_H */

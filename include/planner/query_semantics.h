@@ -4,6 +4,6 @@
 #include "multirelation/multirelation_utils.h"
 
 extern void analyseSelectClause(List *targetList, PostProcessing *postProcessing);
-extern CatalogFilter *AnalyseCatalog(SpatiotemporalTable *tbl, FromExpr * fromExpr);
+extern CatalogFilter *AnalyseCatalog(STMultirelation *tbl, FromExpr * fromExpr);
 
 #endif /* QUERY_SEMANTICS_CHECK_H */

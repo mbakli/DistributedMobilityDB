@@ -5,9 +5,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <liblwgeom.h>
 #include "distributed/distributed_planner.h"
 #include "planner/query_semantics.h"
 #include "distributed/multi_executor.h"
+#include "general/general_types.h"
 #include "distributed_functions/distributed_function.h"
 #include "executor/multi_phase_executor.h"
 #include "planner/planner_strategies.h"
@@ -20,6 +22,8 @@
 #include "distributed_functions/coordinator_operations.h"
 #include "distributed_functions/worker_operations.h"
 #include "nodes/makefuncs.h"
+#include "general/spatiotemporal_processing.h"
+#include "general/rte.h"
 
 
 static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
@@ -56,8 +60,10 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     List *rangeTableList = ExtractRangeTableEntryList(parse);
     /* Copy the parse tree for later use */
     distPlan->query = parse;
+    if (query_string == NULL)
+        return distributed_planner(parse, query_string, cursorOptions, boundParams);
     analyzeDistributedSpatiotemporalTables(rangeTableList, distPlan);
-    if (distPlan->tablesList->length == 0 || query_string == NULL)
+    if (distPlan->tablesList->length == 0 )
         return distributed_planner(parse, query_string, cursorOptions, boundParams);
 
     /* Initialize the post processing phase */
@@ -94,6 +100,8 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
                 NonColocationStrategyPlan(distPlan);
             else if (type == TileScanRebalancer)
                 TileScanRebalanceStrategyPlan(distPlan);
+            else if (type == PredicatePushDown)
+                PredicatePushDownStrategyPlan(distPlan);
             else
                 ereport(ERROR, (errmsg("This query is not supported yet!")));
         }
@@ -141,19 +149,20 @@ GetSpatiotemporalDistributedPlan(CustomScan *customScan)
  */
 static void
 analyzeDistributedSpatiotemporalTables(List *rangeTableList,
-                                       DistributedSpatiotemporalQueryPlan *distPlan) {
-    /* TODO: Find a way to stop the function if it is not a spatiotemporal query */
+                                       DistributedSpatiotemporalQueryPlan *distPlan)
+{
     ListCell *rangeTableCell = NULL;
     Oid curr_relid = -1;
     bool shapeType;
-    List *spatiotemporal_tables = NIL;
-
-    foreach(rangeTableCell, rangeTableList) {
+    List *rtes = NIL;
+    foreach(rangeTableCell, rangeTableList)
+    {
         RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
         if (rangeTableEntry->rtekind != RTE_RELATION) {
             continue;
         }
-        if (IsDistributedSpatiotemporalTable(rangeTableEntry->relid)) {
+        if (IsDistributedSpatiotemporalTable(rangeTableEntry->relid))
+        {
             if(IsReshuffledTable(rangeTableEntry->relid))
             {
                 distPlan->queryContainsReshuffledTable = true;
@@ -162,14 +171,8 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
             shapeType = DistributedColumnType(rangeTableEntry->relid);
             if (shapeType == SPATIAL || shapeType == SPATIOTEMPORAL)
             {
-                SpatiotemporalTable *spatiotemporal_table =
-                        (SpatiotemporalTable *) palloc0(sizeof(SpatiotemporalTable));
-                spatiotemporal_table->shapeType = shapeType;
-                spatiotemporal_table->col = GetSpatiotemporalCol(rangeTableEntry->relid);
-                spatiotemporal_table->alias = rangeTableEntry->alias;
-                spatiotemporal_table->localIndex = GetLocalIndex(rangeTableEntry->relid,
-                                                                 spatiotemporal_table->col);
-                spatiotemporal_table->catalogTableInfo = GetTilingSchemeInfo(rangeTableEntry->relid);
+
+                STMultirelation *spatiotemporal_table = GetMultirelationInfo(rangeTableEntry, shapeType);
                 if (curr_relid != rangeTableEntry->relid)
                 {
                     distPlan->tablesList->diffCount++;
@@ -182,12 +185,52 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
 
                 spatiotemporal_table->catalogFilter = AnalyseCatalog(spatiotemporal_table,
                                                                      distPlan->query->jointree);
-                spatiotemporal_tables = lappend(spatiotemporal_tables , spatiotemporal_table);
+                Rte *rteNode = GetRteNode((Node *) spatiotemporal_table, STRte, rangeTableEntry->alias);
+                rtes = lappend(rtes , rteNode);
                 distPlan->tablesList->length++;
+                distPlan->tablesList->stCount++;
+            }
+        }
+        else
+        {
+            /* Table is not distributed using any of the following dimensions:
+             * 1D (Temporal Tiling)
+             * 2D (Spatial Tiling)
+             * 3D (Spatiotemporal)
+             * */
+
+            if (LookupCitusTableCacheEntry(rangeTableEntry->relid) != NULL)
+            {
+                char partitioningMethod = PartitionMethodViaCatalog (rangeTableEntry->relid);
+                if (partitioningMethod == DISTRIBUTE_BY_HASH || partitioningMethod == DISTRIBUTE_BY_RANGE)
+                {
+                    /* Citus table processing */
+                    CitusRteNode *citusNode = GetCitusRteInfo(rangeTableEntry,partitioningMethod);
+                    citusNode->rangeTableCell = rangeTableCell;
+                    distPlan->tablesList->length++;
+                    Rte *rteNode = GetRteNode((Node *) citusNode, CitusRte, rangeTableEntry->alias);
+                    rtes = lappend(rtes , rteNode);
+                    distPlan->tablesList->length++;
+                    distPlan->tablesList->nonStCount++;
+                }
+                else
+                    elog(ERROR, "The %s table is not distributed using one of the supported partitioning methods",
+                         get_rel_name(rangeTableEntry->relid));
+            }
+            else
+            {
+                /* Local table processing */
+               /* LocalRteNode *localRte = GetLocalRteInfo(rangeTableEntry);
+                // CheckBroadcastingPossibility(localRte);
+                distPlan->tablesList->length++;
+                Rte *rteNode = GetRteNode((Node *) localRte, CitusRte, rangeTableEntry->alias);
+                rtes = lappend(rtes , rteNode);
+                distPlan->tablesList->length++;*/
             }
         }
     }
-    distPlan->tablesList->tables = spatiotemporal_tables;
+
+    distPlan->tablesList->tables = rtes;
 }
 
 static PlannedStmt *
@@ -201,7 +244,14 @@ EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions, Param
     foreach(rangeTableCell, parse->rtable) {
         RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
         if (IsDistributedSpatiotemporalTable(rangeTableEntry->relid) && parse->commandType == CMD_SELECT)
+        {
+            /* at least one distriubted table */
             res = true;
+        }
+        /*if(IsReshuffledTable(rangeTableEntry->relid)) {
+            res = false;
+            break;
+        }*/
     }
     if (res)
         return result;
@@ -214,9 +264,10 @@ EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions, Param
 static void
 PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
 {
-    distPlan->tablesList = (SpatiotemporalTables *) palloc0(sizeof(SpatiotemporalTables));
+    distPlan->tablesList = (STMultirelations *) palloc0(sizeof(STMultirelations));
     distPlan->tablesList->diffCount = 0;
     distPlan->tablesList->simCount = 0;
+    distPlan->tablesList->nonStCount = 0;
     distPlan->queryContainsReshuffledTable = false;
     distPlan->tablesList->tables = NIL;
     distPlan->postProcessing =  (PostProcessing *) palloc0(sizeof(PostProcessing));
@@ -264,7 +315,15 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                     }
                     else if (distPlan->tablesList->length == 1)
                     {
-                        AddStrategy(distPlan, PredicatePushDown);
+                        Datum rangeBox = get_query_range(distPlan->tablesList, opExpr);
+                        if (!IsDatumEmpty(rangeBox) &&
+                            CheckTileRebalancerActivation(distPlan->tablesList, opExpr, rangeBox))
+                        {
+                            AddStrategy(distPlan, TileScanRebalancer);
+                            distPlan->range_bbox = rangeBox;
+                        }
+                        else
+                            AddStrategy(distPlan, PredicatePushDown);
                     }
                     else
                     {

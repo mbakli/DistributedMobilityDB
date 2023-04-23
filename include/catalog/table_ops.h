@@ -16,5 +16,6 @@ extern  char * GetSpatiotemporalCol(Oid relationId);
 extern char * GetGlobalIndexInfo(Oid relid);
 extern Oid RelationId(const char *relationName);
 extern bool IsDistributedSpatiotemporalTable(Oid relationId);
+char *GetShapeCol(Oid relationId);
 
 #endif /* TABLE_OPS_H */

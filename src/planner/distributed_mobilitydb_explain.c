@@ -22,8 +22,8 @@ static char * getQueryType(List *strategies);
 static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
                                        int indent_group);
 static void ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
-static void ExplainOneTask(ExecutorTask *task, ExplainState *es, int indent_group);
-static char * GetLocalQuery(char *query_string, ExecTaskType taskType);
+static void ExplainOneTask(ExecutorTask *task, STMultirelation *base, ExplainState *es, int indent_group);
+static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType);
 
 /* create custom scan method for the spatiotemporal executor */
 CustomScanMethods SpatiotemporalExecutorMethod = {
@@ -210,7 +210,7 @@ static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, Expla
 static void
 ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group)
 {
-   MultiPhaseExecutor *multiPhaseExecutor = RunQueryExecutor(distPlan, true);
+    MultiPhaseExecutor *multiPhaseExecutor = RunQueryExecutor(distPlan, true);
     ListCell *cell = NULL;
     foreach(cell, multiPhaseExecutor->tasks)
     {
@@ -223,12 +223,12 @@ ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState
         appendStringInfo(es->str, "Tasks Shown: One of %d\n", task->catalog_filtered->candidates);
         appendStringInfoSpaces(es->str, es->indent * indent_group + 10);
         appendStringInfo(es->str, "-> Task:\n");
-        ExplainOneTask(task, es, indent_group);
+        ExplainOneTask(task, distPlan->reshuffled_table_base, es, indent_group);
         es->indent -= 5;
     }
 }
 static void
-ExplainOneTask(ExecutorTask *task, ExplainState *es, int indent_group)
+ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int indent_group)
 {
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
     TaskNode *taskNode = GetNodeInfo();
@@ -236,7 +236,7 @@ ExplainOneTask(ExecutorTask *task, ExplainState *es, int indent_group)
     appendStringInfo(es->str, "port=%d ", taskNode->port);
     appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(taskNode->db));
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
-    char *OneTileQuery = GetLocalQuery(task->taskQuery->data, task->taskType);
+    char *OneTileQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid, task->taskType);
     Query *parse = ParseQueryString(OneTileQuery, NULL, 0);
     PlannedStmt *plan = pg_plan_query_compat(parse, NULL, 0, NULL);
     instr_time planduration;
@@ -249,7 +249,7 @@ ExplainOneTask(ExecutorTask *task, ExplainState *es, int indent_group)
 }
 
 static char *
-GetLocalQuery(char *query_string, ExecTaskType taskType)
+GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType)
 {
     if (query_string != NULL)
     {
@@ -267,11 +267,11 @@ GetLocalQuery(char *query_string, ExecTaskType taskType)
             // Get random tile key
             if (i == 0)
             {
-                appendStringInfo(tileId, "%s", GetRandomTileId(rangeTableEntry->relid, taskType));
+                appendStringInfo(tileId, "%s", GetRandomTileId(base, taskType));
                 i = 1;
             }
             StringInfo  t = makeStringInfo();
-            appendStringInfo(t, "%s ", get_rel_name(rangeTableEntry->relid));
+            appendStringInfo(t, "%s ", get_rel_name(base));
             // Replace it in the query string
             appendStringInfo(replace, "%s ", replaceWord(final_query->data, t->data,
                                                          tileId->data));
@@ -286,7 +286,8 @@ GetLocalQuery(char *query_string, ExecTaskType taskType)
         if (taskType == NeighborTilingScan)
         {
             resetStringInfo(replace);
-            appendStringInfo(replace, "%s.%s", Var_Schema, tileId->data);
+            // appendStringInfo(replace, "%s.%s", Var_Schema, tileId->data);
+            appendStringInfo(replace, "%s", tileId->data);
             StringInfo  t = makeStringInfo();
             appendStringInfo(t, " %s", tileId->data);
             return replaceWord(final_query->data, t->data, replace->data);

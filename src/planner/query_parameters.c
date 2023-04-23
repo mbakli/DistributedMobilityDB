@@ -4,10 +4,11 @@
 #include "multirelation/multirelation_utils.h"
 #include "planner/distributed_mobilitydb_planner.h"
 #include "planner/distributed_mobilitydb_explain.h"
+#include "general/rte.h"
 
 static void ExplainMainPredicate(PredicateType predicateType, PredicateInfo * predicateInfo,
                                  ExplainState *es, int indent_group);
-static void ExplainDistributedTables(SpatiotemporalTables *tablesList, ExplainState *es, int indent_group);
+static void ExplainDistributedTables(STMultirelations *tablesList, ExplainState *es, int indent_group);
 static void ExplainReshufflingPlanInfo(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
                                        int indent_group);
 
@@ -47,7 +48,7 @@ static void ExplainMainPredicate(PredicateType predicateType, PredicateInfo * pr
     }
 }
 
-static void ExplainDistributedTables(SpatiotemporalTables *tablesList, ExplainState *es, int indent_group)
+static void ExplainDistributedTables(STMultirelations *tablesList, ExplainState *es, int indent_group)
 {
     appendStringInfoSpaces(es->str, es->indent * indent_group);
     appendStringInfo(es->str, "-> Distributed Tables:%d\n", tablesList->length);
@@ -62,28 +63,42 @@ static void ExplainDistributedTables(SpatiotemporalTables *tablesList, ExplainSt
         appendStringInfo(es->str, "Number of different tables: %d\n", 0);
     appendStringInfoSpaces(es->str, es->indent * indent_group);
     ListCell *rangeTableCell = NULL;
-    char * check;
+    char * check = NULL;
     foreach(rangeTableCell, tablesList->tables)
     {
-        SpatiotemporalTable *spatiotemporalTable = (SpatiotemporalTable *) lfirst(rangeTableCell);
-        char * relname = get_rel_name(spatiotemporalTable->catalogTableInfo.table_oid);
-        if (strcasecmp(check, relname) == 0)
+        Rte *rteNode = (Rte *) lfirst(rangeTableCell);
+        if (rteNode->RteType == STRte)
         {
-            indent_group -= 2;
-            continue;
+            STMultirelation *spatiotemporalTable = (STMultirelation *) rteNode->rte;
+            char * relname = get_rel_name(spatiotemporalTable->catalogTableInfo.table_oid);
+            if (check == NULL)
+            {
+                check = palloc((strlen(relname) + 1) * sizeof (char));
+                strcpy(check, relname);
+            }
+
+            if (strcasecmp(check, relname) == 0)
+            {
+                indent_group -= 2;
+                continue;
+            }
+            else
+            {
+                check = palloc((strlen(relname) + 1) * sizeof (char));
+                strcpy(check, relname);
+            }
+            appendStringInfo(es->str, "-> Table: %s\n", relname);
+            es->indent += indent_group;
+
+            appendStringInfoSpaces(es->str, es->indent * indent_group);
+            appendStringInfo(es->str, "Global Index: %s\n", spatiotemporalTable->catalogTableInfo.tiling_method);
+            appendStringInfoSpaces(es->str, es->indent * indent_group);
+            appendStringInfo(es->str, "Local Index: %s\n", spatiotemporalTable->localIndex);
+            appendStringInfoSpaces(es->str, es->indent * indent_group);
+            appendStringInfo(es->str, "Number of tiles: %d\n",spatiotemporalTable->catalogTableInfo.numTiles);
+            es->indent -= 2;
+            appendStringInfoSpaces(es->str, es->indent * indent_group);
         }
-        appendStringInfo(es->str, "-> Table: %s\n", relname);
-        check = palloc((strlen(relname) + 1) * sizeof (char));
-        strcpy(check, relname);
-        es->indent += indent_group;
-        appendStringInfoSpaces(es->str, es->indent * indent_group);
-        appendStringInfo(es->str, "Global Index: %s\n", spatiotemporalTable->catalogTableInfo.tiling_method);
-        appendStringInfoSpaces(es->str, es->indent * indent_group);
-        appendStringInfo(es->str, "Local Index: %s\n", spatiotemporalTable->localIndex);
-        appendStringInfoSpaces(es->str, es->indent * indent_group);
-        appendStringInfo(es->str, "Number of tiles: %d\n",spatiotemporalTable->catalogTableInfo.numTiles);
-        es->indent -= 2;
-        appendStringInfoSpaces(es->str, es->indent * indent_group);
     }
     ExplainCloseGroup("TablesInfo", "Distributed Tables Info", true, es);
 }
@@ -91,6 +106,13 @@ static void ExplainDistributedTables(SpatiotemporalTables *tablesList, ExplainSt
 static void ExplainReshufflingPlanInfo(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
                                        int indent_group)
 {
+    STMultirelation *stReshuffled = NULL;
+    CitusRteNode *citusReshuffled = NULL;
+
+    if(distPlan->reshuffledTable->RteType == STRte)
+        stReshuffled = (STMultirelation *)distPlan->reshuffledTable->rte;
+    else if (distPlan->reshuffledTable->RteType == CitusRte)
+        citusReshuffled = (CitusRteNode *)distPlan->reshuffledTable->rte;
     es->indent = 0;
     ExplainOpenGroup("Reshuffling", "Reshuffling", true, es);
     appendStringInfoSpaces(es->str, es->indent * indent_group);
@@ -105,11 +127,19 @@ static void ExplainReshufflingPlanInfo(DistributedSpatiotemporalQueryPlan *distP
     es->indent += indent_group;
 
     appendStringInfoSpaces(es->str, es->indent * indent_group);
-    appendStringInfo(es->str, "-> Table: %s\n", get_rel_name(
-            distPlan->reshuffledTable->catalogTableInfo.table_oid));
+    if(distPlan->reshuffledTable->RteType == STRte)
+        appendStringInfo(es->str, "-> Table: %s\n", get_rel_name(
+                stReshuffled->catalogTableInfo.table_oid));
+    else if (distPlan->reshuffledTable->RteType == CitusRte)
+        appendStringInfo(es->str, "-> Table: %s\n", get_rel_name(
+                ((RangeTblEntry *) lfirst(citusReshuffled->rangeTableCell))->relid));
+
     es->indent += indent_group;
     appendStringInfoSpaces(es->str, es->indent * indent_group);
-    appendStringInfo(es->str, "-> Reshuffling column: %s\n", distPlan->reshuffledTable->col);
+    if(distPlan->reshuffledTable->RteType == STRte)
+        appendStringInfo(es->str, "-> Reshuffling column: %s\n", stReshuffled->col);
+    else if (distPlan->reshuffledTable->RteType == CitusRte)
+        appendStringInfo(es->str, "-> Reshuffling column: %s\n", citusReshuffled->col);
     ExplainCloseGroup("ReshufflingTables", "ReshufflingTables", true, es);
     ExplainCloseGroup("Reshuffling", "Reshuffling", true, es);
 }

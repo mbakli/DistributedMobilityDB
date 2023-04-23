@@ -4,7 +4,7 @@
 #include "multirelation/tiling_utils.h"
 #include "distributed/listutils.h"
 
-typedef struct SpatiotemporalTableCatalog
+typedef struct STMultirelationCatalog
 {
     Oid table_oid;
     char *tiling_type;
@@ -21,7 +21,7 @@ typedef struct SpatiotemporalTableCatalog
     int srid;
     char * distCol;
     char *reshuffledTable;
-} SpatiotemporalTableCatalog;
+} STMultirelationCatalog;
 
 /* Catalog Filter */
 typedef struct CatalogFilter
@@ -33,10 +33,10 @@ typedef struct CatalogFilter
 } CatalogFilter;
 
 /* Spatiotemporal Table Information */
-typedef struct SpatiotemporalTable
+typedef struct STMultirelation
 {
     ListCell *rangeTableCell;
-    SpatiotemporalTableCatalog catalogTableInfo;
+    STMultirelationCatalog catalogTableInfo;
     bool spatiotemporal_distributed;
     ShapeType shapeType;
     char *col;
@@ -44,18 +44,22 @@ typedef struct SpatiotemporalTable
     char *localIndex;
     Alias *alias;
     CatalogFilter *catalogFilter;
-} SpatiotemporalTable;
+} STMultirelation;
 
-typedef struct SpatiotemporalTables
+typedef struct STMultirelations
 {
     List *tables;
     int diffCount;
     int simCount;
+    int stCount;
+    int nonStCount;
     int length;
-} SpatiotemporalTables;
+} STMultirelations;
 
 
 
 extern bool IsDistributedSpatiotemporalTable(Oid relationId);
+extern STMultirelation *GetMultirelationInfo(RangeTblEntry *rangeTableEntry, ShapeType type);
 extern char *GetLocalIndex(Oid relationId, char * col);
+extern char GetReshufflingType(RangeTblEntry *rangeTableEntry);
 #endif /* MULTIRELATION_H */

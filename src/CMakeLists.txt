@@ -1,5 +1,6 @@
 add_subdirectory("general")
 add_subdirectory("catalog")
+add_subdirectory("multirelation")
 add_subdirectory("distributed_functions")
 add_subdirectory("post_processing")
 add_subdirectory("utils")
