@@ -150,6 +150,7 @@ add_subdirectory("sql")
 set (DistMobilityDB_SOURCE_NAMES
         general
         catalog
+        multirelation
         utils
         post_processing
         distributed_functions
