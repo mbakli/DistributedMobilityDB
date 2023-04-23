@@ -15,11 +15,3 @@ GetMultirelationInfo(RangeTblEntry *rangeTableEntry, ShapeType type)
     multirelation->catalogTableInfo = GetTilingSchemeInfo(rangeTableEntry->relid);
     return multirelation;
 }
-
-
-
-extern char
-GetReshufflingType(RangeTblEntry *rangeTableEntry)
-{
-    //char partitioningMethod =
-}
