@@ -4,6 +4,7 @@
 #include "catalog/nodes.h"
 #include <utils/lsyscache.h>
 #include "executor/executor_tasks.h"
+#include "catalog/table_ops.h"
 
 
 extern Datum GetDBName();
@@ -39,12 +40,18 @@ GetNodeInfo()
                           isNullArray);
         taskNode->node = PointerGetDatum(datumArray[Anum_DistNodes_nodename]);
         taskNode->port = DatumGetInt32(datumArray[Anum_DistNodes_nodeport]);
+        spi_result = SPI_finish();
+        if (spi_result != SPI_OK_FINISH)
+        {
+            elog(ERROR, "Could not disconnect from database using SPI");
+        }
     }
+
     return taskNode;
 }
 
 extern
-char * GetRandomTileId(Oid relationId, ExecTaskType taskType)
+char * GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile)
 {
     int spi_result;
     /* Connect */
@@ -56,18 +63,16 @@ char * GetRandomTileId(Oid relationId, ExecTaskType taskType)
 
     /* Execute the query, noting the readonly status of this SQL */
     StringInfo logicalrel = makeStringInfo();
-    /*if (taskType == NeighborTilingScan)
+    if (IsReshuffledTable(relationId))
         appendStringInfo(logicalrel, "%s.%s", Var_Schema, get_rel_name(relationId));
-    else*/
-    appendStringInfo(logicalrel, "%s", get_rel_name(relationId));
+    else
+        appendStringInfo(logicalrel, "%s", get_rel_name(relationId));
     StringInfo catalogQuery = makeStringInfo();
     appendStringInfo(catalogQuery, "SELECT concat('%s_',shard.shardid,' ')\n"
-                                   "FROM pg_dist_placement AS placement, pg_dist_node AS node, pg_dist_shard As shard\n"
-                                   "WHERE placement.groupid = node.groupid\n"
-                                   "    AND shard.logicalrelid = '%s'::regclass\n"
-                                   "    AND placement.shardid = shard.shardid\n"
-                                   "    AND node.noderole = 'primary' ORDER BY random() limit 1; ",
-                     get_rel_name(relationId), logicalrel->data);
+                                   "FROM pg_dist_shard As shard\n"
+                                   "WHERE shard.logicalrelid = '%s'::regclass\n"
+                                   "    AND shard.shardminvalue = %d::text",
+                     logicalrel->data, logicalrel->data, rand_tile);
     spi_result = SPI_execute(catalogQuery->data, true, 1);
     /* Read back the PROJ text */
     if (spi_result == SPI_OK_SELECT)
@@ -78,12 +83,12 @@ char * GetRandomTileId(Oid relationId, ExecTaskType taskType)
         resetStringInfo(catalogQuery);
         appendStringInfo(catalogQuery, "%s", res);
         spi_result = SPI_finish();
-
         if (spi_result != SPI_OK_FINISH)
         {
             elog(ERROR, "Could not disconnect from database using SPI");
         }
         return catalogQuery->data;
+
     }
     return NULL;
 }
@@ -105,12 +110,12 @@ GetDBName()
     {
         TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
-        return SPI_getbinval(row, rowDescriptor, 1, &isNull);
         spi_result = SPI_finish();
         if (spi_result != SPI_OK_FINISH)
         {
             elog(ERROR, "Could not disconnect from database using SPI");
         }
+        return SPI_getbinval(row, rowDescriptor, 1, &isNull);
     }
     return 0;
 }

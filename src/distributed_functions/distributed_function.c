@@ -71,7 +71,7 @@ IsDistFunc(TargetEntry *targetEntry)
 
     bool heapTupleIsValid = HeapTupleIsValid(heapTuple);
     systable_endscan(scanDescriptor);
-    table_close(distFuns, AccessShareLock);
+    table_close(distFuns, NoLock);
     return heapTupleIsValid;
 }
 

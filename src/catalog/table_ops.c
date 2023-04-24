@@ -25,7 +25,8 @@ PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance)
     const int scanKeyCount = 2;
     ScanKeyData scanKey[2];
     bool indexOK = false;
-    Relation pgSpatiotemporalOperation = table_open(RelationId("pg_spatiotemporal_join_operations"), AccessShareLock);
+    Relation pgSpatiotemporalOperation = table_open(RelationId("pg_spatiotemporal_join_operations"),
+                                                    AccessShareLock);
 
     ScanKeyInit(&scanKey[0], Anum_pg_spatiotemporal_join_operations_oid,
                 BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(operationId));
@@ -46,7 +47,7 @@ PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance)
     }
 
     systable_endscan(scanDescriptor);
-    table_close(pgSpatiotemporalOperation, AccessShareLock);
+    table_close(pgSpatiotemporalOperation, NoLock);
 
     return partitionTuple;
 }
@@ -65,7 +66,6 @@ DistributedColumnType(Oid relationId)
     {
         elog(ERROR, "Could not connect to database using SPI");
     }
-
     /* Execute the query, noting the readonly status of this SQL */
     StringInfo catalogQuery = makeStringInfo();
     appendStringInfo(catalogQuery, "select distcoltype from pg_dist_spatiotemporal_tables WHERE tableName= '%s' ",
@@ -74,21 +74,21 @@ DistributedColumnType(Oid relationId)
     /* Read back the PROJ text */
     if (spi_result == SPI_OK_SELECT)
     {
-        const char * columnType = (char *)DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
+       const char * columnType = (char *)DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
                                                                        SPI_tuptable->tupdesc,
                                                                        1));
         spi_result = SPI_finish();
-
         if (spi_result != SPI_OK_FINISH)
         {
             elog(ERROR, "Could not disconnect from database using SPI");
         }
         if (strcmp(columnType, "geometry") == 0)
             return SPATIAL;
-        else
+        else if(strcmp(columnType, "tgeompoint") == 0)
             return SPATIOTEMPORAL;
     }
-    return DIFFTYPE;
+    else
+        return DIFFTYPE;
 }
 
 /*
@@ -133,12 +133,11 @@ GetSpatiotemporalCol(Oid relationId)
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
         Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
         spi_result = SPI_finish();
-
         if (spi_result != SPI_OK_FINISH)
         {
             elog(ERROR, "Could not disconnect from database using SPI");
         }
-        return DatumToString(distcol, TEXTOID);;
+        return DatumToString(distcol, TEXTOID);
     }
     return NULL;
 }
@@ -168,7 +167,7 @@ IsDistributedSpatiotemporalTable(Oid relationId)
 
         bool heapTupleIsValid = HeapTupleIsValid(heapTuple);
         systable_endscan(scanDescriptor);
-        table_close(multirelation, AccessShareLock);
+        table_close(multirelation, NoLock);
         return heapTupleIsValid;
     }
     return false;
@@ -239,7 +238,6 @@ GetShapeCol(Oid relationId)
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
         Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
         spi_result = SPI_finish();
-
         if (spi_result != SPI_OK_FINISH)
         {
             elog(ERROR, "Could not disconnect from database using SPI");

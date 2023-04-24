@@ -171,23 +171,16 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
             shapeType = DistributedColumnType(rangeTableEntry->relid);
             if (shapeType == SPATIAL || shapeType == SPATIOTEMPORAL)
             {
-
                 STMultirelation *spatiotemporal_table = GetMultirelationInfo(rangeTableEntry, shapeType);
                 if (curr_relid != rangeTableEntry->relid)
-                {
-                    distPlan->tablesList->diffCount++;
                     distPlan->joining_col = spatiotemporal_table->col;
-                }
-                else
-                    distPlan->tablesList->simCount++;
 
-                curr_relid = rangeTableEntry->relid;
+
 
                 spatiotemporal_table->catalogFilter = AnalyseCatalog(spatiotemporal_table,
                                                                      distPlan->query->jointree);
                 Rte *rteNode = GetRteNode((Node *) spatiotemporal_table, STRte, rangeTableEntry->alias);
                 rtes = lappend(rtes , rteNode);
-                distPlan->tablesList->length++;
                 distPlan->tablesList->stCount++;
             }
         }
@@ -210,7 +203,6 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                     distPlan->tablesList->length++;
                     Rte *rteNode = GetRteNode((Node *) citusNode, CitusRte, rangeTableEntry->alias);
                     rtes = lappend(rtes , rteNode);
-                    distPlan->tablesList->length++;
                     distPlan->tablesList->nonStCount++;
                 }
                 else
@@ -228,6 +220,15 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                 distPlan->tablesList->length++;*/
             }
         }
+        if (curr_relid != rangeTableEntry->relid)
+        {
+            distPlan->tablesList->diffCount++;
+        }
+        else
+            distPlan->tablesList->simCount++;
+
+        curr_relid = rangeTableEntry->relid;
+        distPlan->tablesList->length++;
     }
 
     distPlan->tablesList->tables = rtes;
@@ -276,7 +277,7 @@ PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
             palloc0(sizeof(CoordinatorLevelOperator));
     distPlan->postProcessing->workerLevelOperator = (WorkerLevelOperator *)
             palloc0(sizeof(WorkerLevelOperator));
-    distPlan->tablesList->length = 0;
+    distPlan->tablesList->length = -1;
     distPlan->predicatesList = palloc0(sizeof(PredicateInfo));
     distPlan->predicatesList->predicateInfo = palloc0(sizeof(PredicateInfo));
     distPlan->strategies = NIL;
