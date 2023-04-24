@@ -63,6 +63,7 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     if (query_string == NULL)
         return distributed_planner(parse, query_string, cursorOptions, boundParams);
     analyzeDistributedSpatiotemporalTables(rangeTableList, distPlan);
+
     if (distPlan->tablesList->length == 0 )
         return distributed_planner(parse, query_string, cursorOptions, boundParams);
 
@@ -74,6 +75,7 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
         checkQueryType(parse, distPlan);
         needsSpatiotemporalPlanning = needsDistributedSpatiotemporalPlanning(distPlan);
     }
+
     /* Query rewriter */
     if (list_length(distPlan->postProcessing->distfuns) > 0 )
         RewriterDistFuncs(parse, distPlan->postProcessing, query_string);
@@ -179,6 +181,7 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
 
                 spatiotemporal_table->catalogFilter = AnalyseCatalog(spatiotemporal_table,
                                                                      distPlan->query->jointree);
+                distPlan->reshuffled_table_base = spatiotemporal_table;
                 Rte *rteNode = GetRteNode((Node *) spatiotemporal_table, STRte, rangeTableEntry->alias);
                 rtes = lappend(rtes , rteNode);
                 distPlan->tablesList->stCount++;
@@ -277,7 +280,7 @@ PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
             palloc0(sizeof(CoordinatorLevelOperator));
     distPlan->postProcessing->workerLevelOperator = (WorkerLevelOperator *)
             palloc0(sizeof(WorkerLevelOperator));
-    distPlan->tablesList->length = -1;
+    distPlan->tablesList->length = 0;
     distPlan->predicatesList = palloc0(sizeof(PredicateInfo));
     distPlan->predicatesList->predicateInfo = palloc0(sizeof(PredicateInfo));
     distPlan->strategies = NIL;
