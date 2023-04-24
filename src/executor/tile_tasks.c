@@ -77,3 +77,43 @@ AddNonStRteTilingKey(Rte *tbl, Alias *alias ,char * query_string)
     }
     return 0;
 }
+
+extern int
+GetRandTileNum(STMultirelation *rte)
+{
+    int spi_result;
+    int res = 0;
+    Datum datum;
+    bool isNull;
+    /* Connect */
+    spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    /* Execute the query, noting the readonly status of this SQL */
+    StringInfo catalogQuery = makeStringInfo();
+    appendStringInfo(catalogQuery, "SELECT shardminvalue::int FROM pg_dist_shard "
+                                   "WHERE logicalrelid = '%s'::regclass "
+                                   "ORDER BY random() limit 1;",
+                     get_rel_name(rte->catalogTableInfo.table_oid));
+    spi_result = SPI_execute(catalogQuery->data, true, 1);
+    /* Read back the PROJ text */
+    if (spi_result == SPI_OK_SELECT)
+    {
+        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
+        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
+        heap_deform_tuple(row, rowDescriptor, &datum,
+                          &isNull);
+        res = DatumGetInt32(datum);
+
+        spi_result = SPI_finish();
+
+        if (spi_result != SPI_OK_FINISH)
+        {
+            elog(ERROR, "Could not disconnect from database using SPI");
+        }
+    }
+    return res;
+}

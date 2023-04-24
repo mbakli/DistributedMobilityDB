@@ -23,7 +23,7 @@ static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, Expla
                                        int indent_group);
 static void ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
 static void ExplainOneTask(ExecutorTask *task, STMultirelation *base, ExplainState *es, int indent_group);
-static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType);
+static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile);
 
 /* create custom scan method for the spatiotemporal executor */
 CustomScanMethods SpatiotemporalExecutorMethod = {
@@ -230,13 +230,15 @@ ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState
 static void
 ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int indent_group)
 {
+    int rand_tile = GetRandTileNum(base);
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
     TaskNode *taskNode = GetNodeInfo();
     appendStringInfo(es->str, "Node: host=%s ", DatumToString(taskNode->node, TEXTOID));
     appendStringInfo(es->str, "port=%d ", taskNode->port);
     appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(taskNode->db));
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
-    char *OneTileQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid, task->taskType);
+    char *OneTileQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid,
+                                       task->taskType, rand_tile);
     Query *parse = ParseQueryString(OneTileQuery, NULL, 0);
     PlannedStmt *plan = pg_plan_query_compat(parse, NULL, 0, NULL);
     instr_time planduration;
@@ -249,7 +251,7 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
 }
 
 static char *
-GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType)
+GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile)
 {
     if (query_string != NULL)
     {
@@ -260,18 +262,19 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType)
         StringInfo replace = makeStringInfo();
         appendStringInfo(final_query, "%s", query_string);
         int i =0;
+        RangeTblEntry *reshuffledTableEntry;
         StringInfo  tileId = makeStringInfo();
         foreach(rangeTableCell, rangeTableList)
         {
             RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
             // Get random tile key
-            if (i == 0)
-            {
-                appendStringInfo(tileId, "%s", GetRandomTileId(base, taskType));
-                i = 1;
-            }
-            StringInfo  t = makeStringInfo();
-            appendStringInfo(t, "%s ", get_rel_name(base));
+            appendStringInfo(tileId, "%s", GetRandomTileId(rangeTableEntry->relid, taskType, rand_tile));
+
+            StringInfo t = makeStringInfo();
+            if (IsReshuffledTable(rangeTableEntry->relid))
+                appendStringInfo(t, "%s.%s", Var_Schema, get_rel_name(rangeTableEntry->relid));
+            else
+                appendStringInfo(t, "%s ", get_rel_name(rangeTableEntry->relid));
             // Replace it in the query string
             appendStringInfo(replace, "%s ", replaceWord(final_query->data, t->data,
                                                          tileId->data));
@@ -279,18 +282,7 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType)
             resetStringInfo(final_query);
             appendStringInfo(final_query, "%s", replace->data);
             resetStringInfo(replace);
-            if (rangeTableList->length == 1)
-                break;
-        }
-        /* To be removed when I fix the schema */
-        if (taskType == NeighborTilingScan)
-        {
-            resetStringInfo(replace);
-            // appendStringInfo(replace, "%s.%s", Var_Schema, tileId->data);
-            appendStringInfo(replace, "%s", tileId->data);
-            StringInfo  t = makeStringInfo();
-            appendStringInfo(t, " %s", tileId->data);
-            return replaceWord(final_query->data, t->data, replace->data);
+            resetStringInfo(tileId);
         }
         return final_query->data;
 
@@ -333,7 +325,7 @@ ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, ExplainState *es
      * Use a snapshot with an updated command ID to ensure this query sees
      * results of any previously executed queries.
      */
-    PushCopiedSnapshot(GetActiveSnapshot());
+    PushActiveSnapshot(GetTransactionSnapshot());
     UpdateActiveSnapshotCommandId();
 
     /* Create a QueryDesc for the query */
@@ -398,7 +390,6 @@ ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, ExplainState *es
     FreeQueryDesc(queryDesc);
 
     PopActiveSnapshot();
-
     /* We need a CCI just in case query expanded to multiple plans */
     if (es->analyze)
         CommandCounterIncrement();

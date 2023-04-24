@@ -276,15 +276,15 @@ ReshuffleData(char *query_string, MultiPhaseExecutor *multiPhaseExecutor)
     spi_result = SPI_execute(query_string, false, 1);
     if (spi_result == SPI_OK_INSERT)
     {
-        spi_result = SPI_finish();
         multiPhaseExecutor->dataReshuffled = true;
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
     }
     else
         multiPhaseExecutor->dataReshuffled = false;
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
 }
 
 /* Executor Job: Index the reshuffled data */
@@ -316,17 +316,21 @@ IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor
 
     }
     spi_result = SPI_execute(val->data, false, 1);
-    if (spi_result == SPI_OK_INSERT)
+    if (spi_result == SPI_OK_UTILITY)
     {
-        spi_result = SPI_finish();
         multiPhaseExecutor->indexCreated = true;
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
     }
     else
         multiPhaseExecutor->indexCreated = false;
+
+    /*
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+     */
+
 }
 
 /* Executor Job: GeneralScan */

@@ -332,14 +332,12 @@ getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan, Oid oid)
                                                                      SPI_tuptable->tupdesc,
                                                                      1));
         spi_result = SPI_finish();
-
         if (spi_result != SPI_OK_FINISH)
         {
             elog(ERROR, "Could not disconnect from database using SPI");
         }
         return reshuffledTableColumns;
     }
-
 }
 
 extern void
