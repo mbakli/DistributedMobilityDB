@@ -231,12 +231,14 @@ static void
 ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int indent_group)
 {
     int rand_tile = GetRandTileNum(base);
+
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
     TaskNode *taskNode = GetNodeInfo();
     appendStringInfo(es->str, "Node: host=%s ", DatumToString(taskNode->node, TEXTOID));
     appendStringInfo(es->str, "port=%d ", taskNode->port);
     appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(taskNode->db));
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
+
     char *OneTileQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid,
                                        task->taskType, rand_tile);
     Query *parse = ParseQueryString(OneTileQuery, NULL, 0);
@@ -253,6 +255,7 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
 static char *
 GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile)
 {
+
     if (query_string != NULL)
     {
         Query *query = ParseQueryString(query_string, NULL, 0);
@@ -261,9 +264,8 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
         StringInfo final_query = makeStringInfo();
         StringInfo replace = makeStringInfo();
         appendStringInfo(final_query, "%s", query_string);
-        int i =0;
         RangeTblEntry *reshuffledTableEntry;
-        StringInfo  tileId = makeStringInfo();
+        StringInfo tileId = makeStringInfo();
         foreach(rangeTableCell, rangeTableList)
         {
             RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
@@ -284,6 +286,7 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
             resetStringInfo(replace);
             resetStringInfo(tileId);
         }
+
         return final_query->data;
 
     }
