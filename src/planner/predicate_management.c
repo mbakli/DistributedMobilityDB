@@ -1,7 +1,7 @@
 #include "postgres.h"
 #include "planner/predicate_management.h"
 #include "optimizer/planner.h"
-#include "postgresql/liblwgeom.h"
+#include "liblwgeom.h"
 #include "general/spatiotemporal_processing.h"
 #include <utils/timestamp.h>
 

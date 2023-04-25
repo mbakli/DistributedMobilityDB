@@ -31,22 +31,7 @@ endif()
 set(PG_MIN_MAJOR_VERSION "13")
 set(PG_MAX_MAJOR_VERSION "14")
 
-#
-# Look for an installation.
-#
-find_path(PostgreSQL_TYPE_INCLUDE_DIR
-        NAMES catalog/pg_type.h
-        PATHS
-        # Look in other places.
-        ${PostgreSQL_ROOT_DIRECTORIES}
-        PATH_SUFFIXES
-        pgsql/server
-        postgresql/server
-        include/server
-        # Help the user find it if we cannot.
-        DOC "The ${PostgreSQL_INCLUDE_DIR_MESSAGE}"
-        )
-
+add_definitions(-DPostgreSQL_TYPE_INCLUDE_DIR=/usr/include/postgresql/)
 
 if(POSTGRESQL_BIN)
     # Checking POSTGRESQL_PG_CONFIG
@@ -74,16 +59,41 @@ find_program(POSTGRESQL_EXECUTABLE NAMES postgres
         )
 
 
-if (PostgreSQL_INCLUDE_DIR)
-    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIR}")
+find_path(PostgreSQL_TYPE_INCLUDE_DIR
+        NAMES catalog/pg_type.h
+        PATHS
+        # Look in other places.
+        ${PostgreSQL_ROOT_DIRECTORIES}
+        PATH_SUFFIXES
+        postgresql
+        pgsql/server
+        postgresql/server
+        include/server
+        # Help the user find it if we cannot.
+        DOC "The ${PostgreSQL_INCLUDE_DIR_MESSAGE}"
+        )
+
+find_package(PostgreSQL)
+
+if (PostgreSQL_INCLUDE_DIRS)
+    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIRS}")
+    set (PostgreSQL_INCLUDE_DIRS /usr/local/pgsql/include)
+    include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS}/server)
+    message(STATUS "POSTGRES_SERVER_PATH ${PostgreSQL_INCLUDE_DIRS}/server")
 else()
-    find_package(PostgreSQL ${PG_MIN_MAJOR_VERSION} REQUIRED)
-    set (PostgreSQL_INCLUDE_DIR /usr/local/pgsql/include)
-    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIR}")
+    set (PostgreSQL_INCLUDE_DIRS /usr/local/pgsql/include)
+    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIRS}")
     include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIR}/server)
+    message(STATUS "POSTGRES_SERVER_PATH ${PostgreSQL_INCLUDE_DIR}/server")
 endif()
 
 include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS})
+include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIR})
+
+if (${PostgreSQL_VERSION_STRING} GREATER ${PG_MIN_MAJOR_VERSION})
+    message(STATUS "PostgreSQL version: ${PostgreSQL_VERSION_STRING}")
+    include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIR}/${PG_MAX_MAJOR_VERSION}/server)
+endif()
 
 #---------------------------------------------
 # library directory
