@@ -38,4 +38,5 @@ extern void TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *di
 extern void PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan);
 extern void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type);
 extern ReshufflingRte *GetReshufflingRte(STMultirelations *rtes);
+extern bool CheckBroadcastingPossibility(LocalRteNode *localNode);
 #endif /* PLANNER_STRATEGIES_H */

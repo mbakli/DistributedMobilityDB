@@ -29,7 +29,6 @@ typedef struct CitusRteNode
     ListCell *rangeTableCell;
     char partitionMethod;
     ShapeType shapeType;
-    bool refCandidate; /* Candidate to be broadcasted */
     int srid;
     char *col;
     char *localIndex;
@@ -44,6 +43,7 @@ typedef struct LocalRteNode
     int srid;
     char *col;
     char *localIndex;
+    char *reshuffledTable;
 } LocalRteNode;
 
 /* Reshuffling Relation */

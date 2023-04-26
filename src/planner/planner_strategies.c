@@ -67,17 +67,39 @@ PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan *distPlan, R
     foreach(rangeTableCell, distPlan->tablesList->tables)
     {
         Rte * rteNode = (Rte *) lfirst(rangeTableCell);
-        if (rteNode->RteType == CitusRte)
-        {
+        if (rteNode->RteType == CitusRte || rteNode->RteType == LocalRte)
             distPlan->reshuffledTable = rteNode;
+        else if (rteNode->RteType == STRte){
         }
+        else
+            elog(ERROR, "The reshuffling node is not identified!");
     }
     /* Add the alias name */
-    CitusRteNode *reshuffledTable = (CitusRteNode *)distPlan->reshuffledTable->rte;
-    reshuffledTable->reshuffledTable = DatumGetCString(GetReshufflingAlias(
-            ((RangeTblEntry *)lfirst(reshuffledTable->rangeTableCell))->relid));
+    if (distPlan->reshuffledTable->RteType == CitusRte)
+    {
+        CitusRteNode *citusNode = (CitusRteNode *)distPlan->reshuffledTable->rte;
+        citusNode->reshuffledTable = DatumGetCString(GetReshufflingAlias(
+                ((RangeTblEntry *)lfirst(citusNode->rangeTableCell))->relid));
+        createReshufflingPlanForNonstRte(distPlan);
+    }
+    else if (distPlan->reshuffledTable->RteType == LocalRte)
+    {
+        /* The rte can be either broadcasted or partitioned using the same tiling scheme of the given
+         * spatiotemporal multirelation
+         * */
+        LocalRteNode *localNode = (LocalRteNode *)distPlan->reshuffledTable->rte;
+        localNode->refCandidate = CheckBroadcastingPossibility(localNode);
+        localNode->reshuffledTable = DatumGetCString(GetReshufflingAlias(
+                ((RangeTblEntry *)lfirst(localNode->rangeTableCell))->relid));
+        if (localNode->refCandidate)
+        {
+            /* TODO: there is a bug that needs to be fixed */
+            //createReshufflingPlanForRefRte(distPlan);
+        }
+        else
+            createReshufflingPlanForNonstRte(distPlan);
+    }
 
-    createReshufflingPlanForNonstRte(distPlan);
     ConstructReshufflingQueryForNonstRte(distPlan);
 }
 
@@ -279,8 +301,12 @@ OtherReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     // Keep the catalog query in the distributed plan
     distPlan->catalog_query_string = palloc((strlen(catalogQuery->data) + 1) * sizeof (char));
     strcpy(distPlan->catalog_query_string, catalogQuery->data);
-    elog(INFO, "catalog_query_string:\n%s\n",
-         distPlan->catalog_query_string);
+}
+
+extern bool
+CheckBroadcastingPossibility(LocalRteNode *localNode)
+{
+    return false;
 }
 
 static void
