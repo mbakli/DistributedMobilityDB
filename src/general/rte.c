@@ -18,11 +18,10 @@ GetCitusRteInfo(RangeTblEntry *rangeTableEntry, char partitionMethod)
 {
     CitusRteNode *citusRteNode = (CitusRteNode *) palloc0(sizeof(CitusRteNode));
     citusRteNode->col = GetShapeCol(rangeTableEntry->relid);
-    // citusRteNode->shapeType = GetShapeType(rangeTableEntry->relid);
+    //citusRteNode->shapeType = GetShapeType(rangeTableEntry->relid);
     citusRteNode->localIndex = GetLocalIndex(rangeTableEntry->relid,
                                              citusRteNode->col);
     citusRteNode->partitionMethod = partitionMethod;
-    // multirelation->catalogTableInfo = GetTilingSchemeInfo(rangeTableEntry->relid);
     return citusRteNode;
 }
 
@@ -31,9 +30,7 @@ GetLocalRteInfo(RangeTblEntry *rangeTableEntry)
 {
     LocalRteNode *localRteNode = (LocalRteNode *) palloc0(sizeof(LocalRteNode));
     localRteNode->col = GetShapeCol(rangeTableEntry->relid);
-    // citusRteNode->shapeType = GetShapeType(rangeTableEntry->relid);
     localRteNode->localIndex = GetLocalIndex(rangeTableEntry->relid,
                                              localRteNode->col);
-    // multirelation->catalogTableInfo = GetTilingSchemeInfo(rangeTableEntry->relid);
     return localRteNode;
 }

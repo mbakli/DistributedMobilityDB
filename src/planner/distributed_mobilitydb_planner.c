@@ -178,7 +178,6 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                     distPlan->joining_col = spatiotemporal_table->col;
 
 
-
                 spatiotemporal_table->catalogFilter = AnalyseCatalog(spatiotemporal_table,
                                                                      distPlan->query->jointree);
                 distPlan->reshuffled_table_base = spatiotemporal_table;
@@ -215,12 +214,9 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
             else
             {
                 /* Local table processing */
-               /* LocalRteNode *localRte = GetLocalRteInfo(rangeTableEntry);
-                // CheckBroadcastingPossibility(localRte);
-                distPlan->tablesList->length++;
-                Rte *rteNode = GetRteNode((Node *) localRte, CitusRte, rangeTableEntry->alias);
+                LocalRteNode *localNode = GetLocalRteInfo(rangeTableEntry);
+                Rte *rteNode = GetRteNode((Node *) localNode, LocalRte, rangeTableEntry->alias);
                 rtes = lappend(rtes , rteNode);
-                distPlan->tablesList->length++;*/
             }
         }
         if (curr_relid != rangeTableEntry->relid)
