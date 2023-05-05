@@ -8,7 +8,7 @@ Distributed MobilityDB is a PostgreSQL extension that extends the open source da
 * Declarative Query Language
   * It provides declarative SQL functions for data partitioning as well as mapping declarative SQL queries into distributed execution strategies.
 
-🚧 **The extension is still under heavy development.** 🚧
+🚧 **Please note that the extension is still under heavy development, so stay tuned for more updates and features.** 🚧
 
 # Prerequisites
 - PostgreSQL >= 13
@@ -35,7 +35,7 @@ Postgresql
 
 ### Creating Distributed Tables
 
-The create_spatiotemporal_distributed_table () function is utilized to define a distributed table that is partitioned using one of the Multidimensional Tiling methods. It splits the input table into several tiles that are stored in separate PostgreSQL tables.
+The create_spatiotemporal_distributed_table () function is utilized to define a distributed table that is partitioned using one of the Multidimensional Tiling methods. It splits the input table into several tiles stored in separate PostgreSQL tables.
 
 func: create_spatiotemporal_distributed_table
 #### Arguments:
@@ -43,12 +43,15 @@ func: create_spatiotemporal_distributed_table
 - <ins>num_tiles</ins>: Number of generated tiles
 - <ins>table_name_out</ins>: Name of the distributed table
 - <ins>tiling_method</ins>: Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>
-- <ins>tiling_granularity</ins> (Optional): The tiling granularity. The default value depends on the granularity selection process of the tiling method that chooses between shape- and point-based strategies to create load-balanced tiles. The user can change that by setting this parameter.
-- <ins>tiling_type</ins> (Optional): The tiling type of the tiling method. It can be one of the following: temporal, spatial, spatiotemporal. The default value depends on the given column type.
-- <ins>colocation_table</ins> (Optional): Colocate the input table with another table
-- <ins>colocation_column</ins> (Optional): The colocation column
+- <ins>tiling_granularity</ins> (Optional): The tiling granularity. The default value depends on the granularity selection process of the tiling method that chooses between shape- and point-based strategies to create load-balanced tiles. The user can set this parameter to customize the tiling granularity.
+- <ins>tiling_type</ins> (Optional): The tiling type of the tiling method. It can be one of the following: temporal, spatial, or spatiotemporal. The default value depends on the given column type.
+- <ins>colocation_table</ins> (Optional): This argument allows you to colocate the input table with another table.  For example, you can use this feature to create tiles based on given boundaries such as province borders. By specifying the colocation_table and colocation_column arguments, you can ensure that your data is organized and managed in a way that suits your specific needs.
+- <ins>colocation_column</ins> (Optional): Specify the colocation column.
 - <ins>physical_partitioning</ins> (Optional): Determine whether or not to physically partition data.
 - <ins>object_segmentation</ins> (Optional): Determine whether or not to segment the input spatiotemporal column.
+
+By utilizing the create_spatiotemporal_distributed_table() function with these arguments, you can easily create a distributed table that suits your data management needs. 
+
 -----------------------------------------------------------------------------------------------------------------------
 # Use Cases
 
