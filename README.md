@@ -115,3 +115,8 @@ We are most definitely open to contributions of any kind.  Bug Reports, Feature 
 If you'd like to contribute code via a Pull Request, please make it against our `develop` branch.
 
 Wrapping Postgres' internals to create a distributed version of MobilityDB is a complex undertaking that requires a significant amount of time and effort. However, the distributed version of MobilityDB is now available for use, and it will continue to evolve as development progresses. We welcome your feedback on how you would like to use Distributed MobilityDB and what features you would like to see added to it.
+
+# Contact Us
+We hope you find our project helpful and easy to use! If you have any questions, comments, or concerns, please don't hesitate to reach out to us. 
+
+You can contact us by sending an email to mohamed.bakli@ulb.be
