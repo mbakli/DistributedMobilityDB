@@ -80,12 +80,19 @@ SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_poly
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_roads', num_tiles =>30, 
   table_name_out=>'planet_osm_roads_30t', tiling_method => 'crange');
 
--- Distance Query: Find buildings that are built within 1km of the primary highways.
+-- Distance-Join Query: Find buildings that are built within 1km of the primary highways.
 SELECT distinct t1.name
 FROM planet_osm_polygon_50t t1, planet_osm_roads_30t t2
 WHERE t1.building = 'yes'
   AND t2.highway = 'primary'
   AND ST_dwithin(t1.way,t2.way, 1000);
+
+-- Intersection-Join Query: Find health centers POIs in Berlin.
+SELECT t2.name
+FROM planet_osm_polygon_30t t1, planet_osm_point_12t t2
+WHERE t2.amenity IN ('hospital', 'clinic', 'doctors')
+  AND t1.name = 'Berlin'
+  AND st_intersects(t1.way, t2.way);
 ```
 ### AIS Trajectory Data
 
@@ -106,6 +113,11 @@ SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_til
 -- Temporal tiling
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, 
   table_name_out=>'ships_50t', partitioning_method => 'crange', tiling_type =>'temporal');
+
+-- Distance-Join Query: Find fishing ships that were within 1km of tanker ships.
+SELECT t1.mmsi Ship1ID, t2.mmsi Ship2ID
+FROM ships_tanker_30t t1, ships_fishing_15t t2
+WHERE edwithin(t1.trip, t2.trip, 1000);
 ```
 
 # Contributing

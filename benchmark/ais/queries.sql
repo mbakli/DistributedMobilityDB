@@ -1,8 +1,16 @@
 -------------------------------------------------------------------------------------------------
---Q1) Find fishing ships that were within 1km of tanker ships during a temporal period
+--Q1) Find fishing ships that were within 1km of tanker ships.
 SELECT t1.mmsi Ship1ID, t2.mmsi Ship2ID
 FROM ships_tanker_30t t1, ships_fishing_15t t2
 WHERE edwithin(t1.trip, t2.trip, 1000);
+
+-- To add a specific period, the query will be as follows:
+SELECT t1.mmsi Ship1ID, t2.mmsi Ship2ID
+FROM ships_tanker_30t t1, ships_fishing_15t t2
+WHERE t1.trip && period('2019-01-02 00:30', '2019-01-02 01:00')
+  AND t2.trip && period('2019-01-02 00:30', '2019-01-02 01:00')
+  AND edwithin(t1.trip, t2.trip, 1000);
+
 -------------------------------------------------------------------------------------------------
 --Q2) List the departure time of all ships in the port of Kalundborg between 2019-01-02 00:30 and 01:00 AM.
 SELECT T.ship_id, T.Trip, startTimestamp(atgeometry(T.trip, P.port_geom)) As DepartTime
