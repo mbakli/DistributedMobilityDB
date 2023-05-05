@@ -4,12 +4,12 @@ Distributed MobilityDB is a PostgreSQL extension that extends the open source da
 # Key Features
 
 * **Spatial and Spatiotemporal Data Partitioning**
-  * It partitions the input relation into shards that preserve spatiotemporal data locality and load balancing.
-  * It provides a two-level (global and local) distributed indexing scheme to reduce the global transmission cost and local computation cost.
+  * Transform the input relation into a multirelation, preserving spatiotemporal data locality and load balancing.
+  * Develop a two-level (global and local) distributed indexing scheme, effectively reducing the global transmission cost and local computation cost.
 * **Spatial and Spatiotemporal Processing**
-  * It provides an adaptive execution engine that transforms a SQL query into a distributed plan that is executed on a cluster.
+  * Provide an adaptive execution engine that transforms a SQL query into a distributed plan, which can then be executed on either a single machine or a cluster.
 * **Declarative Query Language**
-  * It provides declarative SQL functions for data partitioning as well as mapping declarative SQL queries into distributed execution strategies.
+  * Offer declarative SQL functions for data partitioning, as well as map declarative SQL queries into distributed execution strategies.
 
 🚧 **Please note that the extension is still under development, so stay tuned for more updates and features.** 🚧
 
@@ -107,3 +107,11 @@ SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_til
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, 
   table_name_out=>'ships_50t', partitioning_method => 'crange', tiling_type =>'temporal');
 ```
+
+# Contributing
+
+We are most definitely open to contributions of any kind.  Bug Reports, Feature Requests, and Documentation.
+
+If you'd like to contribute code via a Pull Request, please make it against our `develop` branch.
+
+Wrapping Postgres' internals to create a distributed version of MobilityDB is a complex undertaking that requires a significant amount of time and effort. However, the distributed version of MobilityDB is now available for use, and it will continue to evolve as development progresses. We welcome your feedback on how you would like to use Distributed MobilityDB and what features you would like to see added to it.
