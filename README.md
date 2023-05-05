@@ -3,12 +3,12 @@ Distributed MobilityDB is a PostgreSQL extension that extends the open source da
 
 # Key Features
 
-* Spatial and Spatiotemporal Data Partitioning
+* **Spatial and Spatiotemporal Data Partitioning**
   * It partitions the input relation into shards that preserve spatiotemporal data locality and load balancing.
   * It provides a two-level (global and local) distributed indexing scheme to reduce the global transmission cost and local computation cost.
-* Spatial and Spatiotemporal Processing
+* **Spatial and Spatiotemporal Processing**
   * It provides an adaptive execution engine that transforms a SQL query into a distributed plan that is executed on a cluster.
-* Declarative Query Language
+* **Declarative Query Language**
   * It provides declarative SQL functions for data partitioning as well as mapping declarative SQL queries into distributed execution strategies.
 
 🚧 **Please note that the extension is still under development, so stay tuned for more updates and features.** 🚧
@@ -38,13 +38,13 @@ Postgresql
 
 ### Creating Distributed Tables
 
-The create_spatiotemporal_distributed_table () function is utilized to define a distributed table that is partitioned using one of the Multidimensional Tiling methods. It splits the input table into several tiles stored in separate PostgreSQL tables.
+The `create_spatiotemporal_distributed_table ()` function is utilized to define a distributed table that is partitioned using one of the Multidimensional Tiling methods. It splits the input table into several tiles stored in separate PostgreSQL tables.
 
 func: create_spatiotemporal_distributed_table
 #### Arguments:
-- <ins>table_name_in</ins>: Name of the input table
-- <ins>num_tiles</ins>: Number of generated tiles
-- <ins>table_name_out</ins>: Name of the distributed table
+- <ins>`table_name_in`</ins>: Name of the input table
+- <ins>`num_tiles`</ins>: Number of generated tiles
+- <ins>`table_name_out</ins>: Name of the distributed table
 - <ins>tiling_method</ins>: Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>
 - <ins>tiling_granularity</ins> (Optional): The tiling granularity. The default value depends on the granularity selection process of the tiling method that chooses between shape- and point-based strategies to create load-balanced tiles. The user can set this parameter to customize the tiling granularity.
 - <ins>tiling_type</ins> (Optional): The tiling type of the tiling method. It can be one of the following: temporal, spatial, or spatiotemporal. The default value depends on the given column type.
