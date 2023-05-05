@@ -42,16 +42,16 @@ The `create_spatiotemporal_distributed_table ()` function is utilized to define 
 
 func: create_spatiotemporal_distributed_table
 #### Arguments:
-- <ins>`table_name_in`</ins>: Name of the input table
-- <ins>`num_tiles`</ins>: Number of generated tiles
-- <ins>`table_name_out</ins>: Name of the distributed table
-- <ins>tiling_method</ins>: Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>
-- <ins>tiling_granularity</ins> (Optional): The tiling granularity. The default value depends on the granularity selection process of the tiling method that chooses between shape- and point-based strategies to create load-balanced tiles. The user can set this parameter to customize the tiling granularity.
-- <ins>tiling_type</ins> (Optional): The tiling type of the tiling method. It can be one of the following: temporal, spatial, or spatiotemporal. The default value depends on the given column type.
-- <ins>colocation_table</ins> (Optional): This argument allows you to colocate the input table with another table.  For example, you can use this feature to create tiles based on given boundaries such as province borders. By specifying the colocation_table and colocation_column arguments, you can ensure that your data is organized and managed in a way that suits your specific needs.
-- <ins>colocation_column</ins> (Optional): Specify the colocation column.
-- <ins>physical_partitioning</ins> (Optional): Determine whether or not to physically partition data.
-- <ins>object_segmentation</ins> (Optional): Determine whether or not to segment the input spatiotemporal column.
+- `table_name_in`: Name of the input table
+- `num_tiles`: Number of generated tiles
+- `table_name_out`: Name of the distributed table
+- `tiling_method`: Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>
+- `tiling_granularity` (Optional): The tiling granularity. The default value depends on the granularity selection process of the tiling method that chooses between shape- and point-based strategies to create load-balanced tiles. The user can set this parameter to customize the tiling granularity.
+- `tiling_type` (Optional): The tiling type of the tiling method. It can be one of the following: temporal, spatial, or spatiotemporal. The default value depends on the given column type.
+- `colocation_table` (Optional): This argument allows you to colocate the input table with another table.  For example, you can use this feature to create tiles based on given boundaries such as province borders. By specifying the colocation_table and colocation_column arguments, you can ensure that your data is organized and managed in a way that suits your specific needs.
+- `colocation_column` (Optional): Specify the colocation column.
+- `physical_partitioning` (Optional): Determine whether or not to physically partition data.
+- `object_segmentation` (Optional): Determine whether or not to segment the input spatiotemporal column.
 
 By utilizing the create_spatiotemporal_distributed_table() function with these arguments, you can easily create a distributed table that suits your data management needs. 
 
