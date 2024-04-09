@@ -16,6 +16,7 @@ CREATE TYPE dist_mobilitydb.spatiotemporal_tiling_method AS ENUM (
     'octree'
 );
 
+
 ALTER TYPE dist_mobilitydb.spatiotemporal_tiling_method
 SET SCHEMA pg_catalog;
 
