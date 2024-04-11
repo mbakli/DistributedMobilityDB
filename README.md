@@ -59,13 +59,14 @@ By utilizing the create_spatiotemporal_distributed_table() function with these a
 
 -----------------------------------------------------------------------------------------------------------------------
 # Use Cases
-Here are a few examples of widely recognized datasets, where Distributed MobilityDB showcases its proficiency in managing large spatiotemporal data, offering users diverse query types suitable for a wide range of applications. 
+Below are examples of well-known datasets, where Distributed MobilityDB showcases its proficiency in managing large spatiotemporal data, offering users diverse query types suitable for a wide range of applications. 
 
 Distributed MobilityDB seamlessly converts PostGIS and MobilityDB tables into distributed tables, allowing users to execute their PostGIS and MobilityDB SQL queries in a distributed manner without any need for modification.
 
 ### OpenStreatMap (OSM) Data
-#### Description: OSM data refers to geographic data collected by the OpenStreetMap community. It includes information such as roads, buildings, parks, and other features. 
-#### Download: https://download.geofabrik.de/ 
+Description: OSM data refers to geographic data collected by the OpenStreetMap community. It includes information such as roads, buildings, parks, and other features. 
+
+Download: https://download.geofabrik.de/ 
 ```sql
 -- Input tables
 CREATE TABLE planet_osm_polygon (
@@ -103,9 +104,9 @@ WHERE t2.amenity IN ('hospital', 'clinic', 'doctors')
   AND st_intersects(t1.way, t2.way);
 ```
 ### AIS Data
-#### Description: AIS is a tracking system used on ships and vessels to provide information about their identification, course, speed, and dynamic data such as longitude, latitude, and time..
+Description: AIS is a tracking system used on ships and vessels to provide information about their identification, course, speed, and dynamic data such as longitude, latitude, and time..
 
-#### Download: https://web.ais.dk/aisdata/
+Download: https://web.ais.dk/aisdata/
 
 ```sql
 -- Input tables
@@ -151,7 +152,7 @@ SELECT create_spatiotemporal_distributed_table(table_name_in => 'gsod_temp', num
 
 -- Temporal Query: Identify the hottest areas observed within the past 24 hours
 SELECT station, loc
-FROM gsod_temp
+FROM gsod_temp_32t
 WHERE temperature_tfloat && tstzspan '[2024-01-01, 2024-01-01]' 
 	AND temperature_tfloat ?> 95 -- Fahrenheit
 ```
