@@ -103,7 +103,7 @@ WHERE t2.amenity IN ('hospital', 'clinic', 'doctors')
   AND t1.name = 'Berlin'
   AND st_intersects(t1.way, t2.way);
 ```
-### AIS Data
+### Automatic Identification System (AIS) Data
 Description: AIS is a tracking system used on ships and vessels to provide information about their identification, course, speed, and dynamic data such as longitude, latitude, and time..
 
 Download: https://web.ais.dk/aisdata/
@@ -132,7 +132,7 @@ SELECT t1.mmsi Ship1ID, t2.mmsi Ship2ID
 FROM ships_tanker_30t t1, ships_fishing_15t t2
 WHERE edwithin(t1.trip, t2.trip, 1000);
 ```
-### Global Surface Summary of the Day - GSOD Data
+### Global Surface Summary of the Day (GSOD) Data
 Description: GSOD data is a collection of daily weather observations from weather stations around the world. It includes information such as temperature, time, location, humidity, and atmospheric pressure. It provides valuable insights into weather patterns, trends, and extremes on a global scale.
 
 Download: https://www.ncei.noaa.gov/
