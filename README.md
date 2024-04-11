@@ -85,9 +85,13 @@ CREATE TABLE planet_osm_roads (
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, 
   table_name_out=>'planet_osm_polygon_50t', tiling_method => 'crange');
 
--- Distribute the planet_osm_roads table into 30 tiles using the spatial column: geometry(polygon)
+-- Distribute the planet_osm_roads table into 30 tiles using the spatial column: geometry(linestring)
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_roads', num_tiles =>30, 
   table_name_out=>'planet_osm_roads_30t', tiling_method => 'crange');
+
+-- Distribute the planet_osm_point table into 12 tiles using the spatial column: geometry(point)
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_point', num_tiles =>12,
+                                               table_name_out=>'planet_osm_point_12t', tiling_method => 'crange');
 
 -- Distance-Join Query: Find buildings that are built within 1km of the primary highways.
 SELECT distinct t1.name
@@ -98,7 +102,7 @@ WHERE t1.building = 'yes'
 
 -- Intersection-Join Query: Find health centers POIs in Berlin.
 SELECT t2.name
-FROM planet_osm_polygon_30t t1, planet_osm_point_12t t2
+FROM planet_osm_polygon_50t t1, planet_osm_point_12t t2
 WHERE t2.amenity IN ('hospital', 'clinic', 'doctors')
   AND t1.name = 'Berlin'
   AND st_intersects(t1.way, t2.way);
@@ -110,30 +114,33 @@ Download: https://web.ais.dk/aisdata/
 
 ```sql
 -- Input tables
-CREATE TABLE ships (
+CREATE TABLE ships_tanker (
   mmsi int,
   trip tgeompoint(sequence),
   ...
 );
 
--- Distribute the ships table into 50 tiles using the spatiotemporal column: tgeompoint(sequence)
--- Spatiotemporal tiling
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, 
-  table_name_out=>'ships_50t', partitioning_method => 'crange', tiling_type =>'spatiotemporal');
--- Spatial tiling
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, 
-  table_name_out=>'ships_50t', partitioning_method => 'crange', tiling_type =>'spatial');
--- Temporal tiling
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_tiles =>50, 
-  table_name_out=>'ships_50t', partitioning_method => 'crange', tiling_type =>'temporal');
+CREATE TABLE ships_fishing (
+  mmsi int,
+  trip tgeompoint(sequence),
+  ...
+);
+
+-- Distribute the ships_tanker table into 50 tiles using the spatiotemporal column: tgeompoint(sequence)
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships_tanker', num_tiles =>50, 
+  table_name_out=>'ships_tanker_50t', partitioning_method => 'crange', tiling_type =>'spatiotemporal');
+
+-- Distribute the ships_fishing table into 15 tiles using the spatiotemporal column: tgeompoint(sequence)
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships_fishing', num_tiles =>15, 
+  table_name_out=>'ships_fishing_15t', partitioning_method => 'crange', tiling_type =>'spatiotemporal');
 
 -- Distance-Join Query: Find fishing ships that were within 1km of tanker ships.
 SELECT t1.mmsi AS Ship1ID, t2.mmsi AS Ship2ID
-FROM ships_tanker_30t t1, ships_fishing_15t t2
+FROM ships_tanker_50t t1, ships_fishing_15t t2
 WHERE edwithin(t1.trip, t2.trip, 1000);
 -- Temporal Query: What is the total travelled distance of ships that spent more than 5 days to reach to the port of Kalundborg in Sept 19?
 SELECT mmsi AS ShipID, length(Trip) / 1000 AS travelledKms
-FROM ships_tanker_30t
+FROM ships_tanker_50t
 WHERE Destination='Kalundborg'
   AND Trip && Period('2019-09-01', '2019-09-30')
 	AND timespan(Trip) > '5 days';
@@ -153,7 +160,6 @@ CREATE TABLE gsod_temp (
 );
 
 -- Distribute the GSOM table into 32 tiles using the temporal float column: tfloat(sequence)
--- Temporal tiling
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'gsod_temp', num_tiles =>32, 
   table_name_out=>'gsod_temp_32t', partitioning_method => 'crange', tiling_type =>'temporal');
 
@@ -164,7 +170,7 @@ WHERE temperature_tfloat && tstzspan '[2024-01-01, 2024-01-01]'
 	AND temperature_tfloat ?> 95 -- Fahrenheit
 -- Aggregate Query: Retrieve the maximum temperature for each location
 SELECT loc, xmax(extent(temperature_tfloat))
-FROM GSOD_TEMP
+FROM gsod_temp_32t
 GROUP BY loc;	                             
 ```
 
