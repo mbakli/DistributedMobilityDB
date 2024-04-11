@@ -132,8 +132,9 @@ FROM ships_tanker_30t t1, ships_fishing_15t t2
 WHERE edwithin(t1.trip, t2.trip, 1000);
 ```
 ### Global Surface Summary of the Day - GSOD Data
-#### Description: GSOD data is a collection of daily weather observations from weather stations around the world. It includes information such as temperature, time, location, humidity, and atmospheric pressure. It provides valuable insights into weather patterns, trends, and extremes on a global scale.
-#### Download: https://www.ncei.noaa.gov/
+Description: GSOD data is a collection of daily weather observations from weather stations around the world. It includes information such as temperature, time, location, humidity, and atmospheric pressure. It provides valuable insights into weather patterns, trends, and extremes on a global scale.
+
+Download: https://www.ncei.noaa.gov/
 
 ```sql
 -- Input tables
