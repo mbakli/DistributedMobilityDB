@@ -1,15 +1,17 @@
-# Distributed MobilityDB
+[# Distributed MobilityDB
 Distributed MobilityDB is a PostgreSQL extension that extends the open source databases PostGIS and MobilityDB to distribute spatial and spatiotemporal data and queries.
 
 # Key Features
 
-* **Spatial and Spatiotemporal Data Partitioning**
+* **Spatiotemporal Data Partitioning**
   * Transform the input relation into a multirelation, preserving spatiotemporal data locality and load balancing.
   * Develop a two-level (global and local) distributed indexing scheme, effectively reducing the global transmission cost and local computation cost.
-* **Spatial and Spatiotemporal Processing**
-  * Provide an adaptive execution engine that transforms a SQL query into a distributed plan, which can then be executed on either a single machine or a cluster.
-* **Declarative Query Language**
-  * Offer declarative SQL functions for data partitioning, as well as map declarative SQL queries into distributed execution strategies.
+* **Spatiotemporal Processing**
+  * Handle a wide array of MobilityDB types including tint, tfloat, and tgeompoint, alongside PostGIS types, such as point, linestring, and polygon.
+  * Provide an adaptive execution engine that transforms a SQL query into a distributed query plan, which can then be executed on either a single machine or a cluster.
+  * Support spatial-only, temporal-only, and spatiotemporal queries, where PostGIS and MobilityDB predicates can co-exist in a single query.
+  * Facilitate multiple types of queries including range, kNN, intersection, and distance joins.
+  * Offer an execution framework that readily enables distributed processing for both PostGIS and MobilityDB functionalities.
 
 🚧 **Please note that the extension is still under development, so stay tuned for more updates and features.** 🚧
 
@@ -38,14 +40,14 @@ Postgresql
 
 ### Creating Distributed Tables
 
-The `create_spatiotemporal_distributed_table ()` function is utilized to define a distributed table that is partitioned using one of the Multidimensional Tiling methods. It splits the input table into several tiles stored in separate PostgreSQL tables.
+The `create_spatiotemporal_distributed_table ()` function is utilized to define a distributed table that is partitioned using a Multidimensional Tiling method. It splits the input table into several tiles stored in separate PostgreSQL tables.
 
 func: create_spatiotemporal_distributed_table
 #### Arguments:
 - `table_name_in`: Name of the input table
 - `num_tiles`: Number of generated tiles
 - `table_name_out`: Name of the distributed table
-- `tiling_method`: Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>
+- `tiling_method`: Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>, <ins>grid</ins>
 - `tiling_granularity` (Optional): The tiling granularity. The default value depends on the granularity selection process of the tiling method that chooses between shape- and point-based strategies to create load-balanced tiles. The user can set this parameter to customize the tiling granularity.
 - `tiling_type` (Optional): The tiling type of the tiling method. It can be one of the following: temporal, spatial, or spatiotemporal. The default value depends on the given column type.
 - `colocation_table` (Optional): This argument allows you to colocate the input table with another table.  For example, you can use this feature to create tiles based on given boundaries such as province borders. By specifying the colocation_table and colocation_column arguments, you can ensure that your data is organized and managed in a way that suits your specific needs.
@@ -57,9 +59,15 @@ By utilizing the create_spatiotemporal_distributed_table() function with these a
 
 -----------------------------------------------------------------------------------------------------------------------
 # Use Cases
+Here are a few examples of widely recognized datasets, where Distributed MobilityDB showcases its proficiency in managing large spatiotemporal data, offering users diverse query types suitable for a wide range of applications. 
 
-### OSM Data
+Distributed MobilityDB seamlessly converts PostGIS and MobilityDB tables into distributed tables, allowing users to execute their PostGIS and MobilityDB SQL queries in a distributed manner without any need for modification.
+
+### OpenStreatMap (OSM) Data
+#### Description: OSM data refers to geographic data collected by the OpenStreetMap community. It includes information such as roads, buildings, parks, and other features. 
+#### Download: https://download.geofabrik.de/ 
 ```sql
+-- Input tables
 CREATE TABLE planet_osm_polygon (
   osm_id bigint,
   way geometry(polygon),
@@ -94,9 +102,13 @@ WHERE t2.amenity IN ('hospital', 'clinic', 'doctors')
   AND t1.name = 'Berlin'
   AND st_intersects(t1.way, t2.way);
 ```
-### AIS Trajectory Data
+### AIS Data
+#### Description: AIS is a tracking system used on ships and vessels to provide information about their identification, course, speed, and dynamic data such as longitude, latitude, and time..
+
+#### Download: https://web.ais.dk/aisdata/
 
 ```sql
+-- Input tables
 CREATE TABLE ships (
   mmsi int,
   trip tgeompoint(sequence),
@@ -119,6 +131,29 @@ SELECT t1.mmsi Ship1ID, t2.mmsi Ship2ID
 FROM ships_tanker_30t t1, ships_fishing_15t t2
 WHERE edwithin(t1.trip, t2.trip, 1000);
 ```
+### Global Surface Summary of the Day - GSOD Data
+#### Description: GSOD data is a collection of daily weather observations from weather stations around the world. It includes information such as temperature, time, location, humidity, and atmospheric pressure. It provides valuable insights into weather patterns, trends, and extremes on a global scale.
+#### Download: https://www.ncei.noaa.gov/
+
+```sql
+-- Input tables
+CREATE TABLE gsod_temp (
+  loc geometry,
+  temperature_tfloat tfloat(sequence),
+  ...
+);
+
+-- Distribute the GSOM table into 32 tiles using the temporal float column: tfloat(sequence)
+-- Temporal tiling
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'gsod_temp', num_tiles =>32, 
+  table_name_out=>'gsod_temp_32t', partitioning_method => 'crange', tiling_type =>'temporal');
+
+-- Temporal Query: Identify the hottest areas observed within the past 24 hours
+SELECT station, loc
+FROM gsod_temp
+WHERE temperature_tfloat && tstzspan '[2024-01-01, 2024-01-01]' 
+	AND temperature_tfloat ?> 95 -- Fahrenheit
+```
 
 # Contributing
 
@@ -131,4 +166,4 @@ Wrapping Postgres' internals to create a distributed version of MobilityDB is a 
 # Contact Us
 We hope you find our project helpful and easy to use! If you have any questions, comments, or concerns, please don't hesitate to reach out to us. 
 
-You can contact us by sending an email to mohamed.bakli@ulb.be
+1. [ ] You can contact us by sending an email to mohamed.bakli@ulb.be]()
