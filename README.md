@@ -104,7 +104,7 @@ WHERE t2.amenity IN ('hospital', 'clinic', 'doctors')
   AND st_intersects(t1.way, t2.way);
 ```
 ### Automatic Identification System (AIS) Data
-Description: AIS is a tracking system used on ships and vessels to provide information about their identification, course, speed, and dynamic data such as longitude, latitude, and time..
+Description: AIS is a tracking system used on ships and vessels to provide information about their identification, course, speed, and dynamic data such as longitude, latitude, and time.
 
 Download: https://web.ais.dk/aisdata/
 
@@ -128,12 +128,19 @@ SELECT create_spatiotemporal_distributed_table(table_name_in => 'ships', num_til
   table_name_out=>'ships_50t', partitioning_method => 'crange', tiling_type =>'temporal');
 
 -- Distance-Join Query: Find fishing ships that were within 1km of tanker ships.
-SELECT t1.mmsi Ship1ID, t2.mmsi Ship2ID
+SELECT t1.mmsi AS Ship1ID, t2.mmsi AS Ship2ID
 FROM ships_tanker_30t t1, ships_fishing_15t t2
 WHERE edwithin(t1.trip, t2.trip, 1000);
+-- Temporal Query: What is the total travelled distance of ships that spent more than 5 days to reach to the port of Kalundborg in Sept 19?
+SELECT mmsi AS ShipID, length(Trip) / 1000 AS travelledKms
+FROM ships_tanker_30t
+WHERE Destination='Kalundborg'
+  AND Trip && Period('2019-09-01', '2019-09-30')
+	AND timespan(Trip) > '5 days';
+
 ```
 ### Global Surface Summary of the Day (GSOD) Data
-Description: GSOD data is a collection of daily weather observations from weather stations around the world. It includes information such as temperature, time, location, humidity, and atmospheric pressure. It provides valuable insights into weather patterns, trends, and extremes on a global scale.
+Description: GSOD data is a collection of daily weather observations from weather stations around the world. It includes information such as temperature, time, location, humidity, and atmospheric pressure.
 
 Download: https://www.ncei.noaa.gov/
 
@@ -155,6 +162,10 @@ SELECT station, loc
 FROM gsod_temp_32t
 WHERE temperature_tfloat && tstzspan '[2024-01-01, 2024-01-01]' 
 	AND temperature_tfloat ?> 95 -- Fahrenheit
+-- Aggregate Query: Retrieve the maximum temperature for each location
+SELECT loc, xmax(extent(temperature_tfloat))
+FROM GSOD_TEMP
+GROUP BY loc;	                             
 ```
 
 # Contributing
