@@ -1,4 +1,4 @@
-[# Distributed MobilityDB
+# Distributed MobilityDB
 Distributed MobilityDB is a PostgreSQL extension that extends the open source databases PostGIS and MobilityDB to distribute spatial and spatiotemporal data and queries.
 
 # Key Features
