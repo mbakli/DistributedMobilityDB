@@ -81,6 +81,12 @@ CREATE TABLE planet_osm_roads (
   ...
 );
 
+CREATE TABLE planet_osm_point (
+  osm_id bigint,
+  way geometry(point),
+  ...
+);
+
 -- Distribute the planet_osm_polygon table into 50 tiles using the spatial column: geometry(polygon)
 SELECT create_spatiotemporal_distributed_table(table_name_in => 'planet_osm_polygon', num_tiles =>50, 
   table_name_out=>'planet_osm_polygon_50t', tiling_method => 'crange');
