@@ -15,6 +15,14 @@
 #ifndef COORDINATOR_OPERATIONS_H
 #define COORDINATOR_OPERATIONS_H
 
+/*
+ * CoordinatorOperation
+ *
+ * The coordinator-side half of a distributed aggregate/expression: the
+ * `intermediate_op` combines the per-tile results collected from the
+ * workers, and `final_op` transforms that combined result into the value
+ * returned to the client.
+ */
 typedef struct CoordinatorOperation
 {
     Datum intermediate_op;

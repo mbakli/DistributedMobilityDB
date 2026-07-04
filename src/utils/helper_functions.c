@@ -14,6 +14,12 @@
 
 #include "utils/helper_functions.h"
 
+/*
+ * replaceWord replaces the first occurrence of oldW in s with newW,
+ * in place, and returns s. Assumes s has enough allocated room to hold the
+ * result (the local buffer is sized off strlen(s), so newW must not be
+ * longer than oldW).
+ */
 extern
 char* replaceWord( char* s,  char* oldW,  char* newW)
 {
@@ -35,6 +41,7 @@ char* replaceWord( char* s,  char* oldW,  char* newW)
     return s;
 }
 
+/* extract_between returns a newly allocated copy of the substring of str found strictly between markers p1 and p2. */
 extern
 char * extract_between(const char *str, const char *p1, const char *p2) {
     const char *i1 = strstr(str, p1);
@@ -54,6 +61,7 @@ char * extract_between(const char *str, const char *p1, const char *p2) {
     }
 }
 
+/* change_sentence returns a newly allocated copy of sentence with the first occurrence of find replaced by replace. */
 extern char *
 change_sentence (char *sentence, char *find, char *replace)
 {
@@ -72,6 +80,7 @@ change_sentence (char *sentence, char *find, char *replace)
     return dest;
 }
 
+/* toLower returns a newly allocated, lowercased copy of str. */
 extern
 char *toLower(char *str)
 {
@@ -84,6 +93,7 @@ char *toLower(char *str)
     return str_l;
 }
 
+/* IsDatumEmpty reports whether val is the zero/unset Datum (i.e. no value was assigned). */
 extern bool
 IsDatumEmpty(Datum val)
 {

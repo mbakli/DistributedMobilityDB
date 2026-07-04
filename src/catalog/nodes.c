@@ -28,6 +28,11 @@ extern Datum GetDBName();
 #define Anum_DistNodes_nodename 0
 #define Anum_DistNodes_nodeport 1
 
+/*
+ * GetNodeInfo picks a random worker node from Citus' pg_dist_node catalog
+ * and returns its name/port together with the current database name, for
+ * use as the target of a dispatched task.
+ */
 extern TaskNode *
 GetNodeInfo()
 {
@@ -64,6 +69,12 @@ GetNodeInfo()
     return taskNode;
 }
 
+/*
+ * GetRandomTileId looks up the Citus shard id whose shardminvalue matches
+ * rand_tile for relationId (accounting for the dist_mobilitydb schema when
+ * relationId has already been reshuffled) and returns it as a
+ * "<table>_<shardid> " task identifier string.
+ */
 extern
 char * GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile)
 {
@@ -107,6 +118,7 @@ char * GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile)
     return NULL;
 }
 
+/* GetDBName returns the name of the database the current backend is connected to. */
 extern Datum
 GetDBName()
 {

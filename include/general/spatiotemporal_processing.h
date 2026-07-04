@@ -16,9 +16,11 @@
 #define SPATIOTEMPORAL_PROCESSING_H
 #include "postgres.h"
 
+/* Casts a Datum holding a pointer to PostGIS' spatial bounding box (GBOX). */
 #define S_BOX_PTR(c)  ( (GBOX *) DatumGetPointer(c) )
 #define DATUM_GET_SBOX(c)  ( S_BOX_PTR(c) )
 #define BOX_GET_DATUM(c)  ( PointerGetDatum(c) )
+/* Casts a Datum holding a pointer to MobilityDB's spatiotemporal bounding box (STBOX). */
 #define ST_BOX_PTR(c)  ( (STBOX *) DatumGetPointer(c) )
 #define DATUM_GET_STBOX(c)  ( ST_BOX_PTR(c) )
 #endif /* SPATIOTEMPORAL_PROCESSING_H */

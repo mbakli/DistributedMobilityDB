@@ -17,6 +17,11 @@
 #include "utils/planner_utils.h"
 #include "catalog/pg_dist_spatiotemporal_dist_functions.h"
 
+/*
+ * GetTilingSchemeInfo loads relationId's pg_dist_spatiotemporal_tables row
+ * into an in-memory STMultirelationCatalog: its tiling method/type/
+ * granularity, tile count, distribution column, and related metadata.
+ */
 extern STMultirelationCatalog
 GetTilingSchemeInfo(Oid relationId)
 {
@@ -85,6 +90,13 @@ DisFuncRelationId()
     return RelationId(Tbl_Dist_Functions);
 }
 
+/*
+ * AddCatalogFilterInfo records into catalogFilter which of tbl's tiles a
+ * predicate node of predType could match. A NULL node (no analysable
+ * predicate) conservatively assumes every tile is a candidate. Narrowing
+ * the candidate count below numTiles (e.g. via a real bounding-box lookup)
+ * is left as future work — see the Tile Scan Rebalancer TODO below.
+ */
 extern void
 AddCatalogFilterInfo(STMultirelationCatalog tbl, CatalogFilter *catalogFilter, Node *node,
                      PredicateType predType, bool IsConst)

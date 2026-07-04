@@ -93,6 +93,7 @@ RegisterSpatiotemporalPlanMethods(void)
     RegisterCustomScanMethods(&SpatiotemporalExecutorMethod);
 }
 
+/* SpatiotemporalExecutorCreateScan is the CustomScanMethods callback that builds the scan's execution state. */
 static Node *
 SpatiotemporalExecutorCreateScan(CustomScan *scan)
 {
@@ -131,6 +132,7 @@ static void ExplainQueryType(DistributedSpatiotemporalQueryPlan *distPlan, Expla
     ExplainPropertyText("Distributed Spatiotemporal Planner", temp->data, es);
 }
 
+/* getQueryType renders the combination of chosen strategies as a short human-readable label. */
 static char * getQueryType(List *strategies)
 {
     ListCell *cell = NULL;
@@ -221,6 +223,13 @@ static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, Expla
     }
 }
 
+/*
+ * ExplainPlanStrategies re-runs the executor in explain-only mode
+ * (RunQueryExecutor with explain=true, so no data-modifying SPI calls
+ * happen) to obtain the per-strategy tasks, then prints one representative
+ * task per task type via ExplainOneTask — showing the plan for a single
+ * tile stands in for all `candidates` tiles that would actually run.
+ */
 static void
 ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group)
 {
@@ -241,6 +250,12 @@ ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState
         es->indent -= 5;
     }
 }
+/*
+ * ExplainOneTask plans and (via ExplainWorkerPlan) prints the local plan
+ * for a single, randomly-chosen tile of `task`, substituting that tile's
+ * concrete shard identifier into the task's query (GetLocalQuery) so it
+ * can be planned as an ordinary local query.
+ */
 static void
 ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int indent_group)
 {
@@ -266,6 +281,12 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
     ExplainEndOutput(es);
 }
 
+/*
+ * GetLocalQuery rewrites query_string so that every distributed table name
+ * it references is replaced by the concrete shard/tile identifier chosen
+ * for it (GetRandomTileId), producing a plain local query that EXPLAIN can
+ * plan directly.
+ */
 static char *
 GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile)
 {

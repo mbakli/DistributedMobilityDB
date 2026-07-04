@@ -17,6 +17,11 @@
 
 /* ----------------
  *  pg_execution_run: Compiler constants
+ *
+ *  Catalog table that assigns a unique execution id (id) to each
+ *  distributed query run, paired with its serialized executor state
+ *  (sexec) so distributed_functions rows can be traced back to the run
+ *  that produced them.
  * ----------------
  */
 

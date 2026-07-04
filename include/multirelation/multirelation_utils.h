@@ -18,6 +18,14 @@
 #include "multirelation/tiling_utils.h"
 #include "distributed/listutils.h"
 
+/*
+ * STMultirelationCatalog
+ *
+ * In-memory copy of a table's pg_dist_spatiotemporal_tables catalog row:
+ * how it was tiled (tiling_type/tiling_method/numTiles/granularity/
+ * disjointTiles), which column drives the distribution (distCol and its
+ * types), and the reshuffledTable to use if its tiles were rebalanced.
+ */
 typedef struct STMultirelationCatalog
 {
     Oid table_oid;
@@ -37,7 +45,15 @@ typedef struct STMultirelationCatalog
     char *reshuffledTable;
 } STMultirelationCatalog;
 
-/* Catalog Filter */
+/*
+ * CatalogFilter
+ *
+ * Describes how a query predicate narrows down the set of tiles a task
+ * needs to touch: `predicate` is the filter expression, `candidates` the
+ * resulting tile count, and tileExpand/expandValue record whether the
+ * search region had to be grown (e.g. for kNN/distance predicates) and by
+ * how much.
+ */
 typedef struct CatalogFilter
 {
     Datum predicate;
@@ -46,7 +62,7 @@ typedef struct CatalogFilter
     float expandValue;
 } CatalogFilter;
 
-/* Spatiotemporal Table Information */
+/* Spatiotemporal Table Information: a distributed relation as seen by the planner/executor. */
 typedef struct STMultirelation
 {
     ListCell *rangeTableCell;
@@ -60,6 +76,14 @@ typedef struct STMultirelation
     CatalogFilter *catalogFilter;
 } STMultirelation;
 
+/*
+ * STMultirelations
+ *
+ * A query's full set of range-table entries (`tables`), tallied by kind
+ * (stCount = spatiotemporal, nonStCount = plain, simCount/diffCount =
+ * entries sharing/not sharing the same shape type) so the planner can
+ * decide which join/execution strategy applies.
+ */
 typedef struct STMultirelations
 {
     List *tables;
@@ -70,10 +94,15 @@ typedef struct STMultirelations
     int length;
 } STMultirelations;
 
-
-
+/* True if relationId is registered as a distributed spatiotemporal table. */
 extern bool IsDistributedSpatiotemporalTable(Oid relationId);
+
+/* Builds the STMultirelation describing rangeTableEntry, expected to hold shape `type`. */
 extern STMultirelation *GetMultirelationInfo(RangeTblEntry *rangeTableEntry, ShapeType type);
+
+/* Name of the local (per-tile) index defined on relationId's `col`. */
 extern char *GetLocalIndex(Oid relationId, char * col);
+
+/* Determines whether/how rangeTableEntry's tiles need reshuffling before use. */
 extern char GetReshufflingType(RangeTblEntry *rangeTableEntry);
 #endif /* MULTIRELATION_H */

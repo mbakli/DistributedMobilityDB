@@ -17,6 +17,11 @@
 #include "catalog/table_ops.h"
 #include "utils/planner_utils.h"
 
+/*
+ * GetMultirelationInfo builds the STMultirelation describing rangeTableEntry
+ * as a distributed table of the given shape `type`: its spatiotemporal
+ * column, query alias, local per-tile index, and tiling scheme catalog info.
+ */
 extern STMultirelation *
 GetMultirelationInfo(RangeTblEntry *rangeTableEntry, ShapeType type)
 {

@@ -17,7 +17,10 @@
 #include "post_processing/post_processing.h"
 #include "multirelation/multirelation_utils.h"
 
+/* Scans the SELECT targetlist for distributed aggregates and records them into postProcessing. */
 extern void analyseSelectClause(List *targetList, PostProcessing *postProcessing);
+
+/* Analyses fromExpr's predicates against tbl's catalog to derive its candidate-tile filter. */
 extern CatalogFilter *AnalyseCatalog(STMultirelation *tbl, FromExpr * fromExpr);
 
 #endif /* QUERY_SEMANTICS_CHECK_H */

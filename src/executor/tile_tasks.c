@@ -21,6 +21,7 @@
 #include "general/rte.h"
 #include "utils/planner_utils.h"
 
+/* taskQuery returns the SQL text of the first task in `tasks` matching taskType. */
 char *
 taskQuery (List *tasks, ExecTaskType taskType)
 {
@@ -35,7 +36,12 @@ taskQuery (List *tasks, ExecTaskType taskType)
     }
 }
 
-/* Executor Job: Rearrange the generated tiles */
+/*
+ * RearrangeTiles calls the create_reshuffled_multirelation() SQL helper to
+ * redistribute relid's rows into numTiles tiles inside reshuffledTable, so
+ * two previously non-colocated tables end up sharing the same tiling
+ * scheme before being joined.
+ */
 void
 RearrangeTiles(Oid relid, int numTiles, char *reshuffledTable)
 {
@@ -56,6 +62,12 @@ RearrangeTiles(Oid relid, int numTiles, char *reshuffledTable)
     PushActiveSnapshot(GetTransactionSnapshot());
 }
 
+/*
+ * AddTilingKey rewrites query_string so it targets the reshuffled table
+ * (dist_mobilitydb.<reshuffledTable> instead of the original table name)
+ * and replaces its `where` clause with a tile-key equality predicate,
+ * ensuring the neighbor scan only compares rows sharing the same tile.
+ */
 Datum
 AddTilingKey(STMultirelationCatalog tblCatalog, Alias *alias ,char * query_string)
 {
@@ -71,6 +83,7 @@ AddTilingKey(STMultirelationCatalog tblCatalog, Alias *alias ,char * query_strin
     return CStringGetDatum(replaceWord( replaceWord(task_prep->data,"where", tmp->data), ";", " "));
 }
 
+/* AddNonStRteTilingKey is AddTilingKey()'s counterpart for a plain Citus-distributed (non-spatiotemporal) relation. */
 Datum
 AddNonStRteTilingKey(Rte *tbl, Alias *alias ,char * query_string)
 {
@@ -92,6 +105,7 @@ AddNonStRteTilingKey(Rte *tbl, Alias *alias ,char * query_string)
     return 0;
 }
 
+/* GetRandTileNum returns a randomly-chosen shard's shardminvalue for rte, used to sample a single tile. */
 extern int
 GetRandTileNum(STMultirelation *rte)
 {

@@ -15,6 +15,13 @@
 #ifndef WORKER_OPERATIONS_H
 #define WORKER_OPERATIONS_H
 
+/*
+ * WorkerOperation
+ *
+ * The worker-side half of a distributed aggregate/expression: `op` is the
+ * per-tile computation run on each worker before its partial result is
+ * shipped back to the coordinator for combination (see CoordinatorOperation).
+ */
 typedef struct WorkerOperation
 {
     Datum op;

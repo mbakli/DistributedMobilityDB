@@ -87,6 +87,7 @@ IsDistanceOperation(Oid operationId)
     return heapTupleIsValid;
 }
 
+/* get_query_range extracts the constant bounding-box argument from opExpr, if any, as its search range. */
 extern Datum
 get_query_range(STMultirelations *tbls, OpExpr *opExpr)
 {
@@ -104,6 +105,12 @@ get_query_range(STMultirelations *tbls, OpExpr *opExpr)
     return 0;
 }
 
+/*
+ * CheckTileRebalancerActivation would decide whether box spans enough of
+ * tbls' tiles to be worth rebalancing before the scan.
+ * Currently disabled (always returns false) to work around a Citus issue;
+ * see TileScanRebalanceStrategyPlan() in planner_strategies.c.
+ */
 extern bool
 CheckTileRebalancerActivation(STMultirelations *tbls, OpExpr *opExpr, Datum box)
 {

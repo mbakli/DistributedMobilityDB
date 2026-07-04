@@ -17,7 +17,16 @@
 #include "postgres.h"
 #include "multirelation/multirelation_utils.h"
 
-/* Executor Task Type */
+/*
+ * ExecTaskType
+ *
+ * The kind of scan a task performs against a tile:
+ *   NeighborTilingScan - scans a tile against a neighboring tile (join across tile boundaries)
+ *   SelfTilingScan     - scans a tile against itself (self-join / single-tile predicate)
+ *   PushDownScan        - predicate is pushed down and run entirely on the worker
+ *   INTERMEDIATEScan    - a worker-phase task whose result feeds the combiner
+ *   FINALScan           - the coordinator-phase task producing the final result
+ */
 typedef enum ExecTaskType
 {
     NeighborTilingScan,
@@ -28,7 +37,9 @@ typedef enum ExecTaskType
 } ExecTaskType;
 
 /*
- * MultiPhaseExecutor
+ * TaskNode
+ *
+ * Connection info (hostname/db) for the node a task must be dispatched to.
  */
 typedef struct TaskNode
 {
@@ -37,6 +48,13 @@ typedef struct TaskNode
     Datum db;
 } TaskNode;
 
+/*
+ * ExecutorTask
+ *
+ * A single unit of distributed work: the SQL to run (taskQuery), its
+ * ExecTaskType, resource hints (numCores, candidates), and the catalog
+ * filter identifying which tiles it applies to.
+ */
 typedef struct ExecutorTask
 {
     StringInfo taskQuery;
@@ -46,7 +64,10 @@ typedef struct ExecutorTask
     CatalogFilter *catalog_filtered;
 } ExecutorTask;
 
+/* Builds the worker-phase tasks (INTERMEDIATEScan) for the given operations. */
 extern ExecutorTask *ProcessIntermediateTasks(List *op);
+
+/* Builds the coordinator-phase task (FINALScan) that combines worker results. */
 extern ExecutorTask *ProcessFinalTasks(List *op);
 
 #endif /* EXECUTOR_TASKS_H */

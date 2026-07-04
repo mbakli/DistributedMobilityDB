@@ -46,6 +46,7 @@ extern void ExplainQueryParameters(DistributedSpatiotemporalQueryPlan *distPlan,
     ExplainCloseGroup("QueryParameters", "Query Parameters", true, es);
 }
 
+/* ExplainMainPredicate prints the query's dominant predicate kind (distance threshold or intersection). */
 static void ExplainMainPredicate(PredicateType predicateType, PredicateInfo * predicateInfo,
                                  ExplainState *es, int indent_group)
 {
@@ -62,6 +63,12 @@ static void ExplainMainPredicate(PredicateType predicateType, PredicateInfo * pr
     }
 }
 
+/*
+ * ExplainDistributedTables prints each distinct spatiotemporal table
+ * touched by the query along with its tiling method, local index, and tile
+ * count; repeated references to the same table (self-joins) are skipped
+ * after the first.
+ */
 static void ExplainDistributedTables(STMultirelations *tablesList, ExplainState *es, int indent_group)
 {
     appendStringInfoSpaces(es->str, es->indent * indent_group);
@@ -117,6 +124,11 @@ static void ExplainDistributedTables(STMultirelations *tablesList, ExplainState 
     ExplainCloseGroup("TablesInfo", "Distributed Tables Info", true, es);
 }
 
+/*
+ * ExplainReshufflingPlanInfo prints which table gets reshuffled for a
+ * NonColocation-strategy query and which column drives the reshuffle,
+ * shown only when IsReshufflingRequired() is true.
+ */
 static void ExplainReshufflingPlanInfo(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
                                        int indent_group)
 {

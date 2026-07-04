@@ -19,6 +19,7 @@
 #include <nodes/nodes.h>
 #include <access/htup_details.h>
 
+/* Classifies a WHERE-clause predicate by the kind of spatial/temporal test it performs. */
 typedef enum PredicateType
 {
     INTERSECTION,
@@ -27,24 +28,27 @@ typedef enum PredicateType
     OTHER
 } PredicateType;
 
+/* A bounding-box range predicate (e.g. `&&`), with its operator and query box. */
 typedef struct RangePredicate
 {
     char *op;
     Datum bbox;
 } RangePredicate;
 
+/* A distance predicate (e.g. eDwithin), with its operator and distance threshold. */
 typedef struct DistancePredicate
 {
     char *op;
     float distance;
 } DistancePredicate;
 
+/* An intersection predicate (e.g. ST_Intersects/eIntersects). */
 typedef struct IntersectionPredicate
 {
     char *op;
 } IntersectionPredicate;
 
-
+/* Holds the parsed detail for whichever PredicateType a Predicates entry represents. */
 typedef struct PredicateInfo
 {
     RangePredicate *rangePredicate;
@@ -52,17 +56,28 @@ typedef struct PredicateInfo
     IntersectionPredicate *intersectionPredicate;
 } PredicateInfo;
 
-
+/* One analysed predicate from the query's WHERE clause. */
 typedef struct Predicates
 {
     PredicateType predicateType;
     PredicateInfo *predicateInfo;
 } Predicates;
 
+/* Extracts the operator and distance threshold from a distance-predicate clause. */
 extern DistancePredicate *analyseDistancePredicate(Node *clause);
+
+/* Looks up the pg_spatiotemporal_join_operations catalog tuple for a distance/intersection operator. */
 extern HeapTuple PgSpatiotemporalJoinOperationTupleViaCatalog(Oid operationId, bool distance);
+
+/* True if operationId is a registered distance operator (e.g. eDwithin). */
 extern bool IsDistanceOperation(Oid operationId);
+
+/* True if operationId is a registered intersection operator (e.g. eIntersects). */
 extern bool IsIntersectionOperation(Oid operationId);
+
+/* Computes the query's search bounding box from tbls and the range/distance predicate opExpr. */
 extern Datum get_query_range(STMultirelations *tbls, OpExpr *opExpr);
+
+/* True if opExpr's search box spans enough tiles of tbls to warrant rebalancing first. */
 extern bool CheckTileRebalancerActivation(STMultirelations *tbls, OpExpr *opExpr, Datum box);
 #endif /* PREDICATE_MANAGMENT_H */

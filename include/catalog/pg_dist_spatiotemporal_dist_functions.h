@@ -17,6 +17,12 @@
 
 /* ----------------
  *  pg_dist_spatiotemporal_dist_functions: Compiler constants
+ *
+ *  Catalog table that maps a distributable aggregate/function (id) to the
+ *  three-phase function set used to run it across the cluster: the
+ *  per-tile `worker` function, the `combiner` that merges partial results,
+ *  and the `final` function that produces the end result. `sexec_id` ties
+ *  the row to the pg_execution_run entry for the query that registered it.
  * ----------------
  */
 

@@ -26,7 +26,14 @@
 #define Anum_DistFun_combiner 3
 #define Anum_DistFun_final 4
 
-
+/*
+ * QOperation
+ *
+ * A single query operation (e.g. an aggregate call) being rewritten for
+ * distributed execution: `op` is the operation's Datum representation,
+ * `col` the column/argument it applies to, and `alias` the output alias
+ * it must be projected under in the rewritten targetlist.
+ */
 typedef struct QOperation
 {
     Datum op;
@@ -34,6 +41,13 @@ typedef struct QOperation
     Datum col;
 } QOperation;
 
+/*
+ * DistributedFunction
+ *
+ * Binds a query targetlist entry to the worker/coordinator function pair
+ * (looked up via pg_dist_spatiotemporal_dist_functions) that implements it
+ * across the distributed plan.
+ */
 typedef struct DistributedFunction
 {
     CoordinatorOperation *coordinatorOp;
@@ -41,7 +55,12 @@ typedef struct DistributedFunction
     TargetEntry *targetEntry;
 } DistributedFunction;
 
+/* Resolves and attaches the worker/coordinator functions for a targetlist entry. */
 extern DistributedFunction *addDistributedFunction(TargetEntry *operation);
+
+/* True if targetEntry's expression is a registered distributable function. */
 extern bool IsDistFunc(TargetEntry *targetEntry);
+
+/* Builds a QOperation pairing a distributed op (des) with its argument column (cur). */
 extern QOperation * AddQOperation(Datum des, Datum cur);
 #endif /* DISTRIBUTED_FUNCTION_H */

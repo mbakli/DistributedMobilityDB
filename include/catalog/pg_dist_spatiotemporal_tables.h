@@ -17,6 +17,12 @@
 
 /* ----------------
  *  pg_dist_spatiotemporal_tables: Compiler constants
+ *
+ *  Catalog table holding one row per table that has been distributed via
+ *  create_spatiotemporal_distributed_table(). Records the source relation
+ *  (tbloid/tablename), how it was tiled (numtiles, tilingmethod,
+ *  tilingtype, granularity, disjoint, tilekey), and which column drives
+ *  the distribution (distcol/distcoltype/ismobilitydb/shapesegmented/srid).
  * ----------------
  */
 
