@@ -17,6 +17,12 @@
 
 /* ----------------
  *  pg_dist_spatiotemporal_tiles: Compiler constants
+ *
+ *  Catalog table with one row per tile produced for a distributed table
+ *  (table_id references pg_dist_spatiotemporal_tables). Stores the tile's
+ *  key and its bounding boxes in both MobilityDB (mobdb_bbox) and PostGIS
+ *  (postgis_bbox) representations, plus per-tile cardinality used by the
+ *  planner for load balancing (num_shapes, num_points).
  * ----------------
  */
 

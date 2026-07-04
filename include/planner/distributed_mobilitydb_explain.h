@@ -24,12 +24,18 @@
 #include "catalog/nodes.h"
 #include "executor/multi_phase_executor.h"
 
+/* EXPLAIN hook: planned and runs query, then prints the distributed plan/tasks. */
 extern void distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into,
                             ExplainState *es, const char *queryString, ParamListInfo params,
                             QueryEnvironment *queryEnv);
+
+/* Registers the custom-scan callbacks (Begin/Exec/End/Explain) for the spatiotemporal scan node. */
 extern void RegisterSpatiotemporalPlanMethods(void);
+
+/* True if any of `strategies` requires reshuffling tile data before execution. */
 extern bool IsReshufflingRequired(List *strategies);
 
+/* Custom-scan execution state for a distributed spatiotemporal query. */
 typedef struct SpatiotemporalScanState
 {
     CustomScanState customScanState;  /* underlying custom scan node */
@@ -44,6 +50,7 @@ typedef struct SpatiotemporalScanState
 } SpatiotemporalScanState;
 
 
+/* A query paired with its (possibly rewritten) SQL text, for EXPLAIN output. */
 typedef struct DistributedQueryExplain
 {
     Query *query;
@@ -51,6 +58,7 @@ typedef struct DistributedQueryExplain
 
 }DistributedQueryExplain;
 
+/* Writes distPlan's strategy, tasks and parameters into the EXPLAIN output (es). */
 extern void ExplainQueryParameters(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
 
 #endif /* SPATIOTEMPORAL_EXPLAIN_H */

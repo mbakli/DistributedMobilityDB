@@ -57,11 +57,22 @@
 
 
 
+/* Loads relationId's tiling scheme (method/type/granularity/etc.) from pg_dist_spatiotemporal_tables. */
 extern STMultirelationCatalog GetTilingSchemeInfo(Oid relationId);
+
+/* Oid of the pg_dist_spatiotemporal_tables catalog relation. */
 extern Oid MTSRelationId();
+
+/* Oid of the pg_dist_spatiotemporal_tiles catalog relation. */
 extern Oid MTSTilesRelationId();
+
+/* Oid of the pg_dist_spatiotemporal_dist_functions catalog relation. */
 extern Oid DisFuncRelationId();
+
+/* Oid of the distributed-node catalog relation. */
 extern Oid DistNodeId();
+
+/* Derives catalogFilter's candidate tiles/expansion for tbl from a predicate node of predType. */
 extern void AddCatalogFilterInfo(STMultirelationCatalog tbl, CatalogFilter *catalogFilter, Node *node,
                                  PredicateType predType, bool IsConst);
 #endif /* PLANNER_UTILS_H */

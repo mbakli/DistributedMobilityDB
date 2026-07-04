@@ -187,6 +187,10 @@ IsDistributedSpatiotemporalTable(Oid relationId)
     return false;
 }
 
+/*
+ * GetLocalIndex returns the name of the (non-unique) index defined on
+ * relationId's `col`, used to accelerate per-tile scans on workers.
+ */
 extern char *
 GetLocalIndex(Oid relationId, char * col)
 {
@@ -227,6 +231,10 @@ GetLocalIndex(Oid relationId, char * col)
     return NULL;
 }
 
+/*
+ * GetShapeCol returns the name of the geometry/shape column that
+ * relationId is distributed on, via the getDistributedCol() SQL helper.
+ */
 char *
 GetShapeCol(Oid relationId)
 {

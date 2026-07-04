@@ -21,7 +21,12 @@
 #include <nodes/primnodes.h>
 #include <nodes/parsenodes.h>
 
-/* Generic Relation */
+/*
+ * Rte
+ *
+ * A wrapper around a query range-table entry that tags it with which kind
+ * of underlying node (`rte`) it holds, as identified by RteType.
+ */
 typedef struct Rte
 {
     Node *rte;
@@ -29,7 +34,13 @@ typedef struct Rte
     Alias *alias;
 } Rte;
 
-/* Rte Types */
+/*
+ * RteType
+ *
+ *   STRte    - a spatiotemporal/distributed table (see STMultirelation)
+ *   CitusRte - a plain Citus-distributed table
+ *   LocalRte - a regular, non-distributed local table
+ */
 typedef enum RteType
 {
     STRte,
@@ -37,7 +48,7 @@ typedef enum RteType
     LocalRte
 } RteType;
 
-/* Citus Relation */
+/* Metadata for a range-table entry backed by a Citus-distributed table. */
 typedef struct CitusRteNode
 {
     ListCell *rangeTableCell;
@@ -49,7 +60,7 @@ typedef struct CitusRteNode
     char *reshuffledTable;
 } CitusRteNode;
 
-/* Local Relation */
+/* Metadata for a range-table entry backed by a plain local (non-distributed) table. */
 typedef struct LocalRteNode
 {
     ListCell *rangeTableCell;
@@ -60,15 +71,19 @@ typedef struct LocalRteNode
     char *reshuffledTable;
 } LocalRteNode;
 
-/* Reshuffling Relation */
+/* Wraps an STMultirelation that needs its tiles reshuffled/rebalanced before use. */
 typedef struct ReshufflingRte
 {
     STMultirelation *stMultirelation;
 } ReshufflingRte;
 
-
+/* Builds an Rte wrapper around `node`, tagged with rteType and its query alias. */
 extern Rte *GetRteNode(Node * node, RteType rteType, Alias *alias);
+
+/* Extracts Citus distribution metadata for rangeTableEntry (given its partitionMethod). */
 extern CitusRteNode *GetCitusRteInfo(RangeTblEntry *rangeTableEntry, char partitionMethod);
+
+/* Extracts local-table metadata for rangeTableEntry. */
 extern LocalRteNode * GetLocalRteInfo(RangeTblEntry *rangeTableEntry);
 
 #endif /* RTE_H */

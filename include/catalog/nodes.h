@@ -17,9 +17,18 @@
 #include "postgres.h"
 #include "executor/executor_tasks.h"
 
+/* Name of the database the current backend is connected to. */
 extern Datum GetDBName();
+
+/* Coordinator/worker node info (host, port, role) for the local backend. */
 extern TaskNode *GetNodeInfo();
+
+/* Table id of the tile assigned to a randomly-picked worker for relationId. */
 extern char* GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile);
+
+/* Looks up the tiling method used to distribute relationId; -1 if not distributed. */
 extern int TilingSearch(Oid relationId);
+
+/* Number of tiles the given distributed relation was split into. */
 extern int GetNumTiles(Oid relationId);
 #endif /* NODESS_H */

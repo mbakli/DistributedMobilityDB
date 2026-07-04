@@ -17,7 +17,14 @@
 
 #include "postgres.h"
 
-/* Shape Type */
+/*
+ * ShapeType
+ *
+ * Classifies a distributed column/relation by the kind of tiling it needs:
+ *   SPATIAL       - PostGIS geometry only (e.g. point, polygon)
+ *   SPATIOTEMPORAL - MobilityDB temporal type (e.g. tgeompoint)
+ *   DIFFTYPE       - relation is not distributed on a spatial/temporal column
+ */
 typedef enum ShapeType
 {
     SPATIAL,
@@ -25,8 +32,11 @@ typedef enum ShapeType
     DIFFTYPE
 } ShapeType;
 
+/* Schema created by the extension to hold internal catalog tables. */
 #define Var_Schema "dist_mobilitydb"
+/* Index method used for spatial/spatiotemporal (bbox) tile indexes. */
 #define Var_Spatiotemporal_Index "GIST"
+/* Index method used for scalar (non-spatial) tile indexes. */
 #define Var_BTREE_Index "BTREE"
 
 

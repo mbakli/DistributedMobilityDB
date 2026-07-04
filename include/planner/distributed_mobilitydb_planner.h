@@ -72,13 +72,25 @@ typedef struct GeneralScan
     int length;
 } GeneralScan;
 
+/*
+ * planner_hook entry point: intercepts queries touching distributed
+ * spatiotemporal tables and produces a custom-scan plan wrapping a
+ * DistributedSpatiotemporalQueryPlan; falls back to the standard planner
+ * otherwise.
+ */
 extern PlannedStmt * distributed_mobilitydb_planner(Query *parse, const char *query_string, int cursorOptions,
                                             ParamListInfo boundParams);
+
+/* Shared planning logic behind distributed_mobilitydb_planner(), also used by EXPLAIN. */
 extern PlannedStmt *distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, int cursorOptions,
                                                             ParamListInfo boundParams,
                                                             DistributedSpatiotemporalQueryPlan *distributedSpatiotemporalPlan,
                                                             bool explain);
+
+/* Retrieves the DistributedSpatiotemporalQueryPlan stashed on a planned CustomScan node. */
 extern DistributedSpatiotemporalQueryPlan *GetSpatiotemporalDistributedPlan(CustomScan *customScan);
+
+/* Loads the pg_dist_spatiotemporal_tables catalog row for rangeTableEntry's relation. */
 extern STMultirelationCatalog *GetSpatiotemporalCatalogTableInfo(RangeTblEntry *rangeTableEntry);
 
 

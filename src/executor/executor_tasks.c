@@ -16,6 +16,11 @@
 #include "executor/executor_tasks.h"
 #include "distributed_functions/distributed_function.h"
 
+/*
+ * ProcessIntermediateTasks builds the worker-phase (INTERMEDIATEScan) task
+ * query: a SELECT list applying each QOperation's worker function to its
+ * argument column, run against the local per-tile result set.
+ */
 extern ExecutorTask *
 ProcessIntermediateTasks(List *op)
 {
@@ -42,6 +47,11 @@ ProcessIntermediateTasks(List *op)
     return intermTask;
 }
 
+/*
+ * ProcessFinalTasks builds the coordinator-phase (FINALScan) task query: a
+ * SELECT list applying each QOperation's coordinator function over the
+ * combined intermediate results from all workers.
+ */
 extern ExecutorTask *
 ProcessFinalTasks(List *op)
 {

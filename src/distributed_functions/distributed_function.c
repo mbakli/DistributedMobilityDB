@@ -57,6 +57,7 @@ addDistributedFunction(TargetEntry *targetEntry)
     return dist_function;
 }
 
+/* AddQOperation pairs a distributed operation (des) with its argument column (cur), aliased by cur's name. */
 extern QOperation *
 AddQOperation(Datum des, Datum cur)
 {
@@ -67,6 +68,7 @@ AddQOperation(Datum des, Datum cur)
     return qOp;
 }
 
+/* IsDistFunc reports whether targetEntry's result name matches a registered distributed function. */
 extern bool
 IsDistFunc(TargetEntry *targetEntry)
 {

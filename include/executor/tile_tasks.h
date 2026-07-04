@@ -20,9 +20,18 @@
 #include "executor_tasks.h"
 #include "general/rte.h"
 
+/* Builds the SQL text for the given tasks, specialized for taskType. */
 extern char *taskQuery (List *tasks, ExecTaskType taskType);
+
+/* Rebalances relid's data into numTiles tiles, materializing into reshuffledTable. */
 extern void RearrangeTiles(Oid relid, int numTiles, char *reshuffledTable);
+
+/* Appends the tile-key projection for a distributed (spatiotemporal) relation to query_string. */
 extern Datum AddTilingKey(STMultirelationCatalog tblCatalog, Alias *alias , char * query_string);
+
+/* Appends the tile-key projection for a non-spatiotemporal (plain) rte to query_string. */
 extern Datum AddNonStRteTilingKey(Rte *tbl, Alias *alias ,char * query_string);
+
+/* Picks a random tile number for rte, used to sample/estimate during planning. */
 extern int GetRandTileNum(STMultirelation *rte);
 #endif /* TILE_TASKS_H */

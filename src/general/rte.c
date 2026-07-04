@@ -18,6 +18,7 @@
 #include "catalog/table_ops.h"
 #include "multirelation/multirelation_utils.h"
 
+/* GetRteNode wraps `node` into a generic Rte, tagged with its RteType and query alias. */
 extern Rte *
 GetRteNode(Node * node, RteType rteType, Alias *alias)
 {
@@ -28,6 +29,7 @@ GetRteNode(Node * node, RteType rteType, Alias *alias)
     return rteNode;
 }
 
+/* GetCitusRteInfo collects the shape column and local index for a plain Citus-distributed range-table entry. */
 extern CitusRteNode *
 GetCitusRteInfo(RangeTblEntry *rangeTableEntry, char partitionMethod)
 {
@@ -40,6 +42,7 @@ GetCitusRteInfo(RangeTblEntry *rangeTableEntry, char partitionMethod)
     return citusRteNode;
 }
 
+/* GetLocalRteInfo collects the shape column and local index for a plain (non-distributed) local range-table entry. */
 extern LocalRteNode *
 GetLocalRteInfo(RangeTblEntry *rangeTableEntry)
 {
