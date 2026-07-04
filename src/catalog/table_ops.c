@@ -14,6 +14,7 @@
 
 #include "catalog/table_ops.h"
 #include "general/general_types.h"
+#include "utils/helper_functions.h"
 #include <distributed/metadata_cache.h>
 #include <utils/fmgroids.h>
 #include "catalog/pg_namespace.h"
@@ -196,6 +197,7 @@ GetLocalIndex(Oid relationId, char * col)
 {
     int spi_result;
     bool isNull = false;
+    char *result = NULL;
     /* Connect */
     spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
@@ -215,20 +217,23 @@ GetLocalIndex(Oid relationId, char * col)
                      get_rel_name(relationId), col);
 
     spi_result = SPI_execute(catalogQuery->data, true, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /* A table with no qualifying (non-unique) index legitimately returns zero
+     * rows here -- reading SPI_tuptable->vals[0] in that case dereferences
+     * past the (empty) result set. */
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
         TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
         Datum localIndex = SPI_getbinval(row, rowDescriptor, 1, &isNull);
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
-        return (char *)localIndex;
+        if (!isNull)
+            result = (char *) localIndex;
     }
-    return NULL;
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+    return result;
 }
 
 /*

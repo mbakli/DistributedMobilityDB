@@ -86,11 +86,15 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     /* Copy the parse tree for later use */
     distPlan->query = parse;
     if (query_string == NULL)
+    {
         return distributed_planner(parse, query_string, cursorOptions, boundParams);
+    }
     analyzeDistributedSpatiotemporalTables(rangeTableList, distPlan);
 
     if (distPlan->tablesList->length == 0 )
+    {
         return distributed_planner(parse, query_string, cursorOptions, boundParams);
+    }
 
     /* Initialize the post processing phase */
     distPlan->postProcessing = InitializePostProcessing();
@@ -198,6 +202,14 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
             shapeType = DistributedColumnType(rangeTableEntry->relid);
             if (shapeType == SPATIAL || shapeType == SPATIOTEMPORAL)
             {
+                /* distPlan->shapeType drives which bbox flavor (MobilityDB
+                 * STBOX vs PostGIS geometry) the reshuffling plan builds; it
+                 * was previously never assigned here, so it stayed at its
+                 * palloc0 zero value (SPATIAL) even for tgeompoint columns,
+                 * making cross-table distance/intersection joins on
+                 * spatiotemporal columns build a PostGIS-only reshuffling
+                 * query that can't compare against a tgeompoint column. */
+                distPlan->shapeType = shapeType;
                 STMultirelation *spatiotemporal_table = GetMultirelationInfo(rangeTableEntry, shapeType);
                 if (curr_relid != rangeTableEntry->relid)
                     distPlan->joining_col = spatiotemporal_table->col;
@@ -336,10 +348,22 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
 
         if (!NodeIsEqualsOpExpr(clause))
         {
-            OpExpr *opExpr = (OpExpr *) clause;
-            if (opExpr->opno > 0 && list_length(opExpr->args) >= 2)
+            Oid predicateOid;
+            List *predicateArgs;
+
+            /*
+             * MobilityDB/PostGIS join predicates such as eDwithin(...) or
+             * ST_Intersects(...) parse as FuncExpr, not OpExpr -- casting
+             * blindly to OpExpr (as this used to) silently failed to
+             * recognize them (or worse, read OpExpr-shaped fields out of a
+             * FuncExpr node), so joins using them fell through to Citus'
+             * own planner, which rejects any join not on distribution
+             * columns.
+             */
+            if (GetPredicateOidAndArgs(clause, &predicateOid, &predicateArgs) &&
+                predicateOid > 0 && list_length(predicateArgs) >= 2)
             {
-                if (IsIntersectionOperation(opExpr->opno))
+                if (IsIntersectionOperation(predicateOid))
                 {
                     if (distPlan->tablesList->diffCount > 1)
                     {
@@ -350,9 +374,9 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                     {
                         /* Single-table intersection: decide between rebalancing tiles to fit the
                          * query's search box or simply pushing the predicate to each worker. */
-                        Datum rangeBox = get_query_range(distPlan->tablesList, opExpr);
+                        Datum rangeBox = get_query_range(distPlan->tablesList, clause);
                         if (!IsDatumEmpty(rangeBox) &&
-                            CheckTileRebalancerActivation(distPlan->tablesList, opExpr, rangeBox))
+                            CheckTileRebalancerActivation(distPlan->tablesList, clause, rangeBox))
                         {
                             AddStrategy(distPlan, TileScanRebalancer);
                             distPlan->range_bbox = rangeBox;
@@ -366,7 +390,7 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                         AddStrategy(distPlan, Colocation);
                     }
                 }
-                else if (IsDistanceOperation(opExpr->opno))
+                else if (IsDistanceOperation(predicateOid))
                 {
                     /* The NonColocation strategy is triggered by default until the analysis changes it */
                     if (distPlan->tablesList->simCount >= 1)
@@ -385,9 +409,11 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                 else
                 {
                     ListCell *arg;
-                    foreach(arg, opExpr->args)
+                    foreach(arg, predicateArgs)
                     {
                         Node *node = (Node *) lfirst(arg);
+                        if (!IsA(node, Const))
+                            continue;
                         Oid arg_oid = ((Const *)node)->consttype;
                         if (IsDistanceOperation(arg_oid))
                         {
@@ -409,13 +435,21 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
 /*
  * needsDistributedSpatiotemporalPlanning gets the parse tree and the number of distributed spatiotemporal
  * tables and returns true if the query needs the spatiotemporal planner.
+ *
+ * A prior revision required tablesList->length > 1 before even considering
+ * distPlan->strategies, so a single-table query -- even one checkQueryType()
+ * had already assigned a PredicatePushDown strategy to -- always fell
+ * through to Citus' plain distributed_planner() and never actually engaged
+ * this extension's own planning/execution path (or its EXPLAIN output).
+ * diffCount > 1 on its own already implies more than one table, so it does
+ * not need the length > 1 guard either.
  */
 static bool
 needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distPlan)
 {
     bool res = false;
-    if (((distPlan->tablesList->length > 1 && (
-            list_length(distPlan->strategies) > 0 || distPlan->tablesList->diffCount > 1))
+    if ((list_length(distPlan->strategies) > 0
+            || distPlan->tablesList->diffCount > 1
             || list_length(distPlan->postProcessing->distfuns) > 0)
             && !distPlan->queryContainsReshuffledTable)
         res = true;

@@ -50,10 +50,9 @@ typedef struct SpatiotemporalScanState
 } SpatiotemporalScanState;
 
 
-/* A query paired with its (possibly rewritten) SQL text, for EXPLAIN output. */
+/* The (possibly rewritten) SQL text of the query being explained. */
 typedef struct DistributedQueryExplain
 {
-    Query *query;
     char *query_string;
 
 }DistributedQueryExplain;

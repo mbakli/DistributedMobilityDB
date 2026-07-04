@@ -18,6 +18,8 @@
 #include <distributed/multi_join_order.h>
 #include <distributed/multi_executor.h>
 #include <distributed/distribution_column.h>
+#include <catalog/namespace.h>
+#include <access/xact.h>
 #include "utils/planner_utils.h"
 #include "planner/planner_strategies.h"
 
@@ -135,7 +137,10 @@ ColocateRte(STMultirelation *base, Rte *other)
         char *reshuffled_table = get_rel_name(cell->relid);
         Var *distributionColumn = DistPartitionKey(base->catalogTableInfo.table_oid);
         int shardCount = ShardIntervalCount(base->catalogTableInfo.table_oid);
-        char *parentRelationName = NULL;
+        /* Citus' CreateDistributedTable() expects the literal string "default"
+         * (not NULL) to mean "no explicit colocation group" -- IsColocateWithDefault()
+         * dereferences it directly and crashes on NULL. */
+        char *parentRelationName = "default";
 
         DropReshuffledTableIfExists(citusRteNode->reshuffledTable);
         CreateReshuffledTableIfNotExists(citusRteNode->reshuffledTable,
@@ -177,7 +182,10 @@ createReshuffledTable(STMultirelation *base, STMultirelation *other)
     char *reshuffled_table = get_rel_name(other->catalogTableInfo.table_oid);
     Var *distributionColumn = DistPartitionKey(other->catalogTableInfo.table_oid);
     int shardCount = ShardIntervalCount(base->catalogTableInfo.table_oid);
-    char *parentRelationName = NULL;
+    /* Citus' CreateDistributedTable() expects the literal string "default"
+     * (not NULL) to mean "no explicit colocation group" -- IsColocateWithDefault()
+     * dereferences it directly and crashes on NULL. */
+    char *parentRelationName = "default";
 
     DropReshuffledTableIfExists(other->catalogTableInfo.reshuffledTable);
     CreateReshuffledTableIfNotExists(other->catalogTableInfo.reshuffledTable,
@@ -271,7 +279,7 @@ ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,
         if (stMultirelation->catalogFilter->candidates > stMultirelation->catalogTableInfo.numTiles)
             task->catalog_filtered = stMultirelation->catalogFilter;
         appendStringInfo(task->taskQuery, "%s",
-                         DatumGetCString(AddTilingKey(stMultirelation->catalogTableInfo, tbl->alias, query_string)));
+                         DatumGetCString(AddTilingKey(stMultirelation->catalogTableInfo, tbl->alias, base->alias, query_string)));
     }
     else if (tbl->RteType == CitusRte)
     {
@@ -386,13 +394,11 @@ IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor
     else
         multiPhaseExecutor->indexCreated = false;
 
-    /*
     spi_result = SPI_finish();
     if (spi_result != SPI_OK_FINISH)
     {
         elog(ERROR, "Could not disconnect from database using SPI");
     }
-     */
 
 }
 

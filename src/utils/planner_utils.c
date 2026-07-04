@@ -15,6 +15,7 @@
 #include "catalog/table_ops.h"
 #include <distributed/multi_logical_planner.h>
 #include "utils/planner_utils.h"
+#include "utils/helper_functions.h"
 #include "catalog/pg_dist_spatiotemporal_dist_functions.h"
 
 /*
@@ -47,13 +48,16 @@ GetTilingSchemeInfo(Oid relationId)
     catalog.tiling_method = DatumToString(PointerGetDatum(datumArray[Anum_MTS_method]), TEXTOID);
     catalog.tiling_type = DatumToString(PointerGetDatum(datumArray[Anum_MTS_type]), TEXTOID);
     /* TODO: Store it as enum*/
-    catalog.granularity = (strcasecmp(DatumGetCString(datumArray[Anum_MTS_granularity]), "shape-based") == 0) ?
+    catalog.granularity = (strcasecmp(DatumToString(PointerGetDatum(datumArray[Anum_MTS_granularity]), TEXTOID), "shape-based") == 0) ?
             SHAPE_BASED : POINT_BASED;
     catalog.disjointTiles = DatumGetBool(datumArray[Anum_MTS_disjointTiles]);
     catalog.isMobilityDB = DatumGetBool(datumArray[Anum_MTS_isMobilityDB]);
     catalog.distCol = DatumToString(PointerGetDatum(datumArray[Anum_MTS_distCol]), TEXTOID);
     catalog.distColType = DatumToString(PointerGetDatum(datumArray[Anum_MTS_distColType]), TEXTOID);
-    catalog.tileKey = DatumGetCString(datumArray[Anum_MTS_tileKey]);
+    /* tilekey is a varchar column: DatumGetCString would misread its varlena
+     * length header as leading string bytes (this previously corrupted
+     * every generated tile-key join predicate with stray control bytes). */
+    catalog.tileKey = DatumToString(PointerGetDatum(datumArray[Anum_MTS_tileKey]), TEXTOID);
     catalog.segmentation = DatumGetBool(datumArray[Anum_MTS_segmentation]);
     catalog.srid = DatumGetInt32(datumArray[Anum_MTS_srid]);
     systable_endscan(scanDescriptor);

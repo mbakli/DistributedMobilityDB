@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 #include "utils/planner_utils.h"
+#include "utils/helper_functions.h"
 #include <distributed/metadata_cache.h>
 #include "distributed_functions/distributed_function.h"
 #include "general/general_types.h"
@@ -44,12 +45,18 @@ addDistributedFunction(TargetEntry *targetEntry)
                                                     indexOK,
                                                     NULL, 1, scanKey);
     HeapTuple heapTuple = systable_getnext(scanDescriptor);
+    /* The tuple systable_getnext() returns is only valid while the scan is
+     * open; heap_deform_tuple()-ing it directly leaves worker/final_op/
+     * intermediate_op holding Datums (by-reference varlena pointers) into
+     * that soon-to-be-released buffer. Copy it first so those Datums stay
+     * valid for the rest of this DistributedFunction's lifetime. */
+    heapTuple = heap_copytuple(heapTuple);
     heap_deform_tuple(heapTuple, RelationGetDescr(distFuns), datumArray,
                       isNullArray);
 
-    dist_function->workerOp->op = PointerGetDatum(datumArray[Anum_DistFun_worker - 1]);
-    dist_function->coordinatorOp->final_op = PointerGetDatum(datumArray[Anum_DistFun_final - 1]);
-    dist_function->coordinatorOp->intermediate_op = PointerGetDatum(datumArray[Anum_DistFun_combiner - 1]);
+    dist_function->workerOp->op = datumArray[Anum_DistFun_worker - 1];
+    dist_function->coordinatorOp->final_op = datumArray[Anum_DistFun_final - 1];
+    dist_function->coordinatorOp->intermediate_op = datumArray[Anum_DistFun_combiner - 1];
 
     systable_endscan(scanDescriptor);
     table_close(distFuns, NoLock);

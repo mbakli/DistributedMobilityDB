@@ -75,9 +75,20 @@ extern bool IsDistanceOperation(Oid operationId);
 /* True if operationId is a registered intersection operator (e.g. eIntersects). */
 extern bool IsIntersectionOperation(Oid operationId);
 
-/* Computes the query's search bounding box from tbls and the range/distance predicate opExpr. */
-extern Datum get_query_range(STMultirelations *tbls, OpExpr *opExpr);
+/*
+ * Extracts the callable identifier and argument list from a WHERE-clause
+ * predicate node, regardless of whether MobilityDB/PostGIS exposed it as an
+ * infix operator (OpExpr, e.g. `&&`) or a plain function call (FuncExpr,
+ * e.g. eDwithin(...), ST_Intersects(...)) -- both forms appear in practice
+ * and pg_spatiotemporal_join_operations is keyed by either an operator or a
+ * function oid. Returns false (leaving *oid/*args unset) for any other node
+ * type.
+ */
+extern bool GetPredicateOidAndArgs(Node *clause, Oid *oid, List **args);
 
-/* True if opExpr's search box spans enough tiles of tbls to warrant rebalancing first. */
-extern bool CheckTileRebalancerActivation(STMultirelations *tbls, OpExpr *opExpr, Datum box);
+/* Computes the query's search bounding box from tbls and the range/distance predicate clause. */
+extern Datum get_query_range(STMultirelations *tbls, Node *clause);
+
+/* True if clause's search box spans enough tiles of tbls to warrant rebalancing first. */
+extern bool CheckTileRebalancerActivation(STMultirelations *tbls, Node *clause, Datum box);
 #endif /* PREDICATE_MANAGMENT_H */

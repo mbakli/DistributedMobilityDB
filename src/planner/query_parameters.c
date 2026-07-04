@@ -114,7 +114,8 @@ static void ExplainDistributedTables(STMultirelations *tablesList, ExplainState 
             appendStringInfoSpaces(es->str, es->indent * indent_group);
             appendStringInfo(es->str, "Global Index: %s\n", spatiotemporalTable->catalogTableInfo.tiling_method);
             appendStringInfoSpaces(es->str, es->indent * indent_group);
-            appendStringInfo(es->str, "Local Index: %s\n", spatiotemporalTable->localIndex);
+            appendStringInfo(es->str, "Local Index: %s\n",
+                             spatiotemporalTable->localIndex ? spatiotemporalTable->localIndex : "none");
             appendStringInfoSpaces(es->str, es->indent * indent_group);
             appendStringInfo(es->str, "Number of tiles: %d\n",spatiotemporalTable->catalogTableInfo.numTiles);
             es->indent -= 2;

@@ -52,30 +52,42 @@ ExecuteQueryViaSPI(char *query, int expectedSpiOk)
 }
 
 /*
- * replaceWord replaces the first occurrence of oldW in s with newW,
- * in place, and returns s. Assumes s has enough allocated room to hold the
- * result (the local buffer is sized off strlen(s), so newW must not be
- * longer than oldW).
+ * replaceWord replaces the first occurrence of oldW in s with newW and
+ * returns the result as a freshly palloc'd string (s itself is left
+ * untouched). A prior revision built the result into a buffer sized off
+ * strlen(s) and copied it back into s in place -- since callers routinely
+ * replace a bare table name with a longer schema-qualified one (e.g.
+ * "trips" -> "dist_mobilitydb.trips_reshuffled"), newW is frequently longer
+ * than oldW, which overflowed that buffer (and s itself, which is sized for
+ * the original text) and corrupted the stack.
  */
 extern
 char* replaceWord( char* s,  char* oldW,  char* newW)
 {
-    char bstr[strlen(s)];
-    memset(bstr,0,sizeof(bstr));
-    int i;
+    size_t sLen = strlen(s);
+    size_t oldWLen = strlen(oldW);
+    size_t newWLen = strlen(newW);
+    char *bstr = (char *) palloc0(sLen + newWLen + 1);
+    size_t i = 0;
+    size_t bpos = 0;
     int occurance = 0;
-    for(i = 0;i < strlen(s);i++){
-        if(!strncmp(s+i,oldW,strlen(oldW)) && occurance == 0){
-            strcat(bstr,newW);
+
+    while (i < sLen)
+    {
+        if (occurance == 0 && oldWLen > 0 && strncmp(s + i, oldW, oldWLen) == 0)
+        {
+            memcpy(bstr + bpos, newW, newWLen);
+            bpos += newWLen;
             occurance++;
-            i += strlen(oldW) - 1;
-        }else{
-            strncat(bstr,s + i,1);
+            i += oldWLen;
+        }
+        else
+        {
+            bstr[bpos++] = s[i++];
         }
     }
-
-    strcpy(s,bstr);
-    return s;
+    bstr[bpos] = '\0';
+    return bstr;
 }
 
 /* extract_between returns a newly allocated copy of the substring of str found strictly between markers p1 and p2. */

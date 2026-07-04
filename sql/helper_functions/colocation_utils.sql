@@ -101,11 +101,18 @@ i integer;
     results json;
 BEGIN
     PERFORM create_range_shards(shards, reshuffled_table);
-    --Modify the ranges
-    UPDATE pg_catalog.pg_dist_partition
-    SET colocationid=2
-    WHERE logicalrelid=reshuffled_table::regclass;
-    PERFORM colocate_multirelation(tableName, reshuffled_table);
+    /* create_range_shards() above already assigns reshuffled_table's shards
+     * the correct tile_key-aligned ranges (1..shards), matching tableName's
+     * own tile numbering by convention -- both tables tile the same way.
+     * This used to also call colocate_multirelation() to try to physically
+     * co-locate the two tables' shard placements onto the same nodes, but
+     * that function's actual placement-move step is unimplemented (commented
+     * out) and its remaining code just re-copies shard ranges by pairing
+     * shards positionally per node -- which silently overwrites the correct
+     * ranges above with wrong, duplicated ones whenever the two tables'
+     * shards aren't distributed identically across nodes (the common case).
+     * Until shard co-location is implemented for real, skip it entirely
+     * rather than corrupt the ranges that are already correct. */
 RETURN true;
 END;
 $$;
