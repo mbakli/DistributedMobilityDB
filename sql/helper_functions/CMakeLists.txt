@@ -2,6 +2,7 @@ SET(LOCAL_FILES
         write_to_catalog.sql
         colocation_utils.sql
         catalog_info_check.sql
+        catalog_cleanup.sql
         )
 
 foreach (f ${LOCAL_FILES})
