@@ -59,41 +59,27 @@ find_program(POSTGRESQL_EXECUTABLE NAMES postgres
         )
 
 
-find_path(PostgreSQL_TYPE_INCLUDE_DIR
-        NAMES catalog/pg_type.h
-        PATHS
-        # Look in other places.
-        ${PostgreSQL_ROOT_DIRECTORIES}
-        PATH_SUFFIXES
-        postgresql
-        pgsql/server
-        postgresql/server
-        include/server
-        # Help the user find it if we cannot.
-        DOC "The ${PostgreSQL_INCLUDE_DIR_MESSAGE}"
-        )
+# Resolve include directories from the same pg_config used for --bindir above,
+# instead of find_package(PostgreSQL) (which only locates the client libpq
+# headers and can pick a different, unrelated PostgreSQL installation when
+# several major versions are installed side by side).
+execute_process(
+        COMMAND ${POSTGRESQL_PG_CONFIG} --includedir-server
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        OUTPUT_VARIABLE PostgreSQL_SERVER_INCLUDE_DIR)
+execute_process(
+        COMMAND ${POSTGRESQL_PG_CONFIG} --includedir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        OUTPUT_VARIABLE PostgreSQL_INCLUDE_DIR)
 
-find_package(PostgreSQL)
-
-if (PostgreSQL_INCLUDE_DIRS)
-    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIRS}")
-    set (PostgreSQL_INCLUDE_DIRS /usr/local/pgsql/include)
-    include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS}/server)
-    message(STATUS "POSTGRES_SERVER_PATH ${PostgreSQL_INCLUDE_DIRS}/server")
-else()
-    set (PostgreSQL_INCLUDE_DIRS /usr/local/pgsql/include)
-    message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIRS}")
-    include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIR}/server)
-    message(STATUS "POSTGRES_SERVER_PATH ${PostgreSQL_INCLUDE_DIR}/server")
+if (NOT PostgreSQL_SERVER_INCLUDE_DIR)
+    message(FATAL_ERROR "pg_config --includedir-server failed to return a value. Please check your PostgreSQL installation!")
 endif()
 
-include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIRS})
+message(STATUS "POSTGRES_INCLUDE_PATH ${PostgreSQL_INCLUDE_DIR}")
+message(STATUS "POSTGRES_SERVER_PATH ${PostgreSQL_SERVER_INCLUDE_DIR}")
+include_directories(SYSTEM ${PostgreSQL_SERVER_INCLUDE_DIR})
 include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIR})
-
-if (${PostgreSQL_VERSION_STRING} GREATER ${PG_MIN_MAJOR_VERSION})
-    message(STATUS "PostgreSQL version: ${PostgreSQL_VERSION_STRING}")
-    include_directories(SYSTEM ${PostgreSQL_INCLUDE_DIR}/${PG_MAX_MAJOR_VERSION}/server)
-endif()
 
 #---------------------------------------------
 # library directory
@@ -144,6 +130,13 @@ if(PROJ_INCLUDE_DIRS)
     message(STATUS "POSTGIS_PROJ_VERSION: ${POSTGIS_PROJ_VERSION}")
 endif()
 
+# liblwgeom.h (used for GBOX) is PostGIS' own internal header and is not
+# shipped by any postgresql-*-postgis-3 package; it must be sourced from a
+# PostGIS/MobilityDB checkout. See README for how to place a copy under
+# /usr/local/include/postgis-lwgeom/liblwgeom (alongside its required
+# ../postgis_config.h).
+include_directories(SYSTEM /usr/local/include/postgis-lwgeom/liblwgeom)
+
 #-------------------
 # add the MobilityDB link
 #-------------------
@@ -180,8 +173,12 @@ foreach (subdir ${DistMobilityDB_SOURCE_NAMES} )
 endforeach()
 
 
-set(POSTGRESQL_DYNLIB_DIR /usr/local/pgsql/lib)
-set(POSTGRESQL_SHARE_DIR /usr/local/pgsql/share)
+# Install into the actual pg_config-reported directories for this PostgreSQL
+# installation (LIBRARY_INSTALL_PATH/SHARE_DIR, computed above), rather than
+# an author-specific /usr/local/pgsql source-build layout. Note SHARE_DIR
+# already has "/extension" appended (see the extension-directory block above).
+set(POSTGRESQL_DYNLIB_DIR ${LIBRARY_INSTALL_PATH})
+set(POSTGRESQL_SHARE_DIR ${SHARE_DIR})
 
 set(MOBILITYDB_LIB_NAME "${CMAKE_PROJECT_NAME}-1.0")
 add_library(${MOBILITYDB_LIB_NAME} MODULE ${PROJECT_OBJECTS})
@@ -196,4 +193,4 @@ add_custom_target(control ALL DEPENDS ${CMAKE_BINARY_DIR}/distributed_mobilitydb
 install(TARGETS ${MOBILITYDB_LIB_NAME} DESTINATION "${POSTGRESQL_DYNLIB_DIR}")
 install(FILES "${CMAKE_BINARY_DIR}/distributed_mobilitydb.control"
         "${CMAKE_BINARY_DIR}/${DISTRIBUTED_MOBILITYDB_EXTENSION_FILE}"
-        DESTINATION "${POSTGRESQL_SHARE_DIR}/extension")
+        DESTINATION "${POSTGRESQL_SHARE_DIR}")

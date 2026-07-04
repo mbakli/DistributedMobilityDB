@@ -9,7 +9,7 @@ DECLARE
     group_by_clause text;
     org_table_name_in varchar(250);
 BEGIN
-    IF tiling.isMobilityDB and tiling.internalType not in('point','polygon', 'instant') THEN
+    IF tiling.isMobilityDB and tiling.internalType not in('point','polygon', 'instant') and tiling.granularity = 'point-based' THEN
         org_table_name_in := table_name_in;
         table_name_in := concat(table_name_in, '_temp');
     ELSE

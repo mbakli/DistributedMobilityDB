@@ -13,6 +13,43 @@
  *****************************************************************************/
 
 #include "utils/helper_functions.h"
+#include <utils/lsyscache.h>
+#include <utils/builtins.h>
+#include <executor/spi.h>
+
+/* DatumToString renders datum as a palloc'd C string via typeoid's output function. */
+extern char *
+DatumToString(Datum datum, Oid typeoid)
+{
+    Oid typoutput;
+    bool typisvarlena;
+
+    getTypeOutputInfo(typeoid, &typoutput, &typisvarlena);
+    return OidOutputFunctionCall(typoutput, datum);
+}
+
+/* ExecuteQueryViaSPI runs query via SPI, erroring out if the result status doesn't match expectedSpiOk. */
+extern void
+ExecuteQueryViaSPI(char *query, int expectedSpiOk)
+{
+    int spi_result;
+
+    spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+    spi_result = SPI_execute(query, false, 0);
+    if (spi_result != expectedSpiOk)
+    {
+        elog(ERROR, "SPI_execute failed for query: %s", query);
+    }
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+}
 
 /*
  * replaceWord replaces the first occurrence of oldW in s with newW,

@@ -17,6 +17,7 @@
 #include "executor/multi_phase_executor.h"
 #include <distributed/multi_join_order.h>
 #include <distributed/multi_executor.h>
+#include <distributed/distribution_column.h>
 #include "utils/planner_utils.h"
 #include "planner/planner_strategies.h"
 
@@ -148,9 +149,10 @@ ColocateRte(STMultirelation *base, Rte *other)
                                    "relation %s does not exist", get_rel_name(reshuffled_table_oid))));
         }
         relation_close(relation, NoLock);
-        CreateDistributedTable(reshuffled_table_oid, distributionColumn,
+        CreateDistributedTable(reshuffled_table_oid,
+                               ColumnToColumnName(base->catalogTableInfo.table_oid, (Node *) distributionColumn),
                                DISTRIBUTE_BY_RANGE, shardCount, true,
-                               parentRelationName, true);
+                               parentRelationName);
 
         RearrangeTiles(base->catalogTableInfo.table_oid, base->catalogTableInfo.numTiles,
                        citusRteNode->reshuffledTable);
@@ -189,9 +191,10 @@ createReshuffledTable(STMultirelation *base, STMultirelation *other)
                                "relation %s does not exist", get_rel_name(reshuffled_table_oid))));
     }
     relation_close(relation, NoLock);
-    CreateDistributedTable(reshuffled_table_oid, distributionColumn,
+    CreateDistributedTable(reshuffled_table_oid,
+                           ColumnToColumnName(other->catalogTableInfo.table_oid, (Node *) distributionColumn),
                            DISTRIBUTE_BY_RANGE, shardCount, true,
-                           parentRelationName, true);
+                           parentRelationName);
 
     RearrangeTiles(base->catalogTableInfo.table_oid, base->catalogTableInfo.numTiles,
                    other->catalogTableInfo.reshuffledTable);

@@ -52,6 +52,8 @@ BEGIN
     IF tiling_type IS NULL THEN
         SELECT getTilingType(table_name_in)
         INTO tiling.type;
+    ELSE
+        tiling.type := tiling_type;
     END IF;
 
     -- Check whether the column is Postgis or Mobilitydb
@@ -85,6 +87,8 @@ BEGIN
         SELECT tilingGranularityDetection(table_name_in, table_name_out, tiling)
         INTO tiling.granularity;
         RAISE INFO 'Granularity: %',tiling.granularity;
+    ELSE
+        tiling.granularity := tiling_granularity;
     END IF;
     -- Check if the table exists, tell the user to write another table name
     IF lower(tiling_method) = 'crange' THEN
@@ -129,7 +133,7 @@ BEGIN
         EXECUTE format('%s', concat('SELECT count(distinct '',group_by_col,''), count(*) FROM ',table_name_in,' WHERE st_contains(''',tileSize.postgis_extent,'''::geometry,',tiling.distCol,' )'))
         INTO tileSize.numShapes, tileSize.numPoints;
     ELSIF tiling.internaltype in ('sequence', 'sequenceset') THEN
-        EXECUTE format('%s', concat('SELECT count(*), sum(numInstants(aStbox(',tiling.distCol,', ''',tileSize.mobilitydb_extent,'''::stbox))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && ''',tileSize.mobilitydb_extent,'''::stbox'))
+        EXECUTE format('%s', concat('SELECT count(*), sum(numInstants(atStbox(',tiling.distCol,', ''',tileSize.mobilitydb_extent,'''::stbox))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && ''',tileSize.mobilitydb_extent,'''::stbox'))
         INTO tileSize.numShapes, tileSize.numPoints;
     ELSIF tiling.internaltype in ('linestring', 'polygon', 'multilinestring', 'multipolygon') THEN
         EXECUTE format('%s', concat('SELECT count(*), sum(st_npoints(st_intersection('',tiling.distCol,'', ''',tileSize.postgis_extent,'''::geometry))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && ''',tileSize.postgis_extent,'''::geometry AND st_intersects(', tiling.distCol, ',''', tileSize.postgis_extent,'''::geometry);'))

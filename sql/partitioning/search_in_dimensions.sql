@@ -79,9 +79,20 @@ BEGIN
         --SELECT getBinVal(tableName, tiling , mobilitydb_bbox, postgis_bbox)
         --INTO binValue;
         IF tiling.isMobilityDB THEN
-            EXECUTE format('%s', concat('SELECT count(*) FROM ',tableName,' ' ||
-                                                                          'WHERE setsrid(',tiling.distCol,',',tiling.srid,') && ''', mobilitydb_bbox,'''::stbox '))
-                INTO binValue;
+            -- For sequence(set) types, the search targets (tileNumPoints) are counted in
+            -- instants, not rows: count the instants of each row clipped to the candidate
+            -- box instead of the row count, or the search can never converge (a row count
+            -- of at most a few thousand trips can never approach a per-tile instant target
+            -- derived from hundreds of thousands of GPS pings).
+            IF tiling.internaltype IN ('sequence', 'sequenceset') THEN
+                EXECUTE format('%s', concat('SELECT sum(numInstants(atStbox(',tiling.distCol,', ''', mobilitydb_bbox,'''::stbox))) FROM ',tableName,' ' ||
+                                                                              'WHERE setsrid(',tiling.distCol,',',tiling.srid,') && ''', mobilitydb_bbox,'''::stbox '))
+                    INTO binValue;
+            ELSE
+                EXECUTE format('%s', concat('SELECT count(*) FROM ',tableName,' ' ||
+                                                                              'WHERE setsrid(',tiling.distCol,',',tiling.srid,') && ''', mobilitydb_bbox,'''::stbox '))
+                    INTO binValue;
+            END IF;
         ELSE
             EXECUTE format('%s', concat('SELECT count(*)
                 FROM ',tableName,' WHERE ',tiling.distCol,' && ''', postgis_bbox,'''::geometry'))
