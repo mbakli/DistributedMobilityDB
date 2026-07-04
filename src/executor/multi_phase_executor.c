@@ -36,7 +36,11 @@ static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, Mult
 
 
 
-/* QueryExecutor */
+/*
+ * QueryExecutor drives a distributed query end-to-end: runs every planned
+ * strategy via RunQueryExecutor(), then stitches the resulting per-strategy
+ * tasks into the single SQL statement returned as a GeneralScan.
+ */
 extern GeneralScan *
 QueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
 {
@@ -45,7 +49,15 @@ QueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
     return generalScan;
 }
 
-/* RunQueryExecutor */
+/*
+ * RunQueryExecutor walks distPlan's chosen PlanTask strategies in order and
+ * materializes each into ExecutorTasks: NonColocation triggers a reshuffle
+ * of one side into a temporary colocated table followed by a neighbor scan,
+ * Colocation performs a direct self-tiling (tile-key equi-join) scan, and
+ * PredicatePushDown runs the predicate as-is on the worker. `explain`
+ * suppresses the actual reshuffle/data-modifying SPI calls so EXPLAIN can
+ * describe the plan without side effects.
+ */
 extern MultiPhaseExecutor *
 RunQueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
 {
@@ -102,7 +114,13 @@ RunQueryExecutor(DistributedSpatiotemporalQueryPlan *distPlan, bool explain)
 }
 
 
-/* Executor Job: Colocation  */
+/*
+ * ColocateRte makes a plain Citus-distributed `other` table colocated with
+ * `base`: it materializes other's data into a fresh reshuffled table
+ * distributed on base's distribution column/shard count, then rebalances
+ * base's tiles into it so both sides can be scanned tile-by-tile without
+ * cross-node data movement. Returns false if `other` is not a CitusRte.
+ */
 extern bool
 ColocateRte(STMultirelation *base, Rte *other)
 {
@@ -142,7 +160,12 @@ ColocateRte(STMultirelation *base, Rte *other)
 
 }
 
-/* Executor Job: Create the reshuffling table */
+/*
+ * createReshuffledTable is the STRte counterpart of ColocateRte(): it
+ * materializes `other`'s data into a fresh table distributed to match
+ * `base`'s shard count, then rebalances base's tiles into it so both
+ * spatiotemporal relations can be joined tile-by-tile.
+ */
 extern bool
 createReshuffledTable(STMultirelation *base, STMultirelation *other)
 {
@@ -175,7 +198,13 @@ createReshuffledTable(STMultirelation *base, STMultirelation *other)
     return true;
 }
 
-/* Executor Job: Drop the reshuffled table if exists */
+/*
+ * DropReshuffledTableIfExists drops the temporary per-query reshuffled
+ * table from the extension's schema. The surrounding
+ * commit/start-transaction pair runs the DDL in its own transaction so it
+ * takes effect immediately and is visible to the CREATE that follows it,
+ * rather than staying pending inside the planner's outer transaction.
+ */
 extern void
 DropReshuffledTableIfExists(char * reshuffled_table)
 {
@@ -192,7 +221,13 @@ DropReshuffledTableIfExists(char * reshuffled_table)
     PushActiveSnapshot(GetTransactionSnapshot());
 }
 
-/* Executor Job: Create the reshuffled table if not exists */
+/*
+ * CreateReshuffledTableIfNotExists creates reshuffled_table as a `LIKE
+ * org_table` copy in the extension's schema, optionally adding the tile-key
+ * column (for tables that will be reshuffled/rebalanced across tiles). Runs
+ * in its own commit/start-transaction bracket for the same reason as
+ * DropReshuffledTableIfExists.
+ */
 extern void
 CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table, bool tile_key)
 {
@@ -212,7 +247,12 @@ CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org_table, bool
     PushActiveSnapshot(GetTransactionSnapshot());
 }
 
-/* Executor Job: Construct the neighbor scan */
+/*
+ * ConstructNeighborScanQuery builds the task that scans `tbl` (the
+ * reshuffled/colocated side) tile-by-tile against `base`'s tiling scheme,
+ * widening the tile set searched (catalog_filtered) whenever the catalog
+ * filter found more matching candidates than there are tiles.
+ */
 static void
 ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,MultiPhaseExecutor *multiPhaseExecutor)
 {
@@ -243,7 +283,13 @@ ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,
     multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
-/* Executor Job: Construct the self tiling scan */
+/*
+ * ConstructSelfTilingScanQuery builds the task for a Colocation-strategy
+ * join: since both tables share the same tiling, the join reduces to
+ * adding a `tile_key = tile_key` equality (replacing the query's `WHERE`)
+ * so each tile only ever matches its own counterpart tile, avoiding any
+ * cross-tile data transfer.
+ */
 static void
 ConstructSelfTilingScanQuery(PlanTask *plan, char * query_string, MultiPhaseExecutor *multiPhaseExecutor)
 {
@@ -269,7 +315,11 @@ ConstructSelfTilingScanQuery(PlanTask *plan, char * query_string, MultiPhaseExec
     multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
-/* Executor Job: Execute the reshuffling query */
+/*
+ * ReshuffleData runs the INSERT ... SELECT that copies base's rows into the
+ * reshuffled/colocated table (see createReshuffledTable/ColocateRte),
+ * recording success in multiPhaseExecutor->dataReshuffled.
+ */
 static void
 ReshuffleData(char *query_string, MultiPhaseExecutor *multiPhaseExecutor)
 {
@@ -293,7 +343,11 @@ ReshuffleData(char *query_string, MultiPhaseExecutor *multiPhaseExecutor)
     }
 }
 
-/* Executor Job: Index the reshuffled data */
+/*
+ * IndexReshuffledData creates the spatiotemporal (GIST) index on the newly
+ * reshuffled table's distribution column, needed before it can be scanned
+ * efficiently in the neighbor-scan phase.
+ */
 static void
 IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor)
 {
@@ -339,7 +393,14 @@ IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor
 
 }
 
-/* Executor Job: GeneralScan */
+/*
+ * ConstructGeneralQuery assembles the final SQL text to execute: it unions
+ * together the worker-phase task query for each strategy used in the plan
+ * (NonColocation -> neighbor scan, Colocation -> self-tiling scan,
+ * PredicatePushDown -> push-down scan), then, if a coordinator-phase
+ * (FINALScan) task exists, splices that union in as its `intermediate`
+ * subquery so the coordinator can post-process the combined worker output.
+ */
 static GeneralScan *
 ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseExecutor *multiPhaseExecutor)
 {
@@ -400,7 +461,12 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
     return generalScan;
 }
 
-/* Executor Job: Construct the self tiling scan */
+/*
+ * ConstructPredicatePushDownQuery builds the task for the PredicatePushDown
+ * strategy: the original query text is run as-is (no rewriting), since the
+ * predicate can be fully evaluated on the worker without any coordinator
+ * merge step.
+ */
 static void
 ConstructPredicatePushDownQuery(PlanTask *plan, char * query_string, MultiPhaseExecutor *multiPhaseExecutor)
 {
@@ -413,6 +479,7 @@ ConstructPredicatePushDownQuery(PlanTask *plan, char * query_string, MultiPhaseE
     multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
+/* GetTaskType renders task's ExecTaskType as a human-readable label for EXPLAIN output. */
 extern Datum
 GetTaskType(ExecutorTask *task)
 {
@@ -422,6 +489,12 @@ GetTaskType(ExecutorTask *task)
         return CStringGetDatum("Self Tiling Scan");
 }
 
+/*
+ * ConstructPostProcessingPhase builds the coordinator-phase tasks (see
+ * ProcessIntermediateTasks/ProcessFinalTasks) for any distributed
+ * aggregates recorded in coordOp, so they get merged into the final query
+ * by ConstructGeneralQuery().
+ */
 static void
 ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor)
 {

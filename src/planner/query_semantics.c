@@ -40,6 +40,13 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
     }
 }
 
+/*
+ * AnalyseCatalog walks fromExpr's WHERE clauses looking for spatiotemporal
+ * predicates on `tbl` and, for each one found, folds its arguments into a
+ * CatalogFilter (via AddCatalogFilterInfo) describing which of tbl's tiles
+ * can possibly satisfy the query — this is what lets the planner narrow a
+ * scan down to a handful of candidate tiles instead of all of them.
+ */
 extern CatalogFilter *
 AnalyseCatalog(STMultirelation *tbl, FromExpr * fromExpr)
 {

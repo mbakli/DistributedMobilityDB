@@ -93,6 +93,7 @@ RegisterSpatiotemporalPlanMethods(void)
     RegisterCustomScanMethods(&SpatiotemporalExecutorMethod);
 }
 
+/* SpatiotemporalExecutorCreateScan is the CustomScanMethods callback that builds the scan's execution state. */
 static Node *
 SpatiotemporalExecutorCreateScan(CustomScan *scan)
 {

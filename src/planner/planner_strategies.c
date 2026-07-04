@@ -33,7 +33,14 @@ static void PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan 
 static void createReshufflingPlanForNonstRte(DistributedSpatiotemporalQueryPlan *distPlan);
 static void ConstructReshufflingQueryForNonstRte(DistributedSpatiotemporalQueryPlan *distPlan);
 
-/* Non colocated Query Plan */
+/*
+ * NonColocationStrategyPlan handles a join between tables that don't
+ * already share the same tiling scheme: it first builds a reshuffling plan
+ * (planReshufflingQuery) that will copy one side into a colocated
+ * temporary table at execution time, then records a single NonColocation
+ * PlanTask joining the (still-to-be-created) reshuffled table against the
+ * base spatiotemporal table.
+ */
 extern void
 NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -49,7 +56,13 @@ NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
 }
 
-/* Reshuffling Query Plan */
+/*
+ * planReshufflingQuery picks which reshuffling path applies to the query:
+ * joining a spatiotemporal table against a plain Citus table
+ * (PlanReshufflingNonStRteWithStRte) or joining two spatiotemporal tables
+ * with different tiling schemes (PlanReshufflingStRtes). Joins among only
+ * plain Citus tables are not yet handled here.
+ */
 static void
 planReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -71,7 +84,13 @@ planReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan)
     }
 }
 
-/* Reshuffling Query Plan with spatiotemporal multirelations */
+/*
+ * PlanReshufflingNonStRteWithStRte plans reshuffling the query's plain
+ * Citus/local table (`distPlan->reshuffledTable`) to match rte_node's
+ * spatiotemporal table's tiling scheme, which becomes the join's base
+ * table. A LocalRte may in principle be broadcast instead of reshuffled
+ * (see CheckBroadcastingPossibility), but that path is not yet implemented.
+ */
 static void
 PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan *distPlan, ReshufflingRte *rte_node)
 {
@@ -117,7 +136,14 @@ PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan *distPlan, R
     ConstructReshufflingQueryForNonstRte(distPlan);
 }
 
-/* Reshuffling Query Plan with spatiotemporal multirelations */
+/*
+ * PlanReshufflingStRtes plans reshuffling for a join between two
+ * spatiotemporal tables with different tiling schemes: pick which one
+ * becomes the base and which gets reshuffled (chooseReshuffledTable),
+ * build the catalog query that computes the new tile assignment
+ * (createReshufflingTablePlan), then wrap it into the INSERT that performs
+ * the reshuffle (ConstructReshufflingQuery).
+ */
 static void
 PlanReshufflingStRtes(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -125,7 +151,13 @@ PlanReshufflingStRtes(DistributedSpatiotemporalQueryPlan *distPlan)
     createReshufflingTablePlan(distPlan);
     ConstructReshufflingQuery(distPlan);
 }
-/* Choose the base and reshuffling tables */
+
+/*
+ * chooseReshuffledTable picks the table with the most tiles as the base
+ * (reshuffled_table_base) and the other as the one to be reshuffled
+ * (reshuffledTable) — reshuffling the smaller side is cheaper. The cost
+ * function is a placeholder (tile count only) until further testing.
+ */
 static void
 chooseReshuffledTable(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -155,6 +187,13 @@ chooseReshuffledTable(DistributedSpatiotemporalQueryPlan *distPlan)
     }
 }
 
+/*
+ * ConstructReshufflingQueryForNonstRte builds the INSERT that copies the
+ * plain Citus table's rows into its reshuffled counterpart, tagging each
+ * row with the id of the spatiotemporal tile whose bounding box it falls
+ * into (computed by the catalog_query_string CTE built in
+ * createReshufflingPlanForNonstRte).
+ */
 static void
 ConstructReshufflingQueryForNonstRte(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -184,6 +223,7 @@ ConstructReshufflingQueryForNonstRte(DistributedSpatiotemporalQueryPlan *distPla
     strcpy(distPlan->reshuffling_query, reshufflingQuery->data);
 }
 
+/* GetReshufflingAlias returns the temporary reshuffled-table name for oid, i.e. "<table>_reshuffled". */
 static Datum
 GetReshufflingAlias(Oid oid)
 {
@@ -207,7 +247,12 @@ createReshufflingTablePlan(DistributedSpatiotemporalQueryPlan *distPlan)
     }
 }
 
-
+/*
+ * createReshufflingPlanForNonstRte builds the catalog query that maps each
+ * tile of the base spatiotemporal table to its bounding box, used to
+ * assign the plain Citus table's rows to a tile in
+ * ConstructReshufflingQueryForNonstRte.
+ */
 static void
 createReshufflingPlanForNonstRte(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -231,6 +276,13 @@ createReshufflingPlanForNonstRte(DistributedSpatiotemporalQueryPlan *distPlan)
     distPlan->catalog_query_string = palloc((strlen(catalogQuery->data) + 1) * sizeof (char));
     strcpy(distPlan->catalog_query_string, catalogQuery->data);
 }
+/*
+ * DistanceReshufflingPlan builds the catalog query that pairs each tile of
+ * the base table with every tile of the other table whose bounding box
+ * intersects the base tile's box expanded by the query's distance
+ * threshold — i.e. every tile pair that could possibly contain a match for
+ * an eDwithin-style predicate.
+ */
 static void
 DistanceReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -277,6 +329,11 @@ DistanceReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     strcpy(distPlan->catalog_query_string, catalogQuery->data);
 }
 
+/*
+ * OtherReshufflingPlan is DistanceReshufflingPlan()'s counterpart for
+ * non-distance (e.g. intersection) predicates: it pairs tiles whose
+ * bounding boxes directly intersect, with no distance expansion.
+ */
 static void
 OtherReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -317,12 +374,24 @@ OtherReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     strcpy(distPlan->catalog_query_string, catalogQuery->data);
 }
 
+/*
+ * CheckBroadcastingPossibility would determine whether localNode is small
+ * enough to broadcast to every worker instead of reshuffling it into
+ * tiles. Not yet implemented (always returns false); see the TODO in
+ * PlanReshufflingNonStRteWithStRte().
+ */
 extern bool
 CheckBroadcastingPossibility(LocalRteNode *localNode)
 {
     return false;
 }
 
+/*
+ * ConstructReshufflingQuery builds the INSERT that copies the chosen
+ * table's rows into its reshuffled counterpart, tagging each row with the
+ * id of the base table's tile it was paired with (from the tile-pair CTE
+ * built by DistanceReshufflingPlan/OtherReshufflingPlan).
+ */
 static void
 ConstructReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -347,6 +416,7 @@ ConstructReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan)
     strcpy(distPlan->reshuffling_query, reshufflingQuery->data);
 }
 
+/* getReshuffledColumns returns oid's column list (excluding tile_key) as a comma-separated, quoted string. */
 static char *
 getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan, Oid oid)
 {
@@ -380,6 +450,11 @@ getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan, Oid oid)
     }
 }
 
+/*
+ * ColocationStrategyPlan records a Colocation PlanTask for the query's
+ * first two range-table entries, joined on their shared tile key — no data
+ * movement needed since both are already tiled the same way.
+ */
 extern void
 ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -392,12 +467,18 @@ ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
 }
 
+/* TileScanRebalanceStrategyPlan is not yet implemented; disabled alongside CheckTileRebalancerActivation(). */
 extern void
 TileScanRebalanceStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
     /* To be added later */
 }
 
+/*
+ * GetReshufflingRte returns the single spatiotemporal table among rtes as a
+ * ReshufflingRte base candidate, or NULL if there is more than one (in
+ * which case chooseReshuffledTable() must be used instead).
+ */
 extern ReshufflingRte *GetReshufflingRte(STMultirelations *rtes)
 {
     ListCell *rangeTableCell = NULL;
@@ -424,6 +505,11 @@ extern ReshufflingRte *GetReshufflingRte(STMultirelations *rtes)
     }
 }
 
+/*
+ * PredicatePushDownStrategyPlan records a PredicatePushDown PlanTask: the
+ * query's predicate can be evaluated entirely on the worker with no
+ * coordinator-side merge, since it applies to a single table's own tiles.
+ */
 extern void
 PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
@@ -434,6 +520,8 @@ PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     strategy->tileKey = (Datum) Var_Catalog_Tile_Key;
     distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
 }
+
+/* AddStrategy appends `type` to distPlan's list of chosen StrategyTypes. */
 extern
 void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type)
 {

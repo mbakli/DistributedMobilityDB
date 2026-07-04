@@ -41,7 +41,13 @@ static bool needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQuer
 static PlannedStmt * EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions,
                                      ParamListInfo boundParams);
 
-/* Distributed spatiotemporal planner */
+/*
+ * distributed_mobilitydb_planner is the planner_hook entry point (see
+ * _PG_init in shared_library_init.c): it allocates a fresh
+ * DistributedSpatiotemporalQueryPlan and delegates the actual work to
+ * distributed_mobilitydb_planner_internal(), which is also reused directly
+ * by the EXPLAIN hook.
+ */
 PlannedStmt *
 distributed_mobilitydb_planner(Query *parse, const char *query_string, int cursorOptions,
                        ParamListInfo boundParams)
@@ -52,6 +58,18 @@ distributed_mobilitydb_planner(Query *parse, const char *query_string, int curso
                                            distributedSpatiotemporalPlan, false);
 }
 
+/*
+ * distributed_mobilitydb_planner_internal drives the full planning
+ * pipeline for a query: bail out early (via EarlyQueryCheck/Citus'
+ * distributed_planner) when no distributed spatiotemporal table is
+ * involved; otherwise inventory the query's tables
+ * (analyzeDistributedSpatiotemporalTables), classify its predicates
+ * (checkQueryType) to pick execution strategies, rewrite any distributed
+ * aggregate calls (RewriterDistFuncs), run each chosen strategy's plan
+ * function, and finally hand the rewritten query off to QueryExecutor()
+ * and Citus' planner. `explain` skips the actual execution step so EXPLAIN
+ * can report the plan without running it.
+ */
 PlannedStmt *
 distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, int cursorOptions,
                                 ParamListInfo boundParams,
@@ -240,6 +258,13 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
     distPlan->tablesList->tables = rtes;
 }
 
+/*
+ * EarlyQueryCheck short-circuits planning for queries that don't touch any
+ * distributed spatiotemporal SELECT-able table: it returns a plan produced
+ * by Citus' standard distributed_planner() immediately, or NULL to let
+ * distributed_mobilitydb_planner_internal() continue with the
+ * spatiotemporal-aware planning path.
+ */
 static PlannedStmt *
 EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams)
 {
@@ -318,10 +343,13 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                 {
                     if (distPlan->tablesList->diffCount > 1)
                     {
+                        /* Intersection join between two distinct tables: must colocate them first. */
                         AddStrategy(distPlan, NonColocation);
                     }
                     else if (distPlan->tablesList->length == 1)
                     {
+                        /* Single-table intersection: decide between rebalancing tiles to fit the
+                         * query's search box or simply pushing the predicate to each worker. */
                         Datum rangeBox = get_query_range(distPlan->tablesList, opExpr);
                         if (!IsDatumEmpty(rangeBox) &&
                             CheckTileRebalancerActivation(distPlan->tablesList, opExpr, rangeBox))
@@ -334,7 +362,7 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                     }
                     else
                     {
-                        /* By default */
+                        /* By default: multiple references to the same colocated table (self-join). */
                         AddStrategy(distPlan, Colocation);
                     }
                 }
