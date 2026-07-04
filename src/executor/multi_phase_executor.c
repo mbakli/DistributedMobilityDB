@@ -21,6 +21,7 @@
 #include <catalog/namespace.h>
 #include <access/xact.h>
 #include "utils/planner_utils.h"
+#include "utils/helper_functions.h"
 #include "planner/planner_strategies.h"
 
 static void ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,
@@ -36,6 +37,7 @@ static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *di
                                            MultiPhaseExecutor *multiPhaseExecutor);
 static void IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
 static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor);
+static char *EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate);
 
 
 
@@ -137,9 +139,12 @@ ColocateRte(STMultirelation *base, Rte *other)
         char *reshuffled_table = get_rel_name(cell->relid);
         Var *distributionColumn = DistPartitionKey(base->catalogTableInfo.table_oid);
         int shardCount = ShardIntervalCount(base->catalogTableInfo.table_oid);
-        /* Citus' CreateDistributedTable() expects the literal string "default"
-         * (not NULL) to mean "no explicit colocation group" -- IsColocateWithDefault()
-         * dereferences it directly and crashes on NULL. */
+        /* Citus rejects colocate_with for range-distributed tables
+         * ("colocate_with option is not supported for append / range
+         * distributed tables"), so this stays "default"; physical
+         * co-location with base is instead done after the fact by
+         * colocate_shards() in create_reshuffled_multirelation, which
+         * explicitly moves each shard onto base's matching-tile node. */
         char *parentRelationName = "default";
 
         DropReshuffledTableIfExists(citusRteNode->reshuffledTable);
@@ -182,9 +187,12 @@ createReshuffledTable(STMultirelation *base, STMultirelation *other)
     char *reshuffled_table = get_rel_name(other->catalogTableInfo.table_oid);
     Var *distributionColumn = DistPartitionKey(other->catalogTableInfo.table_oid);
     int shardCount = ShardIntervalCount(base->catalogTableInfo.table_oid);
-    /* Citus' CreateDistributedTable() expects the literal string "default"
-     * (not NULL) to mean "no explicit colocation group" -- IsColocateWithDefault()
-     * dereferences it directly and crashes on NULL. */
+    /* Citus rejects colocate_with for range-distributed tables
+     * ("colocate_with option is not supported for append / range
+     * distributed tables"), so this stays "default"; physical
+     * co-location with base is instead done after the fact by
+     * colocate_shards() in create_reshuffled_multirelation, which
+     * explicitly moves each shard onto base's matching-tile node. */
     char *parentRelationName = "default";
 
     DropReshuffledTableIfExists(other->catalogTableInfo.reshuffledTable);
@@ -403,6 +411,28 @@ IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor
 }
 
 /*
+ * EliminateShapeSegmentDuplicates removes shape-segmentation duplicates from
+ * query_string by wrapping it as `SELECT DISTINCT * FROM (query_string) AS
+ * x`, deduping on whatever the query actually projects. Only applied when
+ * no distributed aggregate is involved (see hasDistributedAggregate at the
+ * call site) -- for an aggregate like count(*), the duplicates are already
+ * consumed before this outer DISTINCT would ever see them, so this is left
+ * as a no-op (returns NULL) for that case rather than risking a rewrite
+ * Citus' planner may reject for non-colocated repartition joins.
+ */
+static char *
+EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate)
+{
+    if (hasDistributedAggregate)
+        return NULL;
+
+    char *innerQuery = replaceWord(query_string, ";", " ");
+    StringInfo dedupedQuery = makeStringInfo();
+    appendStringInfo(dedupedQuery, "SELECT DISTINCT * FROM (%s) AS dedup_result", innerQuery);
+    return dedupedQuery->data;
+}
+
+/*
  * ConstructGeneralQuery assembles the final SQL text to execute: it unions
  * together the worker-phase task query for each strategy used in the plan
  * (NonColocation -> neighbor scan, Colocation -> self-tiling scan,
@@ -448,6 +478,29 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
         }
         else
             elog(ERROR, "The query executor could not identify the planner strategy");
+    }
+    /* NonColocation/Colocation strategies reshuffle onto tiles built from a
+     * spatiotemporal shape, which can place the same row's shape-segmented
+     * copy in more than one tile so a boundary-crossing match isn't missed
+     * -- see checkQueryType's dupRemOperator->active assignment. That makes
+     * the worker-phase join above contain the same logical match
+     * (base_row1, base_row2) more than once. This has to be resolved here,
+     * on the flat two-table query before the coordinator/aggregate-rewriter
+     * wrapping below nests it inside a "select sum(...) from (...) as fQ"
+     * subquery -- once that wrapping happens, ExtractRangeTableEntryList
+     * sees three range table entries (the subquery plus its two inner
+     * tables) instead of the two this rewrite expects, and any duplicate
+     * rows have already been consumed by the inner aggregate anyway. */
+    if (distPlan->postProcessing->coordinatorLevelOperator->dupRemOperator->active)
+    {
+        bool hasDistributedAggregate = list_length(distPlan->postProcessing->distfuns) > 0;
+        char *deduped = EliminateShapeSegmentDuplicates(generalScan->query_string->data,
+                                                        hasDistributedAggregate);
+        if (deduped != NULL)
+        {
+            resetStringInfo(generalScan->query_string);
+            appendStringInfo(generalScan->query_string, "%s", deduped);
+        }
     }
     /* Loop though the post processing tasks */
     if (generalScan->length == 0)

@@ -24,6 +24,8 @@
 #include "catalog/nodes.h"
 #include "planner/planner_strategies.h"
 #include <tcop/tcopprot.h>
+#include <executor/spi.h>
+#include <utils/builtins.h>
 
 
 static Node *SpatiotemporalExecutorCreateScan(CustomScan *scan);
@@ -42,6 +44,8 @@ static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, Expla
 static void ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
 static void ExplainOneTask(ExecutorTask *task, STMultirelation *base, ExplainState *es, int indent_group);
 static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile);
+static char * ExplainOnHostingWorker(char *query_string, ExecTaskType taskType, int rand_tile,
+                                     TaskNode *taskNode);
 
 /* create custom scan method for the spatiotemporal executor */
 CustomScanMethods SpatiotemporalExecutorMethod = {
@@ -261,35 +265,49 @@ ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState
     }
 }
 /*
- * ExplainOneTask plans and (via ExplainWorkerPlan) prints the plan for a
- * single, randomly-chosen tile of `task`. Earlier revisions substituted a
- * concrete "<table>_<shardid>" name into the task's query and planned it
- * with pg_plan_query() as an ordinary local query -- but Citus shard tables
- * only exist on the worker that holds their placement, never on the
- * coordinator, so that local table never existed and every multi-table
- * EXPLAIN failed with "relation ... does not exist". Instead, GetLocalQuery
- * now pins the query to one tile via a literal `tile_key = <rand_tile>`
- * predicate (keeping the real, logical table names), and we plan it with
- * Citus' own distributed_planner() directly (bypassing this extension's own
- * planner_hook, since these tables are already-registered distributed
- * spatiotemporal tables and would otherwise recurse back into our own
- * planning here) so Citus prunes to the right shard and dispatches to the
- * worker that actually holds it, exactly like any other distributed query.
+ * ExplainOneTask prints the plan for a single, randomly-chosen tile of
+ * `task`. Since colocate_shards() (see create_reshuffled_multirelation)
+ * physically moves each reshuffled shard onto the same worker as its
+ * matching-tile shard of the base table, a tile's join is ordinarily a
+ * genuine single-node operation -- so we first try ExplainOnHostingWorker(),
+ * which dispatches a real local EXPLAIN (using the concrete shard tables) to
+ * that one worker and returns Postgres' own plan, with no Citus wrapper at
+ * all. If the tiles turn out not to be co-located (a stale/partial
+ * reshuffle, or a straggler placement), that returns NULL and we fall back
+ * to planning the query through Citus' distributed_planner() directly
+ * (bypassing this extension's own planner_hook, since these tables are
+ * already-registered distributed spatiotemporal tables and would otherwise
+ * recurse back into our own planning here), which shows the real cross-node
+ * repartition instead of a misleading local-only plan.
  */
 static void
 ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int indent_group)
 {
     int rand_tile = GetRandTileNum(base);
+    TaskNode *taskNode = GetShardHostNode(base->catalogTableInfo.table_oid, rand_tile);
 
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
-    TaskNode *taskNode = GetNodeInfo();
     appendStringInfo(es->str, "Node: host=%s ", DatumToString(taskNode->node, TEXTOID));
     appendStringInfo(es->str, "port=%d ", taskNode->port);
-    appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(taskNode->db));
-    appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
+    appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(GetDBName()));
 
     char *OneTileQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid,
                                        task->taskType, rand_tile);
+    appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
+    appendStringInfo(es->str, "Query: %s\n", OneTileQuery);
+    appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
+
+    char *localPlanText = ExplainOnHostingWorker(task->taskQuery->data, task->taskType,
+                                                 rand_tile, taskNode);
+    if (localPlanText != NULL)
+    {
+        es->indent += 6;
+        appendStringInfoSpaces(es->str, es->indent * indent_group);
+        appendStringInfo(es->str, "%s\n", localPlanText);
+        es->indent -= 6;
+        return;
+    }
+
     Query *parse = ParseQueryString(OneTileQuery, NULL, 0);
     PlannedStmt *plan = distributed_planner(parse, OneTileQuery, 0, NULL);
     instr_time planduration;
@@ -327,6 +345,82 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
     }
 
     return pinnedQuery->data;
+}
+
+/*
+ * ExplainOnHostingWorker checks that every table referenced by query_string
+ * has its rand_tile shard physically co-located on taskNode; if so, it
+ * substitutes each logical table name for its concrete shard-qualified name
+ * and runs `EXPLAIN (FORMAT JSON)` for the resulting local query directly on
+ * that worker via run_command_on_workers() (JSON format always returns
+ * exactly one row, which run_command_on_workers() requires), returning the
+ * pretty-printed plan. Returns NULL -- signalling the caller to fall back to
+ * a Citus-routed explain -- if any table's matching tile lives elsewhere, or
+ * the dispatch itself fails.
+ */
+static char *
+ExplainOnHostingWorker(char *query_string, ExecTaskType taskType, int rand_tile, TaskNode *taskNode)
+{
+    char *targetNode = DatumToString(taskNode->node, TEXTOID);
+    Query *query = ParseQueryString(query_string, NULL, 0);
+    List *rangeTableList = ExtractRangeTableEntryList(query);
+    StringInfo physicalQuery = makeStringInfo();
+    appendStringInfo(physicalQuery, "%s", query_string);
+
+    ListCell *rangeTableCell = NULL;
+    foreach(rangeTableCell, rangeTableList)
+    {
+        RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+
+        TaskNode *rteNode = GetShardHostNode(rangeTableEntry->relid, rand_tile);
+        if (rteNode->node == (Datum) 0 || rteNode->port != taskNode->port ||
+            strcmp(DatumToString(rteNode->node, TEXTOID), targetNode) != 0)
+        {
+            return NULL;
+        }
+
+        StringInfo tableName = makeStringInfo();
+        if (IsReshuffledTable(rangeTableEntry->relid))
+            appendStringInfo(tableName, "%s.%s", Var_Schema, get_rel_name(rangeTableEntry->relid));
+        else
+            appendStringInfo(tableName, "%s ", get_rel_name(rangeTableEntry->relid));
+
+        char *shardName = GetRandomTileId(rangeTableEntry->relid, taskType, rand_tile);
+        char *rewritten = replaceWord(physicalQuery->data, tableName->data, shardName);
+        resetStringInfo(physicalQuery);
+        appendStringInfo(physicalQuery, "%s", rewritten);
+    }
+
+    StringInfo explainCommand = makeStringInfo();
+    appendStringInfo(explainCommand, "EXPLAIN (FORMAT JSON) %s", physicalQuery->data);
+
+    int spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    StringInfo dispatchQuery = makeStringInfo();
+    appendStringInfo(dispatchQuery,
+                     "SELECT jsonb_pretty(result::jsonb) FROM run_command_on_workers(%s) "
+                     "WHERE nodename = %s AND nodeport = %d AND success",
+                     quote_literal_cstr(explainCommand->data),
+                     quote_literal_cstr(targetNode), taskNode->port);
+    spi_result = SPI_execute(dispatchQuery->data, true, 1);
+
+    char *planText = NULL;
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        planText = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+    }
+
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+
+    return planText;
 }
 
 static void

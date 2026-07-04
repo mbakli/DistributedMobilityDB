@@ -38,6 +38,7 @@ static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
 static void PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan);
 static void checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
 static bool needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distPlan);
+static bool StrategiesInclude(List *strategies, StrategyType type);
 static PlannedStmt * EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions,
                                      ParamListInfo boundParams);
 
@@ -103,6 +104,19 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     {
         checkQueryType(parse, distPlan);
         needsSpatiotemporalPlanning = needsDistributedSpatiotemporalPlanning(distPlan);
+        /* NonColocation/Colocation strategies join tiles that were built by
+         * reshuffling on a spatiotemporal shape (see
+         * analyzeDistributedSpatiotemporalTables/shapesegmented), which can
+         * legitimately place the same row's shape-segmented copy in more
+         * than one tile so a boundary-crossing match isn't missed by any
+         * single tile. That means the coordinator-level union of per-tile
+         * results can contain the same logical match more than once, so
+         * these strategies need a final deduplication pass. */
+        if (StrategiesInclude(distPlan->strategies, NonColocation) ||
+            StrategiesInclude(distPlan->strategies, Colocation))
+        {
+            distPlan->postProcessing->coordinatorLevelOperator->dupRemOperator->active = true;
+        }
     }
 
     /* Query rewriter */
@@ -455,6 +469,19 @@ needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distP
         res = true;
     distPlan->activate_post_processing_phase = res;
     return res;
+}
+
+/* StrategiesInclude returns whether type is among distPlan's chosen strategies. */
+static bool
+StrategiesInclude(List *strategies, StrategyType type)
+{
+    ListCell *cell = NULL;
+    foreach(cell, strategies)
+    {
+        if ((StrategyType) lfirst_int(cell) == type)
+            return true;
+    }
+    return false;
 }
 
 
