@@ -47,8 +47,15 @@ PostProcessingQuery(PostProcessing *postProcessing, List *strategies)
     /* The other operations will be added internally based on the query semantics */
 }
 
-/* Early rewriting for the distributed functions */
-
+/*
+ * RewriterDistFuncs rewrites query_string so each registered distributed
+ * function call (e.g. an aggregate like avg()) is replaced by its worker
+ * function, producing the query that actually runs on each tile
+ * (postProcessing->worker). For every rewritten function it also records
+ * the coordinator-side combiner/final operations (as QOperations) so the
+ * executor's post-processing phase can merge the per-tile results back
+ * together (see ProcessIntermediateTasks/ProcessFinalTasks).
+ */
 extern void
 RewriterDistFuncs(Query *parse, PostProcessing *postProcessing, const char *query_string)
 {
