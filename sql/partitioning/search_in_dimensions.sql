@@ -56,6 +56,19 @@ BEGIN
     END IF;
     binValue := 0;
     LOOP
+        IF rounds > 100 THEN
+            -- Safety valve: the per-tile target can be unreachable (e.g. a
+            -- row count too small relative to the requested tile count
+            -- rounds the target down to 0, or the split point plateaus at
+            -- floating-point precision before ever exactly matching), which
+            -- would otherwise loop forever. Settle for the current best
+            -- split point instead of hanging indefinitely.
+            IF dim = 1 THEN
+                return midT::text;
+            ELSE
+                return mid::text;
+            END IF;
+        END IF;
         --Select mid
         IF dim = 1 THEN
             mobilitydb_bbox := STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(x1,y1),
