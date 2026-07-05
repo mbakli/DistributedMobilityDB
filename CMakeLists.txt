@@ -131,11 +131,10 @@ if(PROJ_INCLUDE_DIRS)
 endif()
 
 # liblwgeom.h (used for GBOX) is PostGIS' own internal header and is not
-# shipped by any postgresql-*-postgis-3 package; it must be sourced from a
-# PostGIS/MobilityDB checkout. See README for how to place a copy under
-# /usr/local/include/postgis-lwgeom/liblwgeom (alongside its required
-# ../postgis_config.h).
-include_directories(SYSTEM /usr/local/include/postgis-lwgeom/liblwgeom)
+# shipped by any postgresql-*-postgis-3 package -- see
+# third_party/postgis-lwgeom/README.md for why a copy is vendored directly
+# in this repo instead of requiring a manual host-wide install step.
+include_directories(SYSTEM "${CMAKE_CURRENT_SOURCE_DIR}/third_party/postgis-lwgeom/liblwgeom")
 
 #-------------------
 # add the MobilityDB link

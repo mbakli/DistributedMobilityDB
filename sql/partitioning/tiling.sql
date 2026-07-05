@@ -3,10 +3,16 @@ SET search_path = SCHEMA,public;
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 -- MD Tiling - Generic (Spatiotemporal)
 --------------------------------------------------------------------------------------------------------------------------------------------------------
+-- num_tiles moved after table_name_out (and gained a default) so a
+-- reference table can be created without mentioning num_tiles at all; since
+-- that changes the parameter type order, the old signature is a distinct
+-- overload as far as Postgres is concerned and must be dropped explicitly
+-- or it would keep existing alongside this one.
+DROP FUNCTION IF EXISTS create_spatiotemporal_distributed_table(text, integer, text, text, text, text, text, text, varchar(50), boolean, boolean);
 CREATE OR REPLACE FUNCTION create_spatiotemporal_distributed_table(
                                                                     table_name_in text,
-                                                                    num_tiles integer,
                                                                     table_name_out text,
+                                                                    num_tiles integer DEFAULT 1,
                                                                     tiling_method text DEFAULT 'crange',
                                                                     tiling_granularity text default NULL,
                                                                     tiling_type text default NULL,
@@ -14,7 +20,8 @@ CREATE OR REPLACE FUNCTION create_spatiotemporal_distributed_table(
                                                                     colocation_column text default NULL,
                                                                     spatiotemporal_col_name varchar(50) default NULL,
                                                                     physical_partitioning boolean default TRUE,
-                                                                    shape_segmentation boolean default TRUE
+                                                                    shape_segmentation boolean default TRUE,
+                                                                    is_reference_table boolean default FALSE
 )
     RETURNS boolean AS $$
 DECLARE
@@ -32,6 +39,33 @@ BEGIN
     IF temp IS NOT NULL THEN
         RAISE EXCEPTION 'Please use different table name or drop it before calling this function!';
     END IF;
+
+    -- Reference (broadcast) table: no spatiotemporal tiling at all -- just
+    -- copy the data into table_name_out and hand it to Citus' own
+    -- create_reference_table(), which replicates the whole table to every
+    -- node so it can be joined against any distributed table without
+    -- repartitioning. tiling_method/etc are all ignored in this path since
+    -- there's no tiling to do. num_tiles defaults to 1 so callers don't
+    -- need to think about it for a reference table, but a reference table
+    -- is never tiled, so any other value is rejected outright rather than
+    -- silently ignored.
+    IF is_reference_table THEN
+        IF num_tiles != 1 THEN
+            RAISE EXCEPTION 'num_tiles must be 1 (or omitted) when is_reference_table is true -- reference tables are replicated whole, not tiled; got %', num_tiles;
+        END IF;
+        RAISE INFO 'Creating reference (broadcast) table %', table_name_out;
+        EXECUTE format('CREATE TABLE %I (LIKE %I INCLUDING ALL)', table_name_out, table_name_in);
+        EXECUTE format('INSERT INTO %I SELECT * FROM %I', table_name_out, table_name_in);
+        -- create_reference_table() takes a regclass; casting table_name_out
+        -- (plain text) to regclass directly applies standard unquoted-
+        -- identifier folding (lowercasing it), which doesn't match the
+        -- case-preserved table just created above via %I whenever
+        -- table_name_out has any uppercase letters. Quoting it through %I
+        -- first makes the regclass cast resolve the exact same identifier.
+        EXECUTE format('SELECT create_reference_table(%L::regclass)', format('%I', table_name_out));
+        RETURN true;
+    END IF;
+
     temp_start_time := clock_timestamp();
     -- Preprocessing
     RAISE INFO 'Collecting information:';

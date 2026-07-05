@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 #include <commands/explain.h>
+#include <distributed/pg_dist_partition.h>
 #include "planner/predicate_management.h"
 #include "multirelation/multirelation_utils.h"
 #include "planner/distributed_mobilitydb_planner.h"
@@ -68,20 +69,75 @@ static void ExplainMainPredicate(PredicateType predicateType, PredicateInfo * pr
  * touched by the query along with its tiling method, local index, and tile
  * count; repeated references to the same table (self-joins) are skipped
  * after the first.
+ *
+ * The header counts distinguish genuinely-distributed (tiled) spatiotemporal
+ * tables from replicated reference tables -- tablesList->length/diffCount
+ * count every range-table entry or distinct relid regardless of kind, so a
+ * query joining one tiled table against several reference tables (e.g. a
+ * self-join on trips_16t plus 4 reference-table references) used to print
+ * as "Distributed Tables:6" / "different tables: 4", reading as if several
+ * genuinely-sharded tables were involved instead of one.
  */
 static void ExplainDistributedTables(STMultirelations *tablesList, ExplainState *es, int indent_group)
 {
+    List *seenDistributedRelids = NIL;
+    List *seenReferenceRelids = NIL;
+    int distributedOccurrences = 0;
+    int referenceOccurrences = 0;
+    ListCell *countCell = NULL;
+    foreach(countCell, tablesList->tables)
+    {
+        Rte *rteNode = (Rte *) lfirst(countCell);
+        if (rteNode->RteType == STRte)
+        {
+            STMultirelation *st = (STMultirelation *) rteNode->rte;
+            distributedOccurrences++;
+            if (!list_member_oid(seenDistributedRelids, st->catalogTableInfo.table_oid))
+                seenDistributedRelids = lappend_oid(seenDistributedRelids, st->catalogTableInfo.table_oid);
+        }
+        else if (rteNode->RteType == CitusRte)
+        {
+            CitusRteNode *citusRte = (CitusRteNode *) rteNode->rte;
+            /* Reference tables report Citus' "none" partition method
+             * ('n', DISTRIBUTE_BY_NONE) -- the same value plain Citus
+             * local tables report, but a CitusRteNode only ever exists for
+             * a hash/range-distributed table or a reference table (see
+             * analyzeDistributedSpatiotemporalTables), so "not hash, not
+             * range" reliably means "reference table" here. */
+            if (citusRte->partitionMethod != DISTRIBUTE_BY_HASH &&
+                citusRte->partitionMethod != DISTRIBUTE_BY_RANGE)
+            {
+                Oid relid = ((RangeTblEntry *) lfirst(citusRte->rangeTableCell))->relid;
+                referenceOccurrences++;
+                if (!list_member_oid(seenReferenceRelids, relid))
+                    seenReferenceRelids = lappend_oid(seenReferenceRelids, relid);
+            }
+        }
+    }
+
+    int distinctDistributedCount = list_length(seenDistributedRelids);
+
     appendStringInfoSpaces(es->str, es->indent * indent_group);
-    appendStringInfo(es->str, "-> Distributed Tables:%d\n", tablesList->length);
+    appendStringInfo(es->str, "-> Distributed Tables:%d\n", distinctDistributedCount);
     es->indent += indent_group;
     ExplainOpenGroup("TablesInfo", "Distributed Tables Info", true, es);
     appendStringInfoSpaces(es->str, es->indent * indent_group);
-    appendStringInfo(es->str, "Number of similar tables: %d\n", tablesList->simCount);
+    /* "Similar"/"different" here are scoped to genuinely-distributed (tiled)
+     * tables only -- self-joins (e.g. trips_16t as both t1 and t2) count as
+     * "similar", and distinct distributed tables (e.g. two different tiled
+     * tables joined together) count as "different". Reference tables are
+     * reported separately below, never folded into either count. */
+    appendStringInfo(es->str, "Number of similar tables: %d\n",
+                     distributedOccurrences - distinctDistributedCount);
     appendStringInfoSpaces(es->str, es->indent * indent_group);
-    if (tablesList->diffCount > 1)
-        appendStringInfo(es->str, "Number of different tables: %d\n", tablesList->diffCount);
+    appendStringInfo(es->str, "Number of different tables: %d\n", distinctDistributedCount);
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    if (referenceOccurrences > 0)
+        appendStringInfo(es->str, "Replicated (reference) tables: %d (%d reference%s)\n",
+                         list_length(seenReferenceRelids), referenceOccurrences,
+                         referenceOccurrences == 1 ? "" : "s");
     else
-        appendStringInfo(es->str, "Number of different tables: %d\n", 0);
+        appendStringInfo(es->str, "Replicated (reference) tables: 0\n");
     appendStringInfoSpaces(es->str, es->indent * indent_group);
     ListCell *rangeTableCell = NULL;
     char * check = NULL;

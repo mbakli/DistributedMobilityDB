@@ -101,6 +101,7 @@ DistributedColumnType(Oid relationId)
             return SPATIAL;
         else if(strcmp(columnType, "tgeompoint") == 0)
             return SPATIOTEMPORAL;
+        return DIFFTYPE;
     }
     else
         return DIFFTYPE;

@@ -90,14 +90,18 @@ char* replaceWord( char* s,  char* oldW,  char* newW)
     return bstr;
 }
 
-/* extract_between returns a newly allocated copy of the substring of str found strictly between markers p1 and p2. */
+/*
+ * extract_between returns a newly allocated copy of the substring of str
+ * found strictly between markers p1 and p2, or NULL if either marker isn't
+ * found (or allocation fails).
+ */
 extern
 char * extract_between(const char *str, const char *p1, const char *p2) {
     const char *i1 = strstr(str, p1);
     if (i1 != NULL) {
         const size_t pl1 = strlen(p1);
         const char *i2 = strstr(i1 + pl1, p2);
-        if (p2 != NULL) {
+        if (i2 != NULL) {
             /* Found both markers, extract text. */
             const size_t mlen = i2 - (i1 + pl1);
             char *ret = malloc(mlen + 1);
@@ -108,6 +112,7 @@ char * extract_between(const char *str, const char *p1, const char *p2) {
             }
         }
     }
+    return NULL;
 }
 
 /* change_sentence returns a newly allocated copy of sentence with the first occurrence of find replaced by replace. */

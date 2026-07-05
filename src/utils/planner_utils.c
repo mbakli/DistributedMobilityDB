@@ -26,7 +26,14 @@
 extern STMultirelationCatalog
 GetTilingSchemeInfo(Oid relationId)
 {
-    STMultirelationCatalog catalog;
+    /* groupCol/internalType/reshuffledTable aren't read from
+     * pg_dist_spatiotemporal_tables here (they're filled in by other code
+     * paths later) -- zero-initializing means they default to a safe NULL
+     * instead of whatever garbage was already on the stack, which
+     * previously clobbered the zeroed STMultirelation this gets copied
+     * into (see GetMultirelationInfo, which palloc0's its multirelation
+     * before this overwrites catalogTableInfo wholesale). */
+    STMultirelationCatalog catalog = {0};
     Datum datumArray[Natts_MTS];
     bool isNullArray[Natts_MTS];
     ScanKeyData scanKey[1];
