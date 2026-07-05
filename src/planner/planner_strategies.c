@@ -451,9 +451,10 @@ getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan, Oid oid)
 }
 
 /*
- * ColocationStrategyPlan records a Colocation PlanTask for the query's
- * first two range-table entries, joined on their shared tile key — no data
- * movement needed since both are already tiled the same way.
+ * ColocationStrategyPlan records a Colocation PlanTask for the query's two
+ * self-joined spatiotemporal (STRte) range-table entries, joined on their
+ * shared tile key — no data movement needed since both are already tiled
+ * the same way.
  */
 extern void
 ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
@@ -461,8 +462,29 @@ ColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     PlanTask * strategy = (PlanTask *) palloc0(sizeof(PlanTask));
     strategy->type = Colocation;
     /* TODO: Add the other cases */
-    strategy->tbl1 = (STMultirelation *) ((Rte *)list_nth(distPlan->tablesList->tables, 0))->rte;
-    strategy->tbl2 = (STMultirelation *) ((Rte *)list_nth(distPlan->tablesList->tables, 1))->rte;
+    /* This is a self-join, so the two tables to join are the two STRte
+     * entries specifically -- not just whichever entries happen to be
+     * first/second in tablesList->tables. Any reference or plain Citus
+     * tables also joined in the same query (CitusRte/LocalRte entries)
+     * can end up interleaved with them (e.g. "Trips t1, Licences1 l1,
+     * Trips t2" puts l1 at index 1), and blindly casting one of those to
+     * STMultirelation* read garbage through the wrong struct layout. */
+    ListCell *rangeTableCell = NULL;
+    STMultirelation *stTables[2] = {NULL, NULL};
+    int stTableCount = 0;
+    foreach(rangeTableCell, distPlan->tablesList->tables)
+    {
+        Rte *rteNode = (Rte *) lfirst(rangeTableCell);
+        if (rteNode->RteType == STRte && stTableCount < 2)
+        {
+            stTables[stTableCount] = (STMultirelation *) rteNode->rte;
+            stTableCount++;
+        }
+    }
+    if (stTableCount < 2)
+        ereport(ERROR, (errmsg("Colocation strategy requires two spatiotemporal tables to self-join")));
+    strategy->tbl1 = stTables[0];
+    strategy->tbl2 = stTables[1];
     strategy->tileKey = (Datum) Var_Catalog_Tile_Key;
     distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
 }

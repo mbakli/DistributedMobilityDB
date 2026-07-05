@@ -92,6 +92,11 @@ typedef struct STMultirelations
     int stCount;
     int nonStCount;
     int length;
+    /* Count of nonStCount entries that are Citus reference tables -- these
+     * are already replicated to every node, so they never need reshuffling
+     * and shouldn't count as a "different distributed table" when deciding
+     * whether a join needs the NonColocation strategy. */
+    int refCount;
 } STMultirelations;
 
 /* True if relationId is registered as a distributed spatiotemporal table. */

@@ -122,6 +122,21 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     /* Query rewriter */
     if (list_length(distPlan->postProcessing->distfuns) > 0 )
         RewriterDistFuncs(parse, distPlan->postProcessing, query_string);
+    if (needsSpatiotemporalPlanning && list_length(distPlan->strategies) == 0
+            && list_length(distPlan->postProcessing->distfuns) == 0)
+    {
+        /* needsDistributedSpatiotemporalPlanning() can return true purely
+         * from tablesList->diffCount > 1, even when checkQueryType() found
+         * no registered intersection/distance predicate to build a strategy
+         * for (e.g. a plain `@>` "contains" clause against a reference
+         * table isn't one of those). With no strategy and no distributed
+         * function, there is nothing for the custom executor below to
+         * build a plan from -- it would otherwise fall into
+         * ConstructGeneralQuery's `generalScan->length == 0` branch and use
+         * postProcessing->worker, which is NULL here, producing "(null)"
+         * as the query text. Let Citus plan the query directly instead. */
+        return distributed_planner(parse, query_string, cursorOptions, boundParams);
+    }
     if (needsSpatiotemporalPlanning)
     {
         if (!distPlan->activate_rewriter)
@@ -198,12 +213,34 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
 {
     ListCell *rangeTableCell = NULL;
     Oid curr_relid = -1;
+    /* diffCount/simCount need to know whether relid has appeared ANYWHERE
+     * earlier in the range table, not just in the immediately preceding
+     * entry -- comparing only to curr_relid miscounted a self-join like
+     * "Trips t1, Licences1 l1, Trips t2" as three different tables instead
+     * of recognizing t2 as a repeat of t1, since t2 is compared against
+     * l1's relid rather than t1's. */
+    List *seenRelids = NIL;
     bool shapeType;
     List *rtes = NIL;
     foreach(rangeTableCell, rangeTableList)
     {
         RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
         if (rangeTableEntry->rtekind != RTE_RELATION) {
+            continue;
+        }
+        /* A view reference (e.g. Licences1, a view over Licences) expands
+         * in the range table into the view's own subquery entry (rtekind
+         * != RTE_RELATION, already skipped above), PostgreSQL's internal
+         * rule-system "old"/"new" placeholder entries for that view, and
+         * the view's real underlying base table -- none of which the user
+         * actually joined except the last. inFromCl is false for exactly
+         * those non-user-visible placeholders (verified: "old"/"new" have
+         * inFromCl=0, the real base table has inFromCl=1), so without this
+         * check every view reference was triple-counted as extra distinct
+         * tables, inflating diffCount/length enough to make e.g. a query
+         * with one distributed table plus reference tables look like it
+         * had several more distributed tables than it really did. */
+        if (!rangeTableEntry->inFromCl) {
             continue;
         }
         if (IsDistributedSpatiotemporalTable(rangeTableEntry->relid))
@@ -248,15 +285,29 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
             if (LookupCitusTableCacheEntry(rangeTableEntry->relid) != NULL)
             {
                 char partitioningMethod = PartitionMethodViaCatalog (rangeTableEntry->relid);
-                if (partitioningMethod == DISTRIBUTE_BY_HASH || partitioningMethod == DISTRIBUTE_BY_RANGE)
+                /* A reference table is replicated to every node, so joining
+                 * it alongside a distributed table needs no repartitioning.
+                 * Its reported partitioning method alone doesn't identify it
+                 * uniquely, so check its table type explicitly instead. */
+                bool isReferenceTable = IsCitusTableType(rangeTableEntry->relid, REFERENCE_TABLE);
+                if (partitioningMethod == DISTRIBUTE_BY_HASH || partitioningMethod == DISTRIBUTE_BY_RANGE
+                        || isReferenceTable)
                 {
                     /* Citus table processing */
                     CitusRteNode *citusNode = GetCitusRteInfo(rangeTableEntry,partitioningMethod);
                     citusNode->rangeTableCell = rangeTableCell;
-                    distPlan->tablesList->length++;
+                    /* length is already incremented unconditionally for
+                     * every range table entry below (after this if/else) --
+                     * incrementing it here too double-counted every Citus
+                     * table entry, inflating effectiveLength enough that a
+                     * query with one distributed table plus reference
+                     * tables was never recognized as an effective
+                     * single-table case. */
                     Rte *rteNode = GetRteNode((Node *) citusNode, CitusRte, rangeTableEntry->alias);
                     rtes = lappend(rtes , rteNode);
                     distPlan->tablesList->nonStCount++;
+                    if (isReferenceTable)
+                        distPlan->tablesList->refCount++;
                 }
                 else
                     elog(ERROR, "The %s table is not distributed using one of the supported partitioning methods",
@@ -270,9 +321,10 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                 rtes = lappend(rtes , rteNode);
             }
         }
-        if (curr_relid != rangeTableEntry->relid)
+        if (!list_member_oid(seenRelids, rangeTableEntry->relid))
         {
             distPlan->tablesList->diffCount++;
+            seenRelids = lappend_oid(seenRelids, rangeTableEntry->relid);
         }
         else
             distPlan->tablesList->simCount++;
@@ -355,6 +407,14 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
         /* TODO: subquery is excluded for now */
         ereport(ERROR, (errmsg("A sub query is not supported yet in Distributed MobilityDB!")));
     }
+    /* Reference tables are already replicated to every node, so a join
+     * against one never needs the NonColocation strategy's reshuffle --
+     * Citus can push the predicate down to each shard directly. Subtracting
+     * refCount here means a query joining one distributed spatiotemporal
+     * table with any number of reference tables is treated the same as a
+     * genuine single-table query below. */
+    int effectiveDiffCount = distPlan->tablesList->diffCount - distPlan->tablesList->refCount;
+    int effectiveLength = distPlan->tablesList->length - distPlan->tablesList->refCount;
     /* Iterate over the where clause conditions */
     foreach(clauseCell, whereClauseList)
     {
@@ -379,12 +439,12 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
             {
                 if (IsIntersectionOperation(predicateOid))
                 {
-                    if (distPlan->tablesList->diffCount > 1)
+                    if (effectiveDiffCount > 1)
                     {
                         /* Intersection join between two distinct tables: must colocate them first. */
                         AddStrategy(distPlan, NonColocation);
                     }
-                    else if (distPlan->tablesList->length == 1)
+                    else if (effectiveLength == 1)
                     {
                         /* Single-table intersection: decide between rebalancing tiles to fit the
                          * query's search box or simply pushing the predicate to each worker. */
@@ -406,10 +466,22 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
                 }
                 else if (IsDistanceOperation(predicateOid))
                 {
-                    /* The NonColocation strategy is triggered by default until the analysis changes it */
                     if (distPlan->tablesList->simCount >= 1)
                         AddStrategy(distPlan, Colocation);
-                    AddStrategy(distPlan, NonColocation);
+                    /* The NonColocation strategy is triggered by default until the analysis
+                     * changes it -- except when the only "different" tables besides one
+                     * distributed spatiotemporal table are reference tables (refCount > 0
+                     * guards this so behavior is untouched whenever no reference table is
+                     * involved), which Citus can push the predicate down to directly with
+                     * no reshuffle needed. */
+                    if (effectiveDiffCount > 1 || distPlan->tablesList->refCount == 0)
+                    {
+                        AddStrategy(distPlan, NonColocation);
+                    }
+                    else if (effectiveLength == 1)
+                    {
+                        AddStrategy(distPlan, PredicatePushDown);
+                    }
                     if(distPlan->predicatesList->predicateType == DISTANCE)
                     {
                         ereport(ERROR, (errmsg("Currently, we do not support using more than "

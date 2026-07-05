@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include "miscadmin.h"
 #include "utils/elog.h"
+#include "utils/guc.h"
 #include "commands/explain.h"
 #include "planner/distributed_mobilitydb_planner.h"
 #include "planner/distributed_mobilitydb_explain.h"
@@ -36,4 +37,12 @@ _PG_init(void)
     planner_hook = distributed_mobilitydb_planner;
 
     ExplainOneQuery_hook = distributed_mobilitydb_explain;
+
+    /* Cross-table joins built by this extension's NonColocation/Colocation
+     * strategies aren't guaranteed to be physically co-located (see
+     * colocate_shards()), so Citus plans them as repartition joins. Turn
+     * that on as a session default here so users don't have to discover and
+     * set it themselves before a join query works; they can still override
+     * it with their own SET/RESET afterwards. */
+    SetConfigOption("citus.enable_repartition_joins", "on", PGC_SUSET, PGC_S_SESSION);
 }

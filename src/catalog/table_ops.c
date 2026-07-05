@@ -258,18 +258,23 @@ GetShapeCol(Oid relationId)
                      get_rel_name(relationId));
 
     spi_result = SPI_execute(catalogQuery->data, true, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /* Read back the PROJ text. getDistributedCol() legitimately returns
+     * NULL for a plain (non-spatiotemporal) table, e.g. a reference table
+     * joined alongside a distributed one -- calling DatumToString on that
+     * NULL Datum crashed instead of just reporting "no shape column". */
+    char *result = NULL;
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
         TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
         Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
-        return DatumToString(distcol, TEXTOID);;
+        if (!isNull)
+            result = DatumToString(distcol, TEXTOID);
     }
-    return NULL;
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+    return result;
 }
