@@ -1,0 +1,51 @@
+name: Lint
+
+# Static analysis only -- no compiling. This project's real build needs
+# PostgreSQL + Citus + PostGIS headers, some of which turned out to be
+# undocumented/version-specific gaps not shipped by any package (see
+# third_party/postgis-lwgeom/README.md), making a genuine `cmake --build`
+# too fragile to run reliably as a PR gate for now. These jobs instead
+# catch real bugs/style issues in the C sources, shell scripts, and the
+# workflow files themselves, without needing that environment at all.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: raven-actions/actionlint@v2.2.0
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: './scripts'
+          severity: warning
+
+  cppcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: Run cppcheck
+        run: |
+          # 'style' is deliberately excluded: it's almost entirely const-
+          # correctness/redundant-condition suggestions with no real bugs
+          # found in this codebase, and including it would make this job
+          # fail on pre-existing code with nothing actionable for a PR to
+          # fix. 'warning'/'performance'/'portability' plus cppcheck's
+          # always-on checks (missingReturn, uninitvar, null dereference)
+          # are what actually caught real bugs while writing this job.
+          cppcheck --enable=warning,performance,portability \
+            --suppress=missingInclude --suppress=missingIncludeSystem \
+            --inline-suppr \
+            --error-exitcode=1 -I include src

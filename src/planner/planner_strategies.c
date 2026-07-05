@@ -100,6 +100,15 @@ PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan *distPlan, R
     foreach(rangeTableCell, distPlan->tablesList->tables)
     {
         Rte * rteNode = (Rte *) lfirst(rangeTableCell);
+        /* TODO(known bug, tracked separately -- not fixed here): Rte.RteType
+         * is declared `bool` in include/general/rte.h but the RteType enum
+         * it holds has three values (STRte=0, CitusRte=1, LocalRte=2);
+         * storing LocalRte truncates to the same bool value CitusRte
+         * produces, so `== LocalRte` (comparing against the int literal 2)
+         * can never be true here. Needs Rte.RteType changed to the real
+         * enum type plus an audit of every ->RteType comparison in the
+         * codebase before it's safe to fix. */
+        // cppcheck-suppress compareBoolExpressionWithInt
         if (rteNode->RteType == CitusRte || rteNode->RteType == LocalRte)
             distPlan->reshuffledTable = rteNode;
         else if (rteNode->RteType == STRte){
@@ -115,6 +124,7 @@ PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan *distPlan, R
                 ((RangeTblEntry *)lfirst(citusNode->rangeTableCell))->relid));
         createReshufflingPlanForNonstRte(distPlan);
     }
+    // cppcheck-suppress compareBoolExpressionWithInt -- see TODO above on the same known Rte.RteType bug
     else if (distPlan->reshuffledTable->RteType == LocalRte)
     {
         /* The rte can be either broadcasted or partitioned using the same tiling scheme of the given
@@ -448,6 +458,7 @@ getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan, Oid oid)
         }
         return reshuffledTableColumns;
     }
+    elog(ERROR, "Could not read column list for relation %u", oid);
 }
 
 /*
