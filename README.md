@@ -19,6 +19,7 @@ Distributed MobilityDB is an open-source extension for PostgreSQL tailored to ha
 - [Use Cases](#use-cases)
   - [OpenStreetMap (OSM) Data](#openstreetmap-osm-data)
   - [Automatic Identification System (AIS) Data](#automatic-identification-system-ais-data)
+  - [BerlinMOD Benchmark Data](#berlinmod-benchmark-data)
   - [Global Surface Summary of the Day (GSOD) Data](#global-surface-summary-of-the-day-gsod-data)
 - [Contributing](#contributing)
 - [Contact Us](#contact-us)
@@ -187,6 +188,48 @@ FROM ships_tanker_50t
 WHERE Destination = 'Kalundborg'
   AND Trip && Period('2019-09-01', '2019-09-30')
   AND timespan(Trip) > '5 days';
+```
+
+### BerlinMOD Benchmark Data
+
+**Description:** BerlinMOD is a standard benchmark for moving object databases: a synthetic data generator producing vehicle trip trajectories (passenger cars, trucks) across a road network, along with reference data (vehicles, licences, points, regions) used by its 17 standard benchmark queries.
+
+**Download:** https://github.com/MobilityDB/MobilityDB-BerlinMOD
+
+```sql
+-- Input tables
+CREATE TABLE trips (
+  TripId int,
+  VehicleId int,
+  StartDate date,
+  SeqNo int,
+  Trip tgeompoint,
+  Trajectory geometry
+);
+
+-- Distribute the passenger trips into 4 tiles using the spatiotemporal column: tgeompoint(sequence)
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'trips_passenger', num_tiles => 4,
+  table_name_out => 'trips_passenger_4t', tiling_method => 'crange', tiling_type => 'spatiotemporal');
+
+-- Distribute the truck trips into 2 tiles using the spatiotemporal column: tgeompoint(sequence)
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'trips_truck', num_tiles => 2,
+  table_name_out => 'trips_truck_2t', tiling_method => 'crange', tiling_type => 'spatiotemporal');
+
+-- Distance-Join Query: Find passenger vehicles that were within 100m of truck vehicles.
+SELECT t1.VehicleId AS PassengerVehicleId, t2.VehicleId AS TruckVehicleId
+FROM trips_passenger_4t t1, trips_truck_2t t2
+WHERE eDWithin(t1.Trip, t2.Trip, 100);
+
+-- Intersection-Join Query: Find passenger and truck vehicles whose trips ever crossed the same point.
+SELECT t1.VehicleId AS PassengerVehicleId, t2.VehicleId AS TruckVehicleId
+FROM trips_passenger_4t t1, trips_truck_2t t2
+WHERE eIntersects(t1.Trip, t2.Trip);
+
+-- Temporal Query: What is the travelled distance of vehicles whose morning trip (8-9am) lasted more than 20 minutes?
+SELECT VehicleId, length(Trip) / 1000 AS travelledKms
+FROM trips_passenger_4t
+WHERE Trip && stbox 'stbox t([2020-06-01 08:00:00+02, 2020-06-01 09:00:00+02))'
+  AND duration(Trip) > '20 minutes';
 ```
 
 ### Global Surface Summary of the Day (GSOD) Data
