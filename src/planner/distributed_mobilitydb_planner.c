@@ -29,6 +29,7 @@
 #include "distributed_functions/coordinator_operations.h"
 #include "distributed_functions/worker_operations.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "general/spatiotemporal_processing.h"
 #include "general/rte.h"
 
@@ -37,6 +38,10 @@ static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                                        DistributedSpatiotemporalQueryPlan *distPlan);
 static void PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan);
 static void checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
+static void ProcessQueryPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
+static void ProcessPredicateClause(DistributedSpatiotemporalQueryPlan *distPlan, Node *clause);
+static bool SelectListPredicateWalker(Node *node, DistributedSpatiotemporalQueryPlan *distPlan);
+static void AnalyseSelectListPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
 static bool needsDistributedSpatiotemporalPlanning(DistributedSpatiotemporalQueryPlan *distPlan);
 static bool StrategiesInclude(List *strategies, StrategyType type);
 static PlannedStmt * EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions,
@@ -351,8 +356,22 @@ EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions, Param
     bool res = false;
     if (query_string == NULL)
         return result;
-    foreach(rangeTableCell, parse->rtable) {
+    /* parse->rtable only holds the OUTER query's own range table -- a query
+     * that references its distributed spatiotemporal table exclusively
+     * inside a CTE (e.g. "WITH Temp AS (SELECT ... FROM trips_16t t1,
+     * trips_16t t2 ...) SELECT ... FROM Temp") has just an RTE_CTE entry
+     * here, so this loop never saw the real table and always deferred such
+     * queries straight to Citus' own planner -- which then rejects a
+     * same-table self-join baked inside the CTE outright, since it has no
+     * way to push it down or materialize-and-rejoin it the way it can for a
+     * CTE referenced (self-joined) from outside. ExtractRangeTableEntryList
+     * recurses into CTEs/subqueries so the table is actually found here,
+     * letting the query into our own planning pipeline instead. */
+    List *rangeTableList = ExtractRangeTableEntryList(parse);
+    foreach(rangeTableCell, rangeTableList) {
         RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+        if (rangeTableEntry->rtekind != RTE_RELATION)
+            continue;
         if (IsDistributedSpatiotemporalTable(rangeTableEntry->relid) && parse->commandType == CMD_SELECT)
         {
             /* at least one distriubted table */
@@ -398,8 +417,37 @@ PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
 static void
 checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
 {
-    // extract where clause qualifiers and verify we can plan for them
+    ProcessQueryPredicates(parse, distPlan);
 
+    /* A self-join whose spatiotemporal predicate lives entirely inside a
+     * CTE's own definition (e.g. Q10: "WITH Temp AS (SELECT ...
+     * whenTrue(tDwithin(t1.Trip, t2.Trip, 3.0)) ... FROM trips_16t t1, ...,
+     * trips_16t t2, ... ) SELECT ... FROM Temp") is invisible to the scan
+     * above, since parse->jointree/parse->targetList only cover the OUTER
+     * query -- the outer query here just references "Temp" once, with no
+     * spatiotemporal predicate of its own. Scan each CTE's own query the
+     * same way so its self-join still gets a strategy chosen. */
+    ListCell *cteCell;
+    foreach(cteCell, parse->cteList)
+    {
+        CommonTableExpr *cte = (CommonTableExpr *) lfirst(cteCell);
+        if (!IsA(cte->ctequery, Query))
+            continue;
+        ProcessQueryPredicates((Query *) cte->ctequery, distPlan);
+    }
+    /* TODO: The rest is excluded for now and will be added after testing the main features */
+}
+
+/*
+ * ProcessQueryPredicates scans a single query's WHERE clause and, if that
+ * doesn't already pick a strategy, its SELECT list, for a registered
+ * intersection/distance predicate. Called once for the outer query and once
+ * per CTE by checkQueryType, since a CTE's own self-join is otherwise never
+ * visible from the outer query's jointree/targetList.
+ */
+static void
+ProcessQueryPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
+{
     List *whereClauseList = WhereClauseList(parse->jointree);
     ListCell *clauseCell = NULL;
     if (whereClauseList == NIL && parse->hasSubLinks)
@@ -407,6 +455,38 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
         /* TODO: subquery is excluded for now */
         ereport(ERROR, (errmsg("A sub query is not supported yet in Distributed MobilityDB!")));
     }
+    /* Iterate over the where clause conditions */
+    foreach(clauseCell, whereClauseList)
+    {
+        Node *clause = (Node *) lfirst(clauseCell);
+        ProcessPredicateClause(distPlan, clause);
+    }
+    /* A self-join whose only spatiotemporal computation lives in the SELECT
+     * list (e.g. MIN(nearestapproachdistance(t1.Trip, t2.Trip)), with no
+     * spatiotemporal predicate in the WHERE clause at all) never reaches the
+     * loop above, since WhereClauseList only sees WHERE-clause conjuncts --
+     * leaving no strategy chosen and Citus rejecting the resulting
+     * unconditioned self cross-join. Only run this fallback scan when the
+     * WHERE clause didn't already pick a strategy, so existing queries are
+     * unaffected. */
+    if (list_length(distPlan->strategies) == 0)
+    {
+        AnalyseSelectListPredicates(parse, distPlan);
+    }
+}
+
+/*
+ * ProcessPredicateClause inspects a single predicate node (either a
+ * WHERE-clause conjunct or a spatiotemporal function call found inside the
+ * SELECT list) and, if it's a registered intersection/distance operation,
+ * chooses the strategy needed to plan it.
+ */
+static void
+ProcessPredicateClause(DistributedSpatiotemporalQueryPlan *distPlan, Node *clause)
+{
+    if (NodeIsEqualsOpExpr(clause))
+        return;
+
     /* Reference tables are already replicated to every node, so a join
      * against one never needs the NonColocation strategy's reshuffle --
      * Citus can push the predicate down to each shard directly. Subtracting
@@ -415,107 +495,144 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
      * genuine single-table query below. */
     int effectiveDiffCount = distPlan->tablesList->diffCount - distPlan->tablesList->refCount;
     int effectiveLength = distPlan->tablesList->length - distPlan->tablesList->refCount;
-    /* Iterate over the where clause conditions */
-    foreach(clauseCell, whereClauseList)
+
+    Oid predicateOid;
+    List *predicateArgs;
+
+    /*
+     * MobilityDB/PostGIS join predicates such as eDwithin(...) or
+     * ST_Intersects(...) parse as FuncExpr, not OpExpr -- casting
+     * blindly to OpExpr (as this used to) silently failed to
+     * recognize them (or worse, read OpExpr-shaped fields out of a
+     * FuncExpr node), so joins using them fell through to Citus'
+     * own planner, which rejects any join not on distribution
+     * columns.
+     */
+    if (!(GetPredicateOidAndArgs(clause, &predicateOid, &predicateArgs) &&
+          predicateOid > 0 && list_length(predicateArgs) >= 2))
+        return;
+
+    if (IsIntersectionOperation(predicateOid))
     {
-        Node *clause = (Node *) lfirst(clauseCell);
-
-        if (!NodeIsEqualsOpExpr(clause))
+        if (effectiveDiffCount > 1)
         {
-            Oid predicateOid;
-            List *predicateArgs;
-
-            /*
-             * MobilityDB/PostGIS join predicates such as eDwithin(...) or
-             * ST_Intersects(...) parse as FuncExpr, not OpExpr -- casting
-             * blindly to OpExpr (as this used to) silently failed to
-             * recognize them (or worse, read OpExpr-shaped fields out of a
-             * FuncExpr node), so joins using them fell through to Citus'
-             * own planner, which rejects any join not on distribution
-             * columns.
-             */
-            if (GetPredicateOidAndArgs(clause, &predicateOid, &predicateArgs) &&
-                predicateOid > 0 && list_length(predicateArgs) >= 2)
+            /* Intersection join between two distinct tables: must colocate them first. */
+            AddStrategy(distPlan, NonColocation);
+        }
+        else if (effectiveLength == 1)
+        {
+            /* Single-table intersection: decide between rebalancing tiles to fit the
+             * query's search box or simply pushing the predicate to each worker. */
+            Datum rangeBox = get_query_range(distPlan->tablesList, clause);
+            if (!IsDatumEmpty(rangeBox) &&
+                CheckTileRebalancerActivation(distPlan->tablesList, clause, rangeBox))
             {
-                if (IsIntersectionOperation(predicateOid))
-                {
-                    if (effectiveDiffCount > 1)
-                    {
-                        /* Intersection join between two distinct tables: must colocate them first. */
-                        AddStrategy(distPlan, NonColocation);
-                    }
-                    else if (effectiveLength == 1)
-                    {
-                        /* Single-table intersection: decide between rebalancing tiles to fit the
-                         * query's search box or simply pushing the predicate to each worker. */
-                        Datum rangeBox = get_query_range(distPlan->tablesList, clause);
-                        if (!IsDatumEmpty(rangeBox) &&
-                            CheckTileRebalancerActivation(distPlan->tablesList, clause, rangeBox))
-                        {
-                            AddStrategy(distPlan, TileScanRebalancer);
-                            distPlan->range_bbox = rangeBox;
-                        }
-                        else
-                            AddStrategy(distPlan, PredicatePushDown);
-                    }
-                    else
-                    {
-                        /* By default: multiple references to the same colocated table (self-join). */
-                        AddStrategy(distPlan, Colocation);
-                    }
-                }
-                else if (IsDistanceOperation(predicateOid))
-                {
-                    if (distPlan->tablesList->simCount >= 1)
-                        AddStrategy(distPlan, Colocation);
-                    /* The NonColocation strategy is triggered by default until the analysis
-                     * changes it -- except when the only "different" tables besides one
-                     * distributed spatiotemporal table are reference tables (refCount > 0
-                     * guards this so behavior is untouched whenever no reference table is
-                     * involved), which Citus can push the predicate down to directly with
-                     * no reshuffle needed. */
-                    if (effectiveDiffCount > 1 || distPlan->tablesList->refCount == 0)
-                    {
-                        AddStrategy(distPlan, NonColocation);
-                    }
-                    else if (effectiveLength == 1)
-                    {
-                        AddStrategy(distPlan, PredicatePushDown);
-                    }
-                    if(distPlan->predicatesList->predicateType == DISTANCE)
-                    {
-                        ereport(ERROR, (errmsg("Currently, we do not support using more than "
-                                               "one distance operation in the same query !")));
-                    }
-                    distPlan->predicatesList->predicateInfo->distancePredicate = (DistancePredicate *)palloc0(
-                            sizeof(DistancePredicate));
-                    distPlan->predicatesList->predicateInfo->distancePredicate = analyseDistancePredicate(clause);
-                    distPlan->predicatesList->predicateType = DISTANCE;
-                }
-                else
-                {
-                    ListCell *arg;
-                    foreach(arg, predicateArgs)
-                    {
-                        Node *node = (Node *) lfirst(arg);
-                        if (!IsA(node, Const))
-                            continue;
-                        Oid arg_oid = ((Const *)node)->consttype;
-                        if (IsDistanceOperation(arg_oid))
-                        {
-                            if (distPlan->tablesList->simCount >= 1)
-                                AddStrategy(distPlan, Colocation);
-                            distPlan->predicatesList->predicateInfo->distancePredicate =
-                                    analyseDistancePredicate(node);
-                            AddStrategy(distPlan, NonColocation);
-                            distPlan->predicatesList->predicateType = DISTANCE;
-                        }
-                    }
-                }
+                AddStrategy(distPlan, TileScanRebalancer);
+                distPlan->range_bbox = rangeBox;
+            }
+            else
+                AddStrategy(distPlan, PredicatePushDown);
+        }
+        else
+        {
+            /* By default: multiple references to the same colocated table (self-join). */
+            AddStrategy(distPlan, Colocation);
+        }
+    }
+    else if (IsDistanceOperation(predicateOid))
+    {
+        if (distPlan->tablesList->simCount >= 1)
+            AddStrategy(distPlan, Colocation);
+        /* The NonColocation strategy is triggered by default until the analysis
+         * changes it -- except when the only "different" tables besides one
+         * distributed spatiotemporal table are reference tables (refCount > 0
+         * guards this so behavior is untouched whenever no reference table is
+         * involved), which Citus can push the predicate down to directly with
+         * no reshuffle needed. */
+        if (effectiveDiffCount > 1 || distPlan->tablesList->refCount == 0)
+        {
+            AddStrategy(distPlan, NonColocation);
+        }
+        else if (effectiveLength == 1)
+        {
+            AddStrategy(distPlan, PredicatePushDown);
+        }
+        if(distPlan->predicatesList->predicateType == DISTANCE)
+        {
+            ereport(ERROR, (errmsg("Currently, we do not support using more than "
+                                   "one distance operation in the same query !")));
+        }
+        distPlan->predicatesList->predicateInfo->distancePredicate = (DistancePredicate *)palloc0(
+                sizeof(DistancePredicate));
+        distPlan->predicatesList->predicateInfo->distancePredicate = analyseDistancePredicate(clause);
+        distPlan->predicatesList->predicateType = DISTANCE;
+    }
+    else
+    {
+        ListCell *arg;
+        foreach(arg, predicateArgs)
+        {
+            Node *node = (Node *) lfirst(arg);
+            if (!IsA(node, Const))
+                continue;
+            Oid arg_oid = ((Const *)node)->consttype;
+            if (IsDistanceOperation(arg_oid))
+            {
+                if (distPlan->tablesList->simCount >= 1)
+                    AddStrategy(distPlan, Colocation);
+                distPlan->predicatesList->predicateInfo->distancePredicate =
+                        analyseDistancePredicate(node);
+                AddStrategy(distPlan, NonColocation);
+                distPlan->predicatesList->predicateType = DISTANCE;
             }
         }
     }
-    /* TODO: The rest is excluded for now and will be added after testing the main features */
+}
+
+/*
+ * SelectListPredicateWalker recurses through a SELECT-list expression (e.g.
+ * into an Aggref's arguments) looking for a registered spatiotemporal
+ * predicate function/operator. A matched node is handed to
+ * ProcessPredicateClause and not recursed into further, since a registered
+ * predicate's own arguments (plain columns) never nest another one.
+ */
+static bool
+SelectListPredicateWalker(Node *node, DistributedSpatiotemporalQueryPlan *distPlan)
+{
+    if (node == NULL)
+        return false;
+
+    if (IsA(node, FuncExpr) || IsA(node, OpExpr))
+    {
+        Oid predicateOid;
+        List *predicateArgs;
+        if (GetPredicateOidAndArgs(node, &predicateOid, &predicateArgs) &&
+            predicateOid > 0 && list_length(predicateArgs) >= 2 &&
+            (IsIntersectionOperation(predicateOid) || IsDistanceOperation(predicateOid)))
+        {
+            ProcessPredicateClause(distPlan, node);
+            return false;
+        }
+    }
+    return expression_tree_walker(node, SelectListPredicateWalker, (void *) distPlan);
+}
+
+/*
+ * AnalyseSelectListPredicates scans the SELECT list's target entries for a
+ * registered spatiotemporal predicate function used inside an aggregate
+ * (e.g. MIN(nearestapproachdistance(t1.Trip, t2.Trip))), so a self-join
+ * whose only spatiotemporal computation lives in the SELECT list still gets
+ * a strategy chosen.
+ */
+static void
+AnalyseSelectListPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
+{
+    ListCell *cell;
+    foreach(cell, parse->targetList)
+    {
+        TargetEntry *targetEntry = (TargetEntry *) lfirst(cell);
+        SelectListPredicateWalker((Node *) targetEntry->expr, distPlan);
+    }
 }
 
 /*

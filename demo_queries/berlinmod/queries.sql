@@ -41,7 +41,6 @@ ORDER BY p.PointId, v.Licence;
 -----------------------------------------------------------------------------------------------------------------------
 -- Q5) What is the minimum distance between places, where a vehicle with a licence from
 -- Licences1 and a vehicle with a licence from Licences2 have been?
--- NOT CURRENTLY SUPPORTED: self-join on trips_16t with no distribution-column equi-join.
 -----------------------------------------------------------------------------------------------------------------------
 SELECT l1.Licence AS Licence1, l2.Licence AS Licence2,
   MIN(nearestapproachdistance(t1.Trip, t2.Trip)) AS MinDist
@@ -117,7 +116,6 @@ ORDER BY PeriodId;
 -----------------------------------------------------------------------------------------------------------------------
 -- Q10) When and where did the vehicles with licence plate numbers from Licences1 meet other
 -- vehicles (distance < 3m) and what are the latter licences?
--- NOT CURRENTLY SUPPORTED: self-join on trips_16t with no distribution-column equi-join.
 -----------------------------------------------------------------------------------------------------------------------
 WITH Temp AS (
   SELECT l1.Licence AS Licence1, t2.VehicleId AS Car2Id,
