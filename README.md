@@ -71,24 +71,33 @@ CREATE EXTENSION Distributed_MobilityDB CASCADE;
 
 ### Creating Distributed Tables
 
-The `create_spatiotemporal_distributed_table()` function is utilized to define a distributed table that is partitioned using a Multidimensional Tiling method. It splits the input table into several tiles stored in separate PostgreSQL tables.
+The `create_spatiotemporal_distributed_table()` function is utilized to define a distributed table that is partitioned using a Multidimensional Tiling method. It splits the input table into several tiles stored in separate PostgreSQL tables. It can also create a Citus **reference table** instead (a table replicated as-is to every node, with no tiling at all) via the `is_reference_table` flag -- useful for smaller lookup/dimension tables that need to be joined against a distributed table without any repartitioning.
 
 **Function:** `create_spatiotemporal_distributed_table`
 
 | Argument | Required | Description |
 |---|---|---|
 | `table_name_in` | Yes | Name of the input table. |
-| `num_tiles` | Yes | Number of generated tiles. |
-| `table_name_out` | Yes | Name of the distributed table. |
-| `tiling_method` | Yes | Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>, <ins>grid</ins>. |
-| `tiling_granularity` | No | The tiling granularity. Defaults to the value chosen by the tiling method's granularity selection process, which picks between shape- and point-based strategies to create load-balanced tiles. Set this to customize the tiling granularity. |
-| `tiling_type` | No | The tiling type of the tiling method: `temporal`, `spatial`, or `spatiotemporal`. Defaults based on the given column type. |
-| `colocation_table` | No | Colocate the input table with another table, e.g. to create tiles based on given boundaries such as province borders. Used together with `colocation_column`. |
-| `colocation_column` | No | The colocation column to use with `colocation_table`. |
-| `physical_partitioning` | No | Whether or not to physically partition data. |
-| `object_segmentation` | No | Whether or not to segment the input spatiotemporal column. |
+| `table_name_out` | Yes | Name of the distributed (or reference) table to create. Must not already exist. |
+| `num_tiles` | No | Number of generated tiles. Defaults to `1`. Ignored when `is_reference_table` is `true` -- reference tables aren't tiled -- except that any value other than `1` is rejected outright rather than silently ignored, to catch accidental misuse. |
+| `tiling_method` | No | Name of the tiling method: <ins>crange</ins>, <ins>hierarchical</ins>, <ins>grid</ins>. Defaults to `crange`. Ignored when `is_reference_table` is `true`. |
+| `tiling_granularity` | No | The tiling granularity. Defaults to the value chosen by the tiling method's granularity selection process, which picks between shape- and point-based strategies to create load-balanced tiles. Set this to customize the tiling granularity. Ignored when `is_reference_table` is `true`. |
+| `tiling_type` | No | The tiling type of the tiling method: `temporal`, `spatial`, or `spatiotemporal`. Defaults based on the given column type. Ignored when `is_reference_table` is `true`. |
+| `colocation_table` | No | Colocate the input table with another table, e.g. to create tiles based on given boundaries such as province borders. Used together with `colocation_column`. Ignored when `is_reference_table` is `true`. |
+| `colocation_column` | No | The colocation column to use with `colocation_table`. Ignored when `is_reference_table` is `true`. |
+| `spatiotemporal_col_name` | No | Name of the spatiotemporal/geometry column to distribute on. Defaults to the column detected automatically from the input table's type. Ignored when `is_reference_table` is `true`. |
+| `physical_partitioning` | No | Whether or not to physically partition data. Defaults to `true`. Ignored when `is_reference_table` is `true`. |
+| `shape_segmentation` | No | Whether or not to segment the input spatiotemporal column across tiles. Defaults to `true`. Ignored when `is_reference_table` is `true`. |
+| `is_reference_table` | No | If `true`, skip tiling entirely and create `table_name_out` as a Citus reference table (a full replica of `table_name_in` on every node) via `create_reference_table()`. Defaults to `false`. |
 
 By utilizing the `create_spatiotemporal_distributed_table()` function with these arguments, you can easily create a distributed table that suits your data management needs.
+
+```sql
+-- Distribute Vehicles as a reference table: replicated whole to every node,
+-- so it can be joined against a distributed table without repartitioning.
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'vehicles',
+  table_name_out => 'vehicles_ref', is_reference_table => true);
+```
 
 ## Use Cases
 
@@ -192,13 +201,15 @@ WHERE Destination = 'Kalundborg'
 
 ### BerlinMOD Benchmark Data
 
-**Description:** BerlinMOD is a standard benchmark for moving object databases: a synthetic data generator producing vehicle trip trajectories (passenger cars, trucks) across a road network, along with reference data (vehicles, licences, points, regions) used by its 17 standard benchmark queries.
+**Description:** BerlinMOD is a standard benchmark for moving object databases: a synthetic data generator producing vehicle trip trajectories across a road network, together with the 17 standard BerlinMOD/R benchmark queries. The full set of queries, adapted to run against a distributed `Trips` table, is available in [`demo_queries/berlinmod`](demo_queries/berlinmod), along with the distribution/setup script.
 
 **Download:** https://github.com/MobilityDB/MobilityDB-BerlinMOD
 
+**Reference:** https://github.com/MobilityDB/MobilityDB-BerlinMOD/blob/master/BerlinMOD/berlinmod_r_queries.sql
+
 ```sql
--- Input tables
-CREATE TABLE trips (
+-- Input table
+CREATE TABLE Trips (
   TripId int,
   VehicleId int,
   StartDate date,
@@ -207,29 +218,30 @@ CREATE TABLE trips (
   Trajectory geometry
 );
 
--- Distribute the passenger trips into 4 tiles using the spatiotemporal column: tgeompoint(sequence)
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'trips_passenger', num_tiles => 4,
-  table_name_out => 'trips_passenger_4t', tiling_method => 'crange', tiling_type => 'spatiotemporal');
+-- Distribute the trips table into 4 tiles using the spatiotemporal column: tgeompoint(sequence)
+SELECT create_spatiotemporal_distributed_table(table_name_in => 'trips', num_tiles => 4,
+  table_name_out => 'trips_4t', tiling_method => 'crange', tiling_type => 'spatiotemporal');
 
--- Distribute the truck trips into 2 tiles using the spatiotemporal column: tgeompoint(sequence)
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'trips_truck', num_tiles => 2,
-  table_name_out => 'trips_truck_2t', tiling_method => 'crange', tiling_type => 'spatiotemporal');
+-- Query 4: Which vehicles have passed the points from Points?
+SELECT DISTINCT p.PointId, p.Geom, v.Licence
+FROM trips_4t t, Vehicles v, Points p
+WHERE t.VehicleId = v.VehicleId
+  AND ST_Intersects(trajectory(t.Trip), p.Geom)
+ORDER BY p.PointId, v.Licence;
 
--- Distance-Join Query: Find passenger vehicles that were within 100m of truck vehicles.
-SELECT t1.VehicleId AS PassengerVehicleId, t2.VehicleId AS TruckVehicleId
-FROM trips_passenger_4t t1, trips_truck_2t t2
-WHERE eDWithin(t1.Trip, t2.Trip, 100);
-
--- Intersection-Join Query: Find passenger and truck vehicles whose trips ever crossed the same point.
-SELECT t1.VehicleId AS PassengerVehicleId, t2.VehicleId AS TruckVehicleId
-FROM trips_passenger_4t t1, trips_truck_2t t2
-WHERE eIntersects(t1.Trip, t2.Trip);
-
--- Temporal Query: What is the travelled distance of vehicles whose morning trip (8-9am) lasted more than 20 minutes?
-SELECT VehicleId, length(Trip) / 1000 AS travelledKms
-FROM trips_passenger_4t
-WHERE Trip && stbox 'stbox t([2020-06-01 08:00:00+02, 2020-06-01 09:00:00+02))'
-  AND duration(Trip) > '20 minutes';
+-- Query 6 (Distance-Join): What are the pairs of licence plate numbers of "trucks"
+-- that have ever been as close as 10m or less to each other?
+WITH Temp(Licence, VehicleId, Trip) AS (
+  SELECT v.Licence, t.VehicleId, t.Trip
+  FROM trips_4t t, Vehicles v
+  WHERE t.VehicleId = v.VehicleId AND v.VehicleType = 'truck'
+)
+SELECT t1.Licence, t2.Licence
+FROM Temp t1, Temp t2
+WHERE t1.VehicleId < t2.VehicleId
+  AND t1.Trip && expandSpace(t2.Trip, 10)
+  AND eDwithin(t1.Trip, t2.Trip, 10.0)
+ORDER BY t1.Licence, t2.Licence;
 ```
 
 ### Global Surface Summary of the Day (GSOD) Data
