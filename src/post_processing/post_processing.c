@@ -14,6 +14,7 @@
 
 #include "post_processing/post_processing.h"
 #include "planner/planner_strategies.h"
+#include "utils/helper_functions.h"
 
 
 /* Initialize Post Processing  */

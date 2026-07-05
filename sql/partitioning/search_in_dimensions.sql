@@ -56,6 +56,19 @@ BEGIN
     END IF;
     binValue := 0;
     LOOP
+        IF rounds > 100 THEN
+            -- Safety valve: the per-tile target can be unreachable (e.g. a
+            -- row count too small relative to the requested tile count
+            -- rounds the target down to 0, or the split point plateaus at
+            -- floating-point precision before ever exactly matching), which
+            -- would otherwise loop forever. Settle for the current best
+            -- split point instead of hanging indefinitely.
+            IF dim = 1 THEN
+                return midT::text;
+            ELSE
+                return mid::text;
+            END IF;
+        END IF;
         --Select mid
         IF dim = 1 THEN
             mobilitydb_bbox := STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(x1,y1),
@@ -79,9 +92,20 @@ BEGIN
         --SELECT getBinVal(tableName, tiling , mobilitydb_bbox, postgis_bbox)
         --INTO binValue;
         IF tiling.isMobilityDB THEN
-            EXECUTE format('%s', concat('SELECT count(*) FROM ',tableName,' ' ||
-                                                                          'WHERE setsrid(',tiling.distCol,',',tiling.srid,') && ''', mobilitydb_bbox,'''::stbox '))
-                INTO binValue;
+            -- For sequence(set) types, the search targets (tileNumPoints) are counted in
+            -- instants, not rows: count the instants of each row clipped to the candidate
+            -- box instead of the row count, or the search can never converge (a row count
+            -- of at most a few thousand trips can never approach a per-tile instant target
+            -- derived from hundreds of thousands of GPS pings).
+            IF tiling.internaltype IN ('sequence', 'sequenceset') THEN
+                EXECUTE format('%s', concat('SELECT sum(numInstants(atStbox(',tiling.distCol,', ''', mobilitydb_bbox,'''::stbox))) FROM ',tableName,' ' ||
+                                                                              'WHERE setsrid(',tiling.distCol,',',tiling.srid,') && ''', mobilitydb_bbox,'''::stbox '))
+                    INTO binValue;
+            ELSE
+                EXECUTE format('%s', concat('SELECT count(*) FROM ',tableName,' ' ||
+                                                                              'WHERE setsrid(',tiling.distCol,',',tiling.srid,') && ''', mobilitydb_bbox,'''::stbox '))
+                    INTO binValue;
+            END IF;
         ELSE
             EXECUTE format('%s', concat('SELECT count(*)
                 FROM ',tableName,' WHERE ',tiling.distCol,' && ''', postgis_bbox,'''::geometry'))

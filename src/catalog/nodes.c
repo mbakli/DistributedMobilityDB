@@ -17,6 +17,7 @@
 #include <executor/spi.h>
 #include "catalog/nodes.h"
 #include <utils/lsyscache.h>
+#include <utils/builtins.h>
 #include "executor/executor_tasks.h"
 #include "catalog/table_ops.h"
 
@@ -116,6 +117,55 @@ char * GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile)
 
     }
     return NULL;
+}
+
+/*
+ * GetShardHostNode looks up the (nodename, nodeport) actually hosting
+ * relationId's shard whose shardminvalue matches rand_tile, for dispatching
+ * a command to the specific worker that holds that tile's data (unlike
+ * GetNodeInfo(), which just picks a random node from pg_dist_node).
+ */
+extern TaskNode *
+GetShardHostNode(Oid relationId, int rand_tile)
+{
+    TaskNode *taskNode = (TaskNode *) palloc0(sizeof(TaskNode));
+    int spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    StringInfo logicalrel = makeStringInfo();
+    if (IsReshuffledTable(relationId))
+        appendStringInfo(logicalrel, "%s.%s", Var_Schema, get_rel_name(relationId));
+    else
+        appendStringInfo(logicalrel, "%s", get_rel_name(relationId));
+
+    StringInfo catalogQuery = makeStringInfo();
+    appendStringInfo(catalogQuery,
+                     "SELECT node.nodename, node.nodeport\n"
+                     "FROM pg_dist_shard shard\n"
+                     "JOIN pg_dist_placement placement ON placement.shardid = shard.shardid\n"
+                     "JOIN pg_dist_node node ON node.groupid = placement.groupid AND node.noderole = 'primary'\n"
+                     "WHERE shard.logicalrelid = '%s'::regclass\n"
+                     "  AND shard.shardminvalue = %d::text",
+                     logicalrel->data, rand_tile);
+    spi_result = SPI_execute(catalogQuery->data, true, 1);
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool isNull;
+        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
+        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
+        char *nodename = SPI_getvalue(row, rowDescriptor, 1);
+        taskNode->node = CStringGetTextDatum(nodename);
+        taskNode->port = DatumGetInt32(SPI_getbinval(row, rowDescriptor, 2, &isNull));
+    }
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+    return taskNode;
 }
 
 /* GetDBName returns the name of the database the current backend is connected to. */

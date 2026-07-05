@@ -17,7 +17,6 @@ DECLARE
     ystartVal float;
     xendVal float;
     yendVal float;
-    srid integer;
     dim_role integer;
     result text;
     org_table_name_in text;
@@ -123,12 +122,12 @@ BEGIN
                 SELECT BinarySearch(dim_role, table_name_in, tiling,tile_numPoints, tile_numShapes, xstartVal, xendVal, ystartVal, yendVal, tstartVal,tendVal)
                 INTO result;
                 tendVal := result::timestamptz;
-                SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+                SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
                 INTO tileSize.mobilitydb_extent;
                 tstartVal := tendVal ;
                 tendVal := tmax(extent.mobilitydb_extent);
             ELSE
-                SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+                SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
                 INTO tileSize.mobilitydb_extent;
             END IF;
             -- X Partitioning
@@ -138,7 +137,7 @@ BEGIN
                         SELECT BinarySearch(dim_role, table_name_in, tiling, tile_numPoints, tile_numShapes, xstartVal, xendVal, ystartVal, yendVal, tstartVal,tendVal)
                         INTO result;
                         xendVal := result::float;
-                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
                         INTO tileSize.mobilitydb_extent;
                         xstartVal := xendVal ;
                         xendVal := xmax(extent.mobilitydb_extent);
@@ -153,7 +152,7 @@ BEGIN
                     END IF;
                 ELSE
                     IF tiling.isMobilityDB THEN
-                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
                         INTO tileSize.mobilitydb_extent;
                     ELSE
                         SELECT ST_SetSRID(ST_MakeBox2D(ST_Point(xstartVal,ystartVal), ST_Point(xendVal, yendVal)), tiling.srid)
@@ -167,7 +166,7 @@ BEGIN
                         SELECT BinarySearch(dim_role, table_name_in, tiling,tile_numPoints, tile_numShapes, xstartVal, xendVal, ystartVal, yendVal, tstartVal,tendVal)
                         INTO result;
                         yendVal := result::float;
-                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
                         INTO tileSize.mobilitydb_extent;
                         ystartVal := yendVal ;
                         yendVal := ymax(extent.mobilitydb_extent);
@@ -182,7 +181,7 @@ BEGIN
                     END IF;
                 ELSE
                     IF tiling.isMobilityDB THEN
-                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+                        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
                         INTO tileSize.mobilitydb_extent;
                     ELSE
                         SELECT ST_SetSRID(ST_MakeBox2D(ST_Point(xstartVal,ystartVal), ST_Point(xendVal, yendVal)), tiling.srid)
@@ -201,7 +200,7 @@ BEGIN
                 EXECUTE format('%s', concat('SELECT count(distinct ',tiling.groupCol,'), count(*) FROM ',table_name_in,' WHERE ''',tileSize.postgis_extent,'''::box2d && ',tiling.distCol))
                 INTO tileSize.numShapes, tileSize.numPoints;
             ELSIF tiling.internaltype in ('sequence', 'sequenceset') THEN
-                EXECUTE format('%s', concat('SELECT count(*), sum(numInstants(aStbox(',tiling.distCol,', ''',tileSize.mobilitydb_extent,'''::stbox))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && ''',tileSize.mobilitydb_extent,'''::stbox'))
+                EXECUTE format('%s', concat('SELECT count(*), sum(numInstants(atStbox(',tiling.distCol,', ''',tileSize.mobilitydb_extent,'''::stbox))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && ''',tileSize.mobilitydb_extent,'''::stbox'))
                 INTO tileSize.numShapes, tileSize.numPoints;
             ELSIF tiling.internaltype in ('linestring', 'polygon', 'multilinestring', 'multipolygon') THEN
                 EXECUTE format('%s', concat('SELECT count(*), sum(st_npoints(st_intersection(',tiling.distCol,', st_setsrid(''',tileSize.postgis_extent,'''::box2d::geometry,',tiling.srid,')))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && st_setsrid(''',tileSize.postgis_extent,'''::box2d::geometry,',tiling.srid,') AND st_intersects(', tiling.distCol, ',st_setsrid(''', tileSize.postgis_extent,'''::box2d::geometry,',tiling.srid,'));'))
@@ -293,7 +292,7 @@ BEGIN
         SELECT BinarySearch(dim_role, table_name_in, tiling,tile_numPoints, tile_numShapes, xstartVal, xendVal, ystartVal, yendVal, tstartVal,tendVal)
         INTO result;
         tendVal := result::timestamptz;
-        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+        SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
         INTO tileSize.mobilitydb_extent;
         tstartVal := tendVal;
         tendVal := tmax(extent.mobilitydb_extent);
@@ -303,7 +302,7 @@ BEGIN
             SELECT BinarySearch(dim_role, table_name_in, tiling, tile_numPoints, tile_numShapes, xstartVal, xendVal, ystartVal, yendVal, tstartVal,tendVal)
             INTO result;
             xendVal := result::float;
-            SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), srid), tstzrange(tstartVal, tendVal)::tstzspan)
+            SELECT STBOX(ST_SetSrid(ST_Envelope(ST_MakeLine(ST_MakePoint(xstartVal,ystartVal), ST_MakePoint(xendVal, yendVal))), tiling.srid), tstzrange(tstartVal, tendVal)::tstzspan)
             INTO tileSize.mobilitydb_extent;
             xstartVal := xendVal ;
             xendVal := xmax(extent.mobilitydb_extent);
@@ -325,7 +324,7 @@ BEGIN
         EXECUTE format('%s', concat('SELECT count(distinct ',tiling.groupCol,'), count(*) FROM ',table_name_in,' WHERE ''',tileSize.postgis_extent,'''::box2d && ',tiling.distCol))
             INTO tileSize.numShapes, tileSize.numPoints;
     ELSIF tiling.internaltype in ('sequence', 'sequenceset') THEN
-        EXECUTE format('%s', concat('SELECT count(*), sum(numInstants(aStbox(',tiling.distCol,', ''',tileSize.mobilitydb_extent,'''::stbox))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && ''',tileSize.mobilitydb_extent,'''::stbox'))
+        EXECUTE format('%s', concat('SELECT count(*), sum(numInstants(atStbox(',tiling.distCol,', ''',tileSize.mobilitydb_extent,'''::stbox))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && ''',tileSize.mobilitydb_extent,'''::stbox'))
             INTO tileSize.numShapes, tileSize.numPoints;
     ELSIF tiling.internaltype in ('linestring', 'polygon', 'multilinestring', 'multipolygon') THEN
         EXECUTE format('%s', concat('SELECT count(*), sum(st_npoints(st_intersection(',tiling.distCol,', st_setsrid(''',tileSize.postgis_extent,'''::box2d::geometry, ',tiling.srid,')))) FROM ',table_name_in,' WHERE ',tiling.distCol,' && st_setsrid(''',tileSize.postgis_extent,'''::box2d::geometry,',tiling.srid,') AND st_intersects(', tiling.distCol, ',st_setsrid(''', tileSize.postgis_extent,'''::box2d::geometry, ',tiling.srid,'));'))

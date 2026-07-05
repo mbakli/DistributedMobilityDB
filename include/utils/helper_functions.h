@@ -38,4 +38,10 @@ extern char *toLower(char *str);
 
 /* True if val is a NULL/zero Datum (no value set). */
 extern bool IsDatumEmpty(Datum val);
+
+/* Renders datum (of the given PostgreSQL type oid) as a palloc'd C string via its type's output function. */
+extern char *DatumToString(Datum datum, Oid typeoid);
+
+/* Runs query via SPI, erroring out if its result status doesn't match expectedSpiOk (an SPI_OK_* constant). */
+extern void ExecuteQueryViaSPI(char *query, int expectedSpiOk);
 #endif /* HELPER_FUNCTIONS_H */

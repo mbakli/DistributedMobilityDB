@@ -17,7 +17,11 @@
 #include "executor/multi_phase_executor.h"
 #include <distributed/multi_join_order.h>
 #include <distributed/multi_executor.h>
+#include <distributed/distribution_column.h>
+#include <catalog/namespace.h>
+#include <access/xact.h>
 #include "utils/planner_utils.h"
+#include "utils/helper_functions.h"
 #include "planner/planner_strategies.h"
 
 static void ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,
@@ -33,6 +37,7 @@ static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *di
                                            MultiPhaseExecutor *multiPhaseExecutor);
 static void IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
 static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor);
+static char *EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate);
 
 
 
@@ -134,7 +139,13 @@ ColocateRte(STMultirelation *base, Rte *other)
         char *reshuffled_table = get_rel_name(cell->relid);
         Var *distributionColumn = DistPartitionKey(base->catalogTableInfo.table_oid);
         int shardCount = ShardIntervalCount(base->catalogTableInfo.table_oid);
-        char *parentRelationName = NULL;
+        /* Citus rejects colocate_with for range-distributed tables
+         * ("colocate_with option is not supported for append / range
+         * distributed tables"), so this stays "default"; physical
+         * co-location with base is instead done after the fact by
+         * colocate_shards() in create_reshuffled_multirelation, which
+         * explicitly moves each shard onto base's matching-tile node. */
+        char *parentRelationName = "default";
 
         DropReshuffledTableIfExists(citusRteNode->reshuffledTable);
         CreateReshuffledTableIfNotExists(citusRteNode->reshuffledTable,
@@ -148,9 +159,10 @@ ColocateRte(STMultirelation *base, Rte *other)
                                    "relation %s does not exist", get_rel_name(reshuffled_table_oid))));
         }
         relation_close(relation, NoLock);
-        CreateDistributedTable(reshuffled_table_oid, distributionColumn,
+        CreateDistributedTable(reshuffled_table_oid,
+                               ColumnToColumnName(base->catalogTableInfo.table_oid, (Node *) distributionColumn),
                                DISTRIBUTE_BY_RANGE, shardCount, true,
-                               parentRelationName, true);
+                               parentRelationName);
 
         RearrangeTiles(base->catalogTableInfo.table_oid, base->catalogTableInfo.numTiles,
                        citusRteNode->reshuffledTable);
@@ -175,7 +187,13 @@ createReshuffledTable(STMultirelation *base, STMultirelation *other)
     char *reshuffled_table = get_rel_name(other->catalogTableInfo.table_oid);
     Var *distributionColumn = DistPartitionKey(other->catalogTableInfo.table_oid);
     int shardCount = ShardIntervalCount(base->catalogTableInfo.table_oid);
-    char *parentRelationName = NULL;
+    /* Citus rejects colocate_with for range-distributed tables
+     * ("colocate_with option is not supported for append / range
+     * distributed tables"), so this stays "default"; physical
+     * co-location with base is instead done after the fact by
+     * colocate_shards() in create_reshuffled_multirelation, which
+     * explicitly moves each shard onto base's matching-tile node. */
+    char *parentRelationName = "default";
 
     DropReshuffledTableIfExists(other->catalogTableInfo.reshuffledTable);
     CreateReshuffledTableIfNotExists(other->catalogTableInfo.reshuffledTable,
@@ -189,9 +207,10 @@ createReshuffledTable(STMultirelation *base, STMultirelation *other)
                                "relation %s does not exist", get_rel_name(reshuffled_table_oid))));
     }
     relation_close(relation, NoLock);
-    CreateDistributedTable(reshuffled_table_oid, distributionColumn,
+    CreateDistributedTable(reshuffled_table_oid,
+                           ColumnToColumnName(other->catalogTableInfo.table_oid, (Node *) distributionColumn),
                            DISTRIBUTE_BY_RANGE, shardCount, true,
-                           parentRelationName, true);
+                           parentRelationName);
 
     RearrangeTiles(base->catalogTableInfo.table_oid, base->catalogTableInfo.numTiles,
                    other->catalogTableInfo.reshuffledTable);
@@ -268,7 +287,7 @@ ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,
         if (stMultirelation->catalogFilter->candidates > stMultirelation->catalogTableInfo.numTiles)
             task->catalog_filtered = stMultirelation->catalogFilter;
         appendStringInfo(task->taskQuery, "%s",
-                         DatumGetCString(AddTilingKey(stMultirelation->catalogTableInfo, tbl->alias, query_string)));
+                         DatumGetCString(AddTilingKey(stMultirelation->catalogTableInfo, tbl->alias, base->alias, query_string)));
     }
     else if (tbl->RteType == CitusRte)
     {
@@ -383,14 +402,34 @@ IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor
     else
         multiPhaseExecutor->indexCreated = false;
 
-    /*
     spi_result = SPI_finish();
     if (spi_result != SPI_OK_FINISH)
     {
         elog(ERROR, "Could not disconnect from database using SPI");
     }
-     */
 
+}
+
+/*
+ * EliminateShapeSegmentDuplicates removes shape-segmentation duplicates from
+ * query_string by wrapping it as `SELECT DISTINCT * FROM (query_string) AS
+ * x`, deduping on whatever the query actually projects. Only applied when
+ * no distributed aggregate is involved (see hasDistributedAggregate at the
+ * call site) -- for an aggregate like count(*), the duplicates are already
+ * consumed before this outer DISTINCT would ever see them, so this is left
+ * as a no-op (returns NULL) for that case rather than risking a rewrite
+ * Citus' planner may reject for non-colocated repartition joins.
+ */
+static char *
+EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate)
+{
+    if (hasDistributedAggregate)
+        return NULL;
+
+    char *innerQuery = replaceWord(query_string, ";", " ");
+    StringInfo dedupedQuery = makeStringInfo();
+    appendStringInfo(dedupedQuery, "SELECT DISTINCT * FROM (%s) AS dedup_result", innerQuery);
+    return dedupedQuery->data;
 }
 
 /*
@@ -439,6 +478,29 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
         }
         else
             elog(ERROR, "The query executor could not identify the planner strategy");
+    }
+    /* NonColocation/Colocation strategies reshuffle onto tiles built from a
+     * spatiotemporal shape, which can place the same row's shape-segmented
+     * copy in more than one tile so a boundary-crossing match isn't missed
+     * -- see checkQueryType's dupRemOperator->active assignment. That makes
+     * the worker-phase join above contain the same logical match
+     * (base_row1, base_row2) more than once. This has to be resolved here,
+     * on the flat two-table query before the coordinator/aggregate-rewriter
+     * wrapping below nests it inside a "select sum(...) from (...) as fQ"
+     * subquery -- once that wrapping happens, ExtractRangeTableEntryList
+     * sees three range table entries (the subquery plus its two inner
+     * tables) instead of the two this rewrite expects, and any duplicate
+     * rows have already been consumed by the inner aggregate anyway. */
+    if (distPlan->postProcessing->coordinatorLevelOperator->dupRemOperator->active)
+    {
+        bool hasDistributedAggregate = list_length(distPlan->postProcessing->distfuns) > 0;
+        char *deduped = EliminateShapeSegmentDuplicates(generalScan->query_string->data,
+                                                        hasDistributedAggregate);
+        if (deduped != NULL)
+        {
+            resetStringInfo(generalScan->query_string);
+            appendStringInfo(generalScan->query_string, "%s", deduped);
+        }
     }
     /* Loop though the post processing tasks */
     if (generalScan->length == 0)

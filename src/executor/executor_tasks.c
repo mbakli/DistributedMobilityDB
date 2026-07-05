@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include "executor/executor_tasks.h"
 #include "distributed_functions/distributed_function.h"
+#include "utils/helper_functions.h"
 
 /*
  * ProcessIntermediateTasks builds the worker-phase (INTERMEDIATEScan) task

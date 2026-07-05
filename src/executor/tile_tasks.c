@@ -16,6 +16,7 @@
 #include <utils/snapmgr.h>
 #include <utils/lsyscache.h>
 #include <executor/spi.h>
+#include <access/xact.h>
 #include "executor/tile_tasks.h"
 #include "utils/helper_functions.h"
 #include "general/rte.h"
@@ -65,11 +66,16 @@ RearrangeTiles(Oid relid, int numTiles, char *reshuffledTable)
 /*
  * AddTilingKey rewrites query_string so it targets the reshuffled table
  * (dist_mobilitydb.<reshuffledTable> instead of the original table name)
- * and replaces its `where` clause with a tile-key equality predicate,
- * ensuring the neighbor scan only compares rows sharing the same tile.
+ * and replaces its `where` clause with a tile-key equality predicate
+ * between alias (tblCatalog's own alias) and otherAlias (the base table's
+ * alias), ensuring the neighbor scan only compares rows sharing the same
+ * tile. A prior revision used `alias` on both sides of the equality (always
+ * comparing a table's tile_key to itself), which built a nonsensical
+ * self-referential predicate and produced a malformed query once folded
+ * into the caller's WHERE clause.
  */
 Datum
-AddTilingKey(STMultirelationCatalog tblCatalog, Alias *alias ,char * query_string)
+AddTilingKey(STMultirelationCatalog tblCatalog, Alias *alias, Alias *otherAlias, char * query_string)
 {
     StringInfo tmp = makeStringInfo();
     StringInfo task_prep = makeStringInfo();
@@ -79,7 +85,7 @@ AddTilingKey(STMultirelationCatalog tblCatalog, Alias *alias ,char * query_strin
 
     resetStringInfo(tmp);
     appendStringInfo(tmp, "WHERE %s.%s = %s.%s AND", alias->aliasname, tblCatalog.tileKey,
-                     alias->aliasname, tblCatalog.tileKey);
+                     otherAlias->aliasname, tblCatalog.tileKey);
     return CStringGetDatum(replaceWord( replaceWord(task_prep->data,"where", tmp->data), ";", " "));
 }
 

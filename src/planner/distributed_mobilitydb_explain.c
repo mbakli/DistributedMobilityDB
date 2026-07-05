@@ -18,8 +18,14 @@
 #include <utils/lsyscache.h>
 #include <distributed/multi_explain.h>
 #include "distributed/listutils.h"
+#include "distributed/distributed_planner.h"
+#include "utils/helper_functions.h"
+#include "utils/planner_utils.h"
 #include "catalog/nodes.h"
 #include "planner/planner_strategies.h"
+#include <tcop/tcopprot.h>
+#include <executor/spi.h>
+#include <utils/builtins.h>
 
 
 static Node *SpatiotemporalExecutorCreateScan(CustomScan *scan);
@@ -38,6 +44,8 @@ static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, Expla
 static void ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
 static void ExplainOneTask(ExecutorTask *task, STMultirelation *base, ExplainState *es, int indent_group);
 static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile);
+static char * ExplainOnHostingWorker(char *query_string, ExecTaskType taskType, int rand_tile,
+                                     TaskNode *taskNode);
 
 /* create custom scan method for the spatiotemporal executor */
 CustomScanMethods SpatiotemporalExecutorMethod = {
@@ -67,14 +75,22 @@ distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into
     DistributedQueryExplain *curDistributedQueryExplain = (DistributedQueryExplain *)
             palloc0(sizeof(DistributedQueryExplain));
     InitializeDistributedQueryExplain(curDistributedQueryExplain, es, queryString);
-    PlannedStmt *result = distributed_mobilitydb_planner_internal(curDistributedQueryExplain->query,
+    /* Plan a copy: planning mutates the Query tree in place, and `query`
+     * itself must stay pristine in case we fall back to CitusExplainOneQuery
+     * below, which plans it again from scratch. */
+    PlannedStmt *result = distributed_mobilitydb_planner_internal(copyObject(query),
                                                           curDistributedQueryExplain->query_string,
                                                           cursorOptions, params,
                                                           distPlan, true);
 
-    /* Delegating it to Citus*/
+    /* If our custom planning bailed out, the query was already handled by
+     * Citus/Postgres directly and distPlan was never fully populated -
+     * delegate the explain output to Citus and skip our custom section. */
     if (result != NULL)
+    {
         CitusExplainOneQuery(query,cursorOptions,into,es,queryString,params,queryEnv);
+        return;
+    }
 
     /* Explain using Distributed MobilityDB  */
     ExplainOpenGroup("DistributedQueryExplain", "Distributed Query", true, es);
@@ -117,9 +133,7 @@ InitializeDistributedQueryExplain(DistributedQueryExplain *distributedQueryExpla
 {
     StringInfo tmp = makeStringInfo();
     appendStringInfo(tmp, "%s", replaceWord(toLower((char *)queryString), "explain ", ""));
-    distributedQueryExplain->query_string = palloc((strlen(tmp->data) + 1) * sizeof (char));
     distributedQueryExplain->query_string = tmp->data;
-    distributedQueryExplain->query = ParseQueryString(tmp->data, NULL, 0);
 }
 
 /*
@@ -251,27 +265,51 @@ ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState
     }
 }
 /*
- * ExplainOneTask plans and (via ExplainWorkerPlan) prints the local plan
- * for a single, randomly-chosen tile of `task`, substituting that tile's
- * concrete shard identifier into the task's query (GetLocalQuery) so it
- * can be planned as an ordinary local query.
+ * ExplainOneTask prints the plan for a single, randomly-chosen tile of
+ * `task`. Since colocate_shards() (see create_reshuffled_multirelation)
+ * physically moves each reshuffled shard onto the same worker as its
+ * matching-tile shard of the base table, a tile's join is ordinarily a
+ * genuine single-node operation -- so we first try ExplainOnHostingWorker(),
+ * which dispatches a real local EXPLAIN (using the concrete shard tables) to
+ * that one worker and returns Postgres' own plan, with no Citus wrapper at
+ * all. If the tiles turn out not to be co-located (a stale/partial
+ * reshuffle, or a straggler placement), that returns NULL and we fall back
+ * to planning the query through Citus' distributed_planner() directly
+ * (bypassing this extension's own planner_hook, since these tables are
+ * already-registered distributed spatiotemporal tables and would otherwise
+ * recurse back into our own planning here), which shows the real cross-node
+ * repartition instead of a misleading local-only plan.
  */
 static void
 ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int indent_group)
 {
     int rand_tile = GetRandTileNum(base);
+    TaskNode *taskNode = GetShardHostNode(base->catalogTableInfo.table_oid, rand_tile);
 
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
-    TaskNode *taskNode = GetNodeInfo();
     appendStringInfo(es->str, "Node: host=%s ", DatumToString(taskNode->node, TEXTOID));
     appendStringInfo(es->str, "port=%d ", taskNode->port);
-    appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(taskNode->db));
-    appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
+    appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(GetDBName()));
 
     char *OneTileQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid,
                                        task->taskType, rand_tile);
+    appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
+    appendStringInfo(es->str, "Query: %s\n", OneTileQuery);
+    appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
+
+    char *localPlanText = ExplainOnHostingWorker(task->taskQuery->data, task->taskType,
+                                                 rand_tile, taskNode);
+    if (localPlanText != NULL)
+    {
+        es->indent += 6;
+        appendStringInfoSpaces(es->str, es->indent * indent_group);
+        appendStringInfo(es->str, "%s\n", localPlanText);
+        es->indent -= 6;
+        return;
+    }
+
     Query *parse = ParseQueryString(OneTileQuery, NULL, 0);
-    PlannedStmt *plan = pg_plan_query_compat(parse, NULL, 0, NULL);
+    PlannedStmt *plan = distributed_planner(parse, OneTileQuery, 0, NULL);
     instr_time planduration;
     INSTR_TIME_SET_ZERO(planduration);
     es->indent += 6;
@@ -282,50 +320,107 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
 }
 
 /*
- * GetLocalQuery rewrites query_string so that every distributed table name
- * it references is replaced by the concrete shard/tile identifier chosen
- * for it (GetRandomTileId), producing a plain local query that EXPLAIN can
- * plan directly.
+ * GetLocalQuery pins query_string to one representative tile by appending a
+ * literal `<alias>.tile_key = rand_tile` predicate for every range table
+ * entry it references, so Citus' shard pruning narrows each table down to
+ * the single matching shard instead of planning across all of them.
  */
 static char *
 GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile)
 {
+    if (query_string == NULL)
+        return NULL;
 
-    if (query_string != NULL)
+    Query *query = ParseQueryString(query_string, NULL, 0);
+    List *rangeTableList = ExtractRangeTableEntryList(query);
+    StringInfo pinnedQuery = makeStringInfo();
+    appendStringInfo(pinnedQuery, "%s", query_string);
+
+    ListCell *rangeTableCell = NULL;
+    foreach(rangeTableCell, rangeTableList)
     {
-        Query *query = ParseQueryString(query_string, NULL, 0);
-        ListCell *rangeTableCell = NULL;
-        List *rangeTableList = ExtractRangeTableEntryList(query);
-        StringInfo final_query = makeStringInfo();
-        StringInfo replace = makeStringInfo();
-        appendStringInfo(final_query, "%s", query_string);
-        RangeTblEntry *reshuffledTableEntry;
-        StringInfo tileId = makeStringInfo();
-        foreach(rangeTableCell, rangeTableList)
-        {
-            RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-            // Get random tile key
-            appendStringInfo(tileId, "%s", GetRandomTileId(rangeTableEntry->relid, taskType, rand_tile));
+        RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+        appendStringInfo(pinnedQuery, " AND %s.%s = %d", rangeTableEntry->eref->aliasname,
+                         Var_Catalog_Tile_Key, rand_tile);
+    }
 
-            StringInfo t = makeStringInfo();
-            if (IsReshuffledTable(rangeTableEntry->relid))
-                appendStringInfo(t, "%s.%s", Var_Schema, get_rel_name(rangeTableEntry->relid));
-            else
-                appendStringInfo(t, "%s ", get_rel_name(rangeTableEntry->relid));
-            // Replace it in the query string
-            appendStringInfo(replace, "%s ", replaceWord(final_query->data, t->data,
-                                                         tileId->data));
-            resetStringInfo(t);
-            resetStringInfo(final_query);
-            appendStringInfo(final_query, "%s", replace->data);
-            resetStringInfo(replace);
-            resetStringInfo(tileId);
+    return pinnedQuery->data;
+}
+
+/*
+ * ExplainOnHostingWorker checks that every table referenced by query_string
+ * has its rand_tile shard physically co-located on taskNode; if so, it
+ * substitutes each logical table name for its concrete shard-qualified name
+ * and runs `EXPLAIN (FORMAT JSON)` for the resulting local query directly on
+ * that worker via run_command_on_workers() (JSON format always returns
+ * exactly one row, which run_command_on_workers() requires), returning the
+ * pretty-printed plan. Returns NULL -- signalling the caller to fall back to
+ * a Citus-routed explain -- if any table's matching tile lives elsewhere, or
+ * the dispatch itself fails.
+ */
+static char *
+ExplainOnHostingWorker(char *query_string, ExecTaskType taskType, int rand_tile, TaskNode *taskNode)
+{
+    char *targetNode = DatumToString(taskNode->node, TEXTOID);
+    Query *query = ParseQueryString(query_string, NULL, 0);
+    List *rangeTableList = ExtractRangeTableEntryList(query);
+    StringInfo physicalQuery = makeStringInfo();
+    appendStringInfo(physicalQuery, "%s", query_string);
+
+    ListCell *rangeTableCell = NULL;
+    foreach(rangeTableCell, rangeTableList)
+    {
+        RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+
+        TaskNode *rteNode = GetShardHostNode(rangeTableEntry->relid, rand_tile);
+        if (rteNode->node == (Datum) 0 || rteNode->port != taskNode->port ||
+            strcmp(DatumToString(rteNode->node, TEXTOID), targetNode) != 0)
+        {
+            return NULL;
         }
 
-        return final_query->data;
+        StringInfo tableName = makeStringInfo();
+        if (IsReshuffledTable(rangeTableEntry->relid))
+            appendStringInfo(tableName, "%s.%s", Var_Schema, get_rel_name(rangeTableEntry->relid));
+        else
+            appendStringInfo(tableName, "%s ", get_rel_name(rangeTableEntry->relid));
 
+        char *shardName = GetRandomTileId(rangeTableEntry->relid, taskType, rand_tile);
+        char *rewritten = replaceWord(physicalQuery->data, tableName->data, shardName);
+        resetStringInfo(physicalQuery);
+        appendStringInfo(physicalQuery, "%s", rewritten);
     }
-    return 0;
+
+    StringInfo explainCommand = makeStringInfo();
+    appendStringInfo(explainCommand, "EXPLAIN (FORMAT JSON) %s", physicalQuery->data);
+
+    int spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    StringInfo dispatchQuery = makeStringInfo();
+    appendStringInfo(dispatchQuery,
+                     "SELECT jsonb_pretty(result::jsonb) FROM run_command_on_workers(%s) "
+                     "WHERE nodename = %s AND nodeport = %d AND success",
+                     quote_literal_cstr(explainCommand->data),
+                     quote_literal_cstr(targetNode), taskNode->port);
+    spi_result = SPI_execute(dispatchQuery->data, true, 1);
+
+    char *planText = NULL;
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        planText = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+    }
+
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+
+    return planText;
 }
 
 static void

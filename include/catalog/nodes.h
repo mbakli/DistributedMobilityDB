@@ -23,6 +23,9 @@ extern Datum GetDBName();
 /* Coordinator/worker node info (host, port, role) for the local backend. */
 extern TaskNode *GetNodeInfo();
 
+/* Node (host, port) actually hosting relationId's shard for rand_tile. */
+extern TaskNode *GetShardHostNode(Oid relationId, int rand_tile);
+
 /* Table id of the tile assigned to a randomly-picked worker for relationId. */
 extern char* GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile);
 

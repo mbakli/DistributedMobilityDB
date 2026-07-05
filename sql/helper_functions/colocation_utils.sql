@@ -34,47 +34,38 @@ END;
 $$;
 
 ----------------------------------------------------------------------------------------------------------------------
--- colocate_multirelation colocates one multirelation with another
+-- colocate_shards physically moves table2's shards so each one lands on the
+-- same node as table1's shard sharing the same tile_key range (shardminvalue).
+-- Citus' own colocate_with option doesn't support range-distributed tables,
+-- so this does the move explicitly with citus_move_shard_placement() instead
+-- of relying on Citus' colocation groups.
 ----------------------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION colocate_multirelation(table1 text, table2 text)
+DROP FUNCTION IF EXISTS colocate_multirelation;
+CREATE OR REPLACE FUNCTION colocate_shards(table1 text, table2 text)
     RETURNS boolean
 LANGUAGE plpgsql
 AS $$
 DECLARE
-i integer;
-    shard_info record;
-    node_info record;
-    node text;
-    shardid_test bigint;
+    tile_pair record;
 BEGIN
-    --Move one of them to a new place because one node contains 10 and the other contains 11
-    --It is an enterpise feature
-    --SELECT master_move_shard_placement(102660,'pgxl4', 5432,'pgxl2', 5432);
-    --For every node, update shards information
-    FOR node_info in SELECT * FROM master_get_active_worker_nodes()
+    FOR tile_pair IN
+        SELECT s2.shardid AS moving_shard,
+               n1.nodename AS target_node, n1.nodeport AS target_port,
+               n2.nodename AS source_node, n2.nodeport AS source_port
+        FROM pg_dist_shard s1
+        JOIN pg_dist_placement p1 ON p1.shardid = s1.shardid
+        JOIN pg_dist_node n1 ON n1.groupid = p1.groupid AND n1.noderole = 'primary'
+        JOIN pg_dist_shard s2 ON s2.shardminvalue = s1.shardminvalue
+        JOIN pg_dist_placement p2 ON p2.shardid = s2.shardid
+        JOIN pg_dist_node n2 ON n2.groupid = p2.groupid AND n2.noderole = 'primary'
+        WHERE s1.logicalrelid = table1::regclass
+          AND s2.logicalrelid = table2::regclass
+          AND (n1.nodename, n1.nodeport) IS DISTINCT FROM (n2.nodename, n2.nodeport)
     LOOP
-        i = 0;
-        --Get the shards of every table in every node
-        FOR shard_info in SELECT shard.shardid, shard.shardminvalue, shard.shardmaxvalue
-                          FROM pg_dist_placement AS placement, pg_dist_node AS node, pg_dist_shard As shard
-                          WHERE placement.groupid = node.groupid
-                            AND shard.logicalrelid = table1::regclass
-                            AND placement.shardid = shard.shardid
-                            AND node.noderole = 'primary'
-                            AND nodename=node_info.node_name
-        LOOP
-                SELECT shard.shardid
-                FROM pg_dist_placement AS placement, pg_dist_node AS node, pg_dist_shard As shard
-                WHERE placement.groupid = node.groupid
-                    AND shard.logicalrelid = table2::regclass
-                    AND placement.shardid = shard.shardid
-                    AND node.noderole = 'primary'
-                    AND nodename=node_info.node_name offset i limit 1 INTO shardid_test;
-                --RAISE NOTICE 'Update:%',shardid_test;
-                UPDATE pg_dist_shard SET shardminvalue = shard_info.shardminvalue, shardmaxvalue=shard_info.shardmaxvalue
-                WHERE shardid = shardid_test;
-                i := i + 1;
-        END LOOP;
+        PERFORM citus_move_shard_placement(tile_pair.moving_shard,
+                                           tile_pair.source_node, tile_pair.source_port,
+                                           tile_pair.target_node, tile_pair.target_port,
+                                           'block_writes');
     END LOOP;
     RETURN TRUE;
 END;
@@ -101,11 +92,15 @@ i integer;
     results json;
 BEGIN
     PERFORM create_range_shards(shards, reshuffled_table);
-    --Modify the ranges
-    UPDATE pg_catalog.pg_dist_partition
-    SET colocationid=2
-    WHERE logicalrelid=reshuffled_table::regclass;
-    PERFORM colocate_multirelation(tableName, reshuffled_table);
+    /* create_range_shards() above already assigns reshuffled_table's shards
+     * the correct tile_key-aligned ranges (1..shards), matching tableName's
+     * own tile numbering by convention -- both tables tile the same way.
+     * Citus' shard placement for the newly-created shards is otherwise
+     * independent of tableName's placement, so without this, a tile-key
+     * join between the two tables is a cross-node repartition even though
+     * both sides cover the same tile_key range. colocate_shards() moves
+     * each of reshuffled_table's shards onto tableName's matching-tile node. */
+    PERFORM colocate_shards(tableName, reshuffled_table);
 RETURN true;
 END;
 $$;

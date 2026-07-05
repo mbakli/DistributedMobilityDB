@@ -23,6 +23,34 @@
 static float GetDistanceVal(Node *node);
 
 /*
+ * GetPredicateOidAndArgs normalizes an OpExpr or FuncExpr WHERE-clause node
+ * into a (callable oid, args) pair. MobilityDB/PostGIS predicates such as
+ * eDwithin(...)/ST_Intersects(...) parse as FuncExpr, not OpExpr -- treating
+ * every predicate as an OpExpr (as earlier revisions of this function did)
+ * silently misidentified them (and risked undefined behavior reading
+ * OpExpr-shaped fields out of a FuncExpr node).
+ */
+extern bool
+GetPredicateOidAndArgs(Node *clause, Oid *oid, List **args)
+{
+    if (IsA(clause, OpExpr))
+    {
+        OpExpr *opExpr = (OpExpr *) clause;
+        *oid = opExpr->opno;
+        *args = opExpr->args;
+        return true;
+    }
+    else if (IsA(clause, FuncExpr))
+    {
+        FuncExpr *funcExpr = (FuncExpr *) clause;
+        *oid = funcExpr->funcid;
+        *args = funcExpr->args;
+        return true;
+    }
+    return false;
+}
+
+/*
  * analyseDistancePredicate analyses the distance predicate.
  */
 extern DistancePredicate *analyseDistancePredicate(Node *clause)
@@ -56,9 +84,13 @@ IsIntersectionOperation(Oid operationId)
 static float
 GetDistanceVal(Node *node)
 {
-    OpExpr *opExpr = (OpExpr *) node;
+    Oid oid;
+    List *args;
     ListCell *arg;
-    foreach(arg, opExpr->args)
+
+    if (!GetPredicateOidAndArgs(node, &oid, &args))
+        return 0;
+    foreach(arg, args)
     {
         Node *dist_node = (Node *) lfirst(arg);
         if (IsA(dist_node, Const))
@@ -87,12 +119,17 @@ IsDistanceOperation(Oid operationId)
     return heapTupleIsValid;
 }
 
-/* get_query_range extracts the constant bounding-box argument from opExpr, if any, as its search range. */
+/* get_query_range extracts the constant bounding-box argument from clause, if any, as its search range. */
 extern Datum
-get_query_range(STMultirelations *tbls, OpExpr *opExpr)
+get_query_range(STMultirelations *tbls, Node *clause)
 {
+    Oid oid;
+    List *args;
     ListCell *arg;
-    foreach(arg, opExpr->args)
+
+    if (!GetPredicateOidAndArgs(clause, &oid, &args))
+        return 0;
+    foreach(arg, args)
     {
         Node *dist_node = (Node *) lfirst(arg);
         if (IsA(dist_node, Const))
@@ -112,7 +149,7 @@ get_query_range(STMultirelations *tbls, OpExpr *opExpr)
  * see TileScanRebalanceStrategyPlan() in planner_strategies.c.
  */
 extern bool
-CheckTileRebalancerActivation(STMultirelations *tbls, OpExpr *opExpr, Datum box)
+CheckTileRebalancerActivation(STMultirelations *tbls, Node *clause, Datum box)
 {
     /* Currently I removed the rebalacer to fix the citus issue */
     return false;
