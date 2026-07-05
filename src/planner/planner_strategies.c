@@ -537,15 +537,53 @@ PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 {
     PlanTask * strategy = (PlanTask *) palloc0(sizeof(PlanTask));
     strategy->type = PredicatePushDown;
-    strategy->tbl1 = (STMultirelation *) list_nth(distPlan->tablesList->tables, 0);
-    strategy->tbl2 = (STMultirelation *) list_nth(distPlan->tablesList->tables, 1);
+    /* tablesList->tables holds Rte wrappers (STRte/CitusRte/LocalRte), not
+     * bare STMultirelation pointers -- list_nth(...)[0]/[1] cast directly
+     * to STMultirelation* (as this used to) read a Citus/local reference
+     * table's Rte wrapper as if it were the spatiotemporal table's own
+     * struct whenever one of the query's other tables sorted before it, a
+     * type confusion that left task->catalog_filtered pointing at garbage
+     * and crashed EXPLAIN's "Task Count: %d" (task->catalog_filtered->
+     * candidates). Find the actual STRte entry instead; PredicatePushDown
+     * only ever needs the one spatiotemporal table its predicate pushes
+     * down onto (see ConstructPredicatePushDownQuery, which only reads
+     * tbl1), so tbl2 is left unset.
+     */
+    ListCell *rangeTableCell = NULL;
+    STMultirelation *stTable = NULL;
+    foreach(rangeTableCell, distPlan->tablesList->tables)
+    {
+        Rte *rteNode = (Rte *) lfirst(rangeTableCell);
+        if (rteNode->RteType == STRte)
+        {
+            stTable = (STMultirelation *) rteNode->rte;
+            break;
+        }
+    }
+    if (stTable == NULL)
+        ereport(ERROR, (errmsg("PredicatePushDown strategy requires a spatiotemporal table")));
+    strategy->tbl1 = stTable;
     strategy->tileKey = (Datum) Var_Catalog_Tile_Key;
     distPlan->strategyPlans = lappend(distPlan->strategyPlans, strategy);
 }
 
-/* AddStrategy appends `type` to distPlan's list of chosen StrategyTypes. */
+/* AddStrategy appends `type` to distPlan's list of chosen StrategyTypes, if
+ * not already present. checkQueryType calls this once per registered
+ * predicate clause, and a query can have more than one predicate that maps
+ * to the same strategy between the same table pair (e.g. Q16's two
+ * ST_Intersects clauses plus an aDisjoint clause all resolve to Colocation)
+ * -- appending unconditionally queued the same strategy's plan/task/query
+ * multiple times, and ConstructGeneralQuery's UNION of one query per
+ * strategies-list entry then UNIONed several copies of a query that already
+ * has its own trailing ORDER BY, which Postgres rejects outright. */
 extern
 void AddStrategy(DistributedSpatiotemporalQueryPlan *distPlan, StrategyType type)
 {
+    ListCell *cell;
+    foreach(cell, distPlan->strategies)
+    {
+        if ((StrategyType) lfirst_int(cell) == type)
+            return;
+    }
     distPlan->strategies = lappend(distPlan->strategies, (Datum *)type);
 }

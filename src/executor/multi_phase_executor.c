@@ -541,7 +541,18 @@ ConstructPredicatePushDownQuery(PlanTask *plan, char * query_string, MultiPhaseE
     multiPhaseExecutor->tasks = lappend(multiPhaseExecutor->tasks, task);
 }
 
-/* GetTaskType renders task's ExecTaskType as a human-readable label for EXPLAIN output. */
+/*
+ * GetTaskType renders task's ExecTaskType as a human-readable label for
+ * EXPLAIN output. Every ExecTaskType that ExplainPlanStrategies can
+ * actually iterate over (multiPhaseExecutor->tasks -- never the separate
+ * coordTasks list, so INTERMEDIATEScan/FINALScan don't reach here today)
+ * needs a case; falling off the end without returning left this Datum
+ * uninitialized, and the caller's DatumGetCString/appendStringInfo("%s")
+ * would then dereference whatever garbage pointer was left in the return
+ * register -- e.g. for a PushDownScan task (a single distributed table
+ * joined against reference tables only, no self-join), crashing EXPLAIN
+ * outright.
+ */
 extern Datum
 GetTaskType(ExecutorTask *task)
 {
@@ -549,6 +560,14 @@ GetTaskType(ExecutorTask *task)
         return CStringGetDatum("Neighbor Scan");
     else if (task->taskType == SelfTilingScan)
         return CStringGetDatum("Self Tiling Scan");
+    else if (task->taskType == PushDownScan)
+        return CStringGetDatum("Push Down Scan");
+    else if (task->taskType == INTERMEDIATEScan)
+        return CStringGetDatum("Intermediate Scan");
+    else if (task->taskType == FINALScan)
+        return CStringGetDatum("Final Scan");
+    else
+        return CStringGetDatum("Unknown Scan");
 }
 
 /*

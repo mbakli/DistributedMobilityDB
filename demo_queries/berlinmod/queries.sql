@@ -204,7 +204,6 @@ ORDER BY t.PointId, t.PeriodId, v.Licence;
 -- Q16) List the pairs of licences for vehicles, the first from Licences1, the second from
 -- Licences2, where the corresponding vehicles are both present within a region from Regions1
 -- during a period from Periods1, but do not meet each other there and then.
--- NOT CURRENTLY SUPPORTED: self-join on trips_16t with no distribution-column equi-join.
 -----------------------------------------------------------------------------------------------------------------------
 SELECT p.PeriodId, p.Period, r.RegionId,
   l1.Licence AS Licence1, l2.Licence AS Licence2

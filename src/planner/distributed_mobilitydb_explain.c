@@ -23,6 +23,7 @@
 #include "utils/planner_utils.h"
 #include "catalog/nodes.h"
 #include "planner/planner_strategies.h"
+#include "catalog/table_ops.h"
 #include <tcop/tcopprot.h>
 #include <executor/spi.h>
 #include <utils/builtins.h>
@@ -320,10 +321,11 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
 }
 
 /*
- * GetLocalQuery pins query_string to one representative tile by appending a
+ * GetLocalQuery pins query_string to one representative tile by adding a
  * literal `<alias>.tile_key = rand_tile` predicate for every range table
- * entry it references, so Citus' shard pruning narrows each table down to
- * the single matching shard instead of planning across all of them.
+ * entry that actually has a tile_key column, so Citus' shard pruning
+ * narrows each such table down to the single matching shard instead of
+ * planning across all of them.
  */
 static char *
 GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile)
@@ -333,18 +335,43 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
 
     Query *query = ParseQueryString(query_string, NULL, 0);
     List *rangeTableList = ExtractRangeTableEntryList(query);
-    StringInfo pinnedQuery = makeStringInfo();
-    appendStringInfo(pinnedQuery, "%s", query_string);
+    StringInfo tileKeyConditions = makeStringInfo();
 
     ListCell *rangeTableCell = NULL;
     foreach(rangeTableCell, rangeTableList)
     {
         RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-        appendStringInfo(pinnedQuery, " AND %s.%s = %d", rangeTableEntry->eref->aliasname,
+        /* Only tables tiled by this extension's own machinery (a
+         * distributed spatiotemporal table, or a plain table reshuffled
+         * to be colocated with one) actually have a tile_key column --
+         * unconditionally pinning every range table entry (as this used
+         * to) added "alias.tile_key = N" for reference tables too (e.g.
+         * vehicles_ref/points_ref), which have no such column at all,
+         * producing "column v.tile_key does not exist" instead of a plan. */
+        if (!IsDistributedSpatiotemporalTable(rangeTableEntry->relid) &&
+            !IsReshuffledTable(rangeTableEntry->relid))
+            continue;
+        appendStringInfo(tileKeyConditions, "%s.%s = %d AND ", rangeTableEntry->eref->aliasname,
                          Var_Catalog_Tile_Key, rand_tile);
     }
 
-    return pinnedQuery->data;
+    if (tileKeyConditions->len == 0)
+        return query_string;
+
+    /*
+     * Inserted right after the query's own WHERE keyword rather than
+     * appended at the very end -- appending unconditionally landed these
+     * AND-joined conditions after a trailing ORDER BY whenever the task
+     * query had one (e.g. Q16's per-tile query), silently folding them
+     * into the ORDER BY expression list instead of the WHERE clause:
+     * "ORDER BY ..., l2.licence AND t1.tile_key = 5 AND ..." parses as one
+     * AND-expression whose left operand is l2.licence (text), producing
+     * "argument of AND must be type boolean, not type text" instead of
+     * pinning the query to one tile.
+     */
+    StringInfo key = makeStringInfo();
+    appendStringInfo(key, "WHERE %s", tileKeyConditions->data);
+    return replaceWord(query_string, "where", key->data);
 }
 
 /*
