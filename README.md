@@ -92,13 +92,6 @@ The `create_spatiotemporal_distributed_table()` function is utilized to define a
 
 By utilizing the `create_spatiotemporal_distributed_table()` function with these arguments, you can easily create a distributed table that suits your data management needs.
 
-```sql
--- Distribute Vehicles as a reference table: replicated whole to every node,
--- so it can be joined against a distributed table without repartitioning.
-SELECT create_spatiotemporal_distributed_table(table_name_in => 'vehicles',
-  table_name_out => 'vehicles_ref', is_reference_table => true);
-```
-
 ## Use Cases
 
 Below are examples of well-known datasets, where Distributed MobilityDB showcases its proficiency in managing large spatiotemporal data, offering users diverse query types suitable for a wide range of applications.
@@ -212,10 +205,7 @@ WHERE Destination = 'Kalundborg'
 CREATE TABLE Trips (
   TripId int,
   VehicleId int,
-  StartDate date,
-  SeqNo int,
-  Trip tgeompoint,
-  Trajectory geometry
+  Trip tgeompoint
 );
 
 -- Distribute the trips table into 4 tiles using the spatiotemporal column: tgeompoint(sequence)
