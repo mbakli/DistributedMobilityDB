@@ -470,28 +470,6 @@ ExplainOnHostingWorker(char *physicalQuery, TaskNode *taskNode)
         elog(ERROR, "Could not connect to database using SPI");
     }
 
-    StringInfo debugQuery = makeStringInfo();
-    appendStringInfo(debugQuery,
-                     "SELECT nodename, nodeport, success, result FROM run_command_on_workers(%s)",
-                     quote_literal_cstr(explainCommand->data));
-    int debug_spi = SPI_execute(debugQuery->data, true, 0);
-    elog(NOTICE, "DEBUG raw run_command_on_workers: spi_result=%d rows=%lu",
-        debug_spi, (unsigned long) SPI_processed);
-    if (debug_spi == SPI_OK_SELECT)
-    {
-        for (uint64 i = 0; i < SPI_processed; i++)
-        {
-            bool isNull;
-            char *nn = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-            char *np = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
-            char *sc = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
-            char *rs = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
-            elog(NOTICE, "DEBUG row %lu: nodename=%s nodeport=%s success=%s result=%s",
-                (unsigned long) i, nn, np, sc, rs ? rs : "NULL");
-        }
-    }
-    elog(NOTICE, "DEBUG target filter: targetNode=[%s] taskNode->port=%d", targetNode, taskNode->port);
-
     StringInfo dispatchQuery = makeStringInfo();
     appendStringInfo(dispatchQuery,
                      "SELECT jsonb_pretty(result::jsonb) FROM run_command_on_workers(%s) "
