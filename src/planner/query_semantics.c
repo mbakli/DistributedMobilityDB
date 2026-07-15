@@ -21,11 +21,33 @@
 /*
  * analyseSelectClause analyses the select clause and
  * detects the distributed functions, segmented objects, etc
+ *
+ * The worker/combiner/final rewrite this feeds (RewriterDistFuncs ->
+ * ProcessIntermediateTasks/ProcessFinalTasks) can only build a SELECT list
+ * out of the registered functions themselves -- it has no way to also carry
+ * along a plain pass-through column such as a join key. So if the target
+ * list mixes a registered function (e.g. length()) with any other column,
+ * treating that function as distributed collapses the whole result down to
+ * one aggregated row and silently drops every other column (e.g.
+ * "SELECT t1.tripid, t2.tripid, length(t2.trip) FROM ... WHERE eIntersects(...)"
+ * returned only length). Only engage the distributed-function rewrite when
+ * every projected column is itself a registered function, matching the
+ * single-aggregate queries (e.g. "SELECT sum(length(Trip)) FROM trips_50t")
+ * it's actually designed for; otherwise leave the functions as plain
+ * per-row calls pushed down with the rest of the query.
  */
 extern void
 analyseSelectClause(List *targetList, PostProcessing *postProcessing)
 {
     ListCell *targetEntryCell = NULL;
+    foreach(targetEntryCell, targetList)
+    {
+        TargetEntry *targetEntry = lfirst(targetEntryCell);
+        if (targetEntry->resjunk)
+            continue;
+        if (targetEntry->resname == NULL || !IsDistFunc(targetEntry))
+            return;
+    }
     foreach(targetEntryCell, targetList)
     {
         /* Process the input functions */
