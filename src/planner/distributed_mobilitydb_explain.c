@@ -45,8 +45,9 @@ static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, Expla
 static void ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
 static void ExplainOneTask(ExecutorTask *task, STMultirelation *base, ExplainState *es, int indent_group);
 static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile);
-static char * ExplainOnHostingWorker(char *query_string, ExecTaskType taskType, int rand_tile,
-                                     TaskNode *taskNode);
+static char * GetPhysicalTileQuery(char *query_string, ExecTaskType taskType, int rand_tile,
+                                   TaskNode *taskNode);
+static char * ExplainOnHostingWorker(char *physicalQuery, TaskNode *taskNode);
 
 /* create custom scan method for the spatiotemporal executor */
 CustomScanMethods SpatiotemporalExecutorMethod = {
@@ -270,16 +271,19 @@ ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState
  * `task`. Since colocate_shards() (see create_reshuffled_multirelation)
  * physically moves each reshuffled shard onto the same worker as its
  * matching-tile shard of the base table, a tile's join is ordinarily a
- * genuine single-node operation -- so we first try ExplainOnHostingWorker(),
- * which dispatches a real local EXPLAIN (using the concrete shard tables) to
- * that one worker and returns Postgres' own plan, with no Citus wrapper at
- * all. If the tiles turn out not to be co-located (a stale/partial
- * reshuffle, or a straggler placement), that returns NULL and we fall back
- * to planning the query through Citus' distributed_planner() directly
- * (bypassing this extension's own planner_hook, since these tables are
- * already-registered distributed spatiotemporal tables and would otherwise
- * recurse back into our own planning here), which shows the real cross-node
- * repartition instead of a misleading local-only plan.
+ * genuine single-node operation -- so we first try GetPhysicalTileQuery(),
+ * which substitutes each logical table name for its concrete shard name at
+ * the chosen tile, then ExplainOnHostingWorker() dispatches a real local
+ * EXPLAIN of that physical query to the one worker hosting it, returning
+ * Postgres' own plan with no Citus wrapper at all. If the tiles turn out not
+ * to be co-located (a stale/partial reshuffle, or a straggler placement),
+ * GetPhysicalTileQuery() returns NULL and we fall back to planning the
+ * logical query (pinned to the tile via a tile_key filter, GetLocalQuery())
+ * through Citus' distributed_planner() directly (bypassing this extension's
+ * own planner_hook, since these tables are already-registered distributed
+ * spatiotemporal tables and would otherwise recurse back into our own
+ * planning here), which shows the real cross-node repartition instead of a
+ * misleading local-only plan.
  */
 static void
 ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int indent_group)
@@ -292,14 +296,39 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
     appendStringInfo(es->str, "port=%d ", taskNode->port);
     appendStringInfo(es->str, "dbname=%s\n", DatumGetCString(GetDBName()));
 
-    char *OneTileQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid,
+    /*
+     * Prefer the physical, tile-substituted query (real shard table names)
+     * so "Query:" shows one concrete tile example instead of the logical
+     * table name. Only available when every referenced table's rand_tile
+     * shard is actually co-located on taskNode; GetPhysicalTileQuery
+     * returns NULL otherwise (no single physical tile name to show when the
+     * tables aren't co-located), in which case we fall back to the logical
+     * query pinned by a tile_key filter (GetLocalQuery) for display.
+     *
+     * What's printed is deliberately independent of whether
+     * ExplainOnHostingWorker's *live* local EXPLAIN round-trip below
+     * succeeds: that dispatch can fail for reasons unrelated to
+     * co-location (e.g. connection/transaction state while already
+     * mid-EXPLAIN of a repartition query), and discarding a correctly
+     * substituted physicalQuery just because the live probe happened to
+     * fail would defeat the point of showing it at all. When the live
+     * probe does fail, we still need *some* query to hand to Citus'
+     * distributed_planner() for the fallback plan below -- that must be
+     * the logical query (physical shard tables aren't known to the
+     * planner), so GetLocalQuery's output is always computed too.
+     */
+    char *physicalQuery = GetPhysicalTileQuery(task->taskQuery->data, task->taskType,
+                                               rand_tile, taskNode);
+    char *logicalQuery = GetLocalQuery(task->taskQuery->data, base->catalogTableInfo.table_oid,
                                        task->taskType, rand_tile);
+    char *displayQuery = physicalQuery != NULL ? physicalQuery : logicalQuery;
+
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
-    appendStringInfo(es->str, "Query: %s\n", OneTileQuery);
+    appendStringInfo(es->str, "Query: %s\n", displayQuery);
     appendStringInfoSpaces(es->str, es->indent * indent_group + 12);
 
-    char *localPlanText = ExplainOnHostingWorker(task->taskQuery->data, task->taskType,
-                                                 rand_tile, taskNode);
+    char *localPlanText = physicalQuery != NULL ?
+        ExplainOnHostingWorker(physicalQuery, taskNode) : NULL;
     if (localPlanText != NULL)
     {
         es->indent += 6;
@@ -309,13 +338,13 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
         return;
     }
 
-    Query *parse = ParseQueryString(OneTileQuery, NULL, 0);
-    PlannedStmt *plan = distributed_planner(parse, OneTileQuery, 0, NULL);
+    Query *parse = ParseQueryString(logicalQuery, NULL, 0);
+    PlannedStmt *plan = distributed_planner(parse, logicalQuery, 0, NULL);
     instr_time planduration;
     INSTR_TIME_SET_ZERO(planduration);
     es->indent += 6;
     DestReceiver *tupleStoreDest = CreateTuplestoreDestReceiver();
-    ExplainWorkerPlan(plan, tupleStoreDest, es, OneTileQuery, NULL, NULL,
+    ExplainWorkerPlan(plan, tupleStoreDest, es, logicalQuery, NULL, NULL,
                       &planduration);
     ExplainEndOutput(es);
 }
@@ -375,18 +404,17 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
 }
 
 /*
- * ExplainOnHostingWorker checks that every table referenced by query_string
+ * GetPhysicalTileQuery checks that every table referenced by query_string
  * has its rand_tile shard physically co-located on taskNode; if so, it
  * substitutes each logical table name for its concrete shard-qualified name
- * and runs `EXPLAIN (FORMAT JSON)` for the resulting local query directly on
- * that worker via run_command_on_workers() (JSON format always returns
- * exactly one row, which run_command_on_workers() requires), returning the
- * pretty-printed plan. Returns NULL -- signalling the caller to fall back to
- * a Citus-routed explain -- if any table's matching tile lives elsewhere, or
- * the dispatch itself fails.
+ * (one tile example, e.g. trips_passenger_6t -> trips_passenger_6t_102008)
+ * and returns the resulting query text. Returns NULL if any table's
+ * matching tile lives elsewhere, signalling the caller to fall back to a
+ * Citus-routed explain instead, since there's then no single physical tile
+ * name that represents the whole query.
  */
 static char *
-ExplainOnHostingWorker(char *query_string, ExecTaskType taskType, int rand_tile, TaskNode *taskNode)
+GetPhysicalTileQuery(char *query_string, ExecTaskType taskType, int rand_tile, TaskNode *taskNode)
 {
     char *targetNode = DatumToString(taskNode->node, TEXTOID);
     Query *query = ParseQueryString(query_string, NULL, 0);
@@ -418,14 +446,51 @@ ExplainOnHostingWorker(char *query_string, ExecTaskType taskType, int rand_tile,
         appendStringInfo(physicalQuery, "%s", rewritten);
     }
 
+    return physicalQuery->data;
+}
+
+/*
+ * ExplainOnHostingWorker runs `EXPLAIN (FORMAT JSON)` for physicalQuery
+ * (already tile-substituted by GetPhysicalTileQuery) directly on taskNode
+ * via run_command_on_workers() (JSON format always returns exactly one row,
+ * which run_command_on_workers() requires), returning the pretty-printed
+ * plan. Returns NULL if the dispatch itself fails.
+ */
+static char *
+ExplainOnHostingWorker(char *physicalQuery, TaskNode *taskNode)
+{
+    char *targetNode = DatumToString(taskNode->node, TEXTOID);
+
     StringInfo explainCommand = makeStringInfo();
-    appendStringInfo(explainCommand, "EXPLAIN (FORMAT JSON) %s", physicalQuery->data);
+    appendStringInfo(explainCommand, "EXPLAIN (FORMAT JSON) %s", physicalQuery);
 
     int spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
     {
         elog(ERROR, "Could not connect to database using SPI");
     }
+
+    StringInfo debugQuery = makeStringInfo();
+    appendStringInfo(debugQuery,
+                     "SELECT nodename, nodeport, success, result FROM run_command_on_workers(%s)",
+                     quote_literal_cstr(explainCommand->data));
+    int debug_spi = SPI_execute(debugQuery->data, true, 0);
+    elog(NOTICE, "DEBUG raw run_command_on_workers: spi_result=%d rows=%lu",
+        debug_spi, (unsigned long) SPI_processed);
+    if (debug_spi == SPI_OK_SELECT)
+    {
+        for (uint64 i = 0; i < SPI_processed; i++)
+        {
+            bool isNull;
+            char *nn = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+            char *np = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+            char *sc = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
+            char *rs = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
+            elog(NOTICE, "DEBUG row %lu: nodename=%s nodeport=%s success=%s result=%s",
+                (unsigned long) i, nn, np, sc, rs ? rs : "NULL");
+        }
+    }
+    elog(NOTICE, "DEBUG target filter: targetNode=[%s] taskNode->port=%d", targetNode, taskNode->port);
 
     StringInfo dispatchQuery = makeStringInfo();
     appendStringInfo(dispatchQuery,
