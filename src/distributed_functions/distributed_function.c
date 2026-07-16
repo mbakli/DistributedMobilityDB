@@ -160,3 +160,39 @@ LookupDistFuncFinalOp(const char *workerFuncName)
     return finalOp;
 }
 
+/*
+ * LookupDistFuncCombinerOp mirrors LookupDistFuncFinalOp but returns the
+ * registered "combiner" op instead (NULL if the catalog row has none --
+ * every function in category1.sql today is a two-phase worker/final model
+ * with no combiner). Used purely for EXPLAIN display, so the extra catalog
+ * scan (vs folding this into LookupDistFuncFinalOp) doesn't matter.
+ */
+extern char *
+LookupDistFuncCombinerOp(const char *workerFuncName)
+{
+    ScanKeyData scanKey[1];
+    bool indexOK = false;
+    Relation distFuns = table_open(DisFuncRelationId(), RowExclusiveLock);
+    ScanKeyInit(&scanKey[0], Anum_DistFun_worker,
+                BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(workerFuncName));
+
+    SysScanDesc scanDescriptor = systable_beginscan(distFuns,
+                                                    DistPlacementPlacementidIndexId(),
+                                                    indexOK,
+                                                    NULL, 1, scanKey);
+
+    HeapTuple heapTuple = systable_getnext(scanDescriptor);
+    char *combinerOp = NULL;
+    if (HeapTupleIsValid(heapTuple))
+    {
+        bool isNull;
+        Datum combinerDatum = heap_getattr(heapTuple, Anum_DistFun_combiner,
+                                           RelationGetDescr(distFuns), &isNull);
+        if (!isNull)
+            combinerOp = TextDatumGetCString(combinerDatum);
+    }
+    systable_endscan(scanDescriptor);
+    table_close(distFuns, NoLock);
+    return combinerOp;
+}
+

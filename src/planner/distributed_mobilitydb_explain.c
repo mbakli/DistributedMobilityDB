@@ -39,6 +39,9 @@ static void InitializeDistributedQueryExplain(DistributedQueryExplain *distribut
                                               ExplainState *es, const char *queryString);
 static void ExplainQueryType(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es);
 static char * getQueryType(List *strategies);
+static void ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
+                                    int cursorOptions, IntoClause *into, ParamListInfo params,
+                                    QueryEnvironment *queryEnv);
 
 static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
                                        int indent_group);
@@ -92,17 +95,20 @@ distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into
      * RewriteSegmentedDistFuncCalls is one such bail-out (a bare
      * distributed-function call over a segmented table, rewritten into an
      * explicit grouped aggregate and handed to Citus directly) -- but
-     * unlike a genuine bail-out, `query` itself was never touched, so
-     * explaining it as-is would show the original bare/ungrouped shape,
-     * not what's actually going to run. Explain the rewritten query text
-     * instead in that case. */
+     * unlike a genuine bail-out, distPlan->tablesList *was* populated (that
+     * happens before the rewrite runs), so there's enough to show a proper
+     * "Distributed Spatiotemporal Planner" section instead of falling all
+     * the way through to a bare Citus explain: ExplainSegmentedRewrite
+     * prints the usual query-type/table-info header this extension's other
+     * strategies show, then embeds Citus' own explain of the rewritten
+     * query (which is real and accurate -- it's what actually runs) as the
+     * "Query Plan" detail, rather than reimplementing Citus' own
+     * distributed-aggregate plan display from scratch. */
     if (result != NULL)
     {
         if (distPlan->segmentedRewriteQuery != NULL)
         {
-            Query *rewrittenQuery = ParseQueryString(distPlan->segmentedRewriteQuery, NULL, 0);
-            CitusExplainOneQuery(rewrittenQuery, cursorOptions, into, es,
-                                 distPlan->segmentedRewriteQuery, params, queryEnv);
+            ExplainSegmentedRewrite(distPlan, es, cursorOptions, into, params, queryEnv);
             return;
         }
         CitusExplainOneQuery(query,cursorOptions,into,es,queryString,params,queryEnv);
@@ -194,6 +200,71 @@ static char * getQueryType(List *strategies)
         return "Knn";
     else
         return "Other";
+}
+
+/*
+ * ExplainSegmentedRewrite prints a custom explain section for a query that
+ * RewriteSegmentedDistFuncCalls turned into an explicit grouped aggregate
+ * (see its own doc comment in query_semantics.c for why a bare
+ * distributed-function call needs this): the usual "Distributed
+ * Spatiotemporal Planner" header/table-info this extension's other
+ * strategies show, the rewritten query text itself (so it's clear *what*
+ * changed and why), and Citus' own explain of that rewritten query
+ * embedded as the "Query Plan" detail. The embedded plan is the real,
+ * accurate one -- it's what actually runs -- so it's shown directly rather
+ * than re-derived by hand; only the header/parameters section here is
+ * this extension's own.
+ */
+static void
+ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
+                        int cursorOptions, IntoClause *into, ParamListInfo params,
+                        QueryEnvironment *queryEnv)
+{
+    Rte *rteNode = (Rte *) linitial(distPlan->tablesList->tables);
+    STMultirelation *table = (STMultirelation *) rteNode->rte;
+    int indent_group = 2;
+
+    ExplainOpenGroup("DistributedQueryExplain", "Distributed Query", true, es);
+    ExplainPropertyText("Distributed Spatiotemporal Planner", "(Query Type: Segmented Distributed Function)", es);
+
+    ExplainOpenGroup("QueryParameters", "Query Parameters", true, es);
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    es->indent += indent_group;
+    appendStringInfo(es->str, "-> Query Parameters: \n");
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "-> Table: %s\n", get_rel_name(table->catalogTableInfo.table_oid));
+    es->indent += indent_group;
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "Global Index: %s\n", table->catalogTableInfo.tiling_method);
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "Local Index: %s\n", table->localIndex ? table->localIndex : "none");
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "Number of tiles: %d\n", table->catalogTableInfo.numTiles);
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "Group by (trip identifier): %s\n", table->catalogTableInfo.groupCol);
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "Combining operation: %s\n",
+                     table->catalogTableInfo.isMobilityDB ?
+                         "duplicate-collapsing (table's tiles hold full replicated copies, not disjoint fragments)" :
+                         "the registered final op (table's tiles hold genuinely disjoint clipped fragments)");
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "Rewritten query: %s\n", distPlan->segmentedRewriteQuery);
+    es->indent -= indent_group * 2;
+    ExplainCloseGroup("QueryParameters", "Query Parameters", true, es);
+
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "-> Query Plan:\n");
+    es->indent += indent_group;
+    appendStringInfoSpaces(es->str, es->indent * indent_group);
+    appendStringInfo(es->str, "Combine per-tile fragments (GROUP BY %s):\n", table->catalogTableInfo.groupCol);
+    es->indent += indent_group;
+
+    Query *rewrittenQuery = ParseQueryString(distPlan->segmentedRewriteQuery, NULL, 0);
+    CitusExplainOneQuery(rewrittenQuery, cursorOptions, into, es,
+                         distPlan->segmentedRewriteQuery, params, queryEnv);
+    es->indent -= indent_group * 2;
+
+    ExplainCloseGroup("DistributedQueryExplain", "Distributed Query", true, es);
 }
 
 
