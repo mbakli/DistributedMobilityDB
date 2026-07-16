@@ -75,10 +75,33 @@ AddQOperation(Datum des, Datum cur)
     return qOp;
 }
 
-/* IsDistFunc reports whether targetEntry's result name matches a registered distributed function. */
+/*
+ * IsDistFunc reports whether targetEntry is a genuine aggregate call (e.g.
+ * `sum(length(Trip)) AS length`) whose result name matches a registered
+ * distributed function's worker name.
+ *
+ * The worker/combiner/final rewrite this feeds exists to recombine partial
+ * per-tile results into one true total for a single (possibly
+ * shape-segmented) trip -- that's only what an actual aggregate call is
+ * asking for. A bare per-row call (e.g. `length(Trip)`, no aggregate
+ * wrapper) wants one result per row instead. Since Postgres defaults an
+ * unaliased function call's column name to the function's own name,
+ * `length(Trip)` alone -- with no `sum()`/aggregate around it -- defaults
+ * to the very same column name ("length") this match is keyed on; without
+ * the Aggref check below, that ordinary per-row call collided with the
+ * name and got wrongly collapsed into a single summed row, silently
+ * discarding every row but one. This is not length-specific: it applies to
+ * every function registered in pg_dist_spatiotemporal_dist_functions. Bare
+ * calls over a shape-segmented table are handled separately (see
+ * RewriteSegmentedDistFuncCalls) by rewriting them into exactly this kind
+ * of explicit aggregate, grouped per trip, before this check ever runs.
+ */
 extern bool
 IsDistFunc(TargetEntry *targetEntry)
 {
+    if (!IsA(targetEntry->expr, Aggref))
+        return false;
+
     ScanKeyData scanKey[1];
     bool indexOK = false;
     Relation distFuns = table_open(DisFuncRelationId(), RowExclusiveLock);
@@ -96,5 +119,44 @@ IsDistFunc(TargetEntry *targetEntry)
     systable_endscan(scanDescriptor);
     table_close(distFuns, NoLock);
     return heapTupleIsValid;
+}
+
+/*
+ * LookupDistFuncFinalOp looks up workerFuncName (a bare function call's own
+ * name, e.g. "length" -- not a column alias) in
+ * pg_dist_spatiotemporal_dist_functions and returns its registered "final"
+ * combining operation (e.g. "sum"), or NULL if workerFuncName isn't
+ * registered. Used by RewriteSegmentedDistFuncCalls to find which aggregate
+ * to wrap a bare call in before handing it to Citus' native distributed
+ * GROUP BY/aggregate support, rather than matching (as IsDistFunc does) by
+ * a target entry's possibly-coincidental result column name.
+ */
+extern char *
+LookupDistFuncFinalOp(const char *workerFuncName)
+{
+    ScanKeyData scanKey[1];
+    bool indexOK = false;
+    Relation distFuns = table_open(DisFuncRelationId(), RowExclusiveLock);
+    ScanKeyInit(&scanKey[0], Anum_DistFun_worker,
+                BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(workerFuncName));
+
+    SysScanDesc scanDescriptor = systable_beginscan(distFuns,
+                                                    DistPlacementPlacementidIndexId(),
+                                                    indexOK,
+                                                    NULL, 1, scanKey);
+
+    HeapTuple heapTuple = systable_getnext(scanDescriptor);
+    char *finalOp = NULL;
+    if (HeapTupleIsValid(heapTuple))
+    {
+        bool isNull;
+        Datum finalDatum = heap_getattr(heapTuple, Anum_DistFun_final,
+                                        RelationGetDescr(distFuns), &isNull);
+        if (!isNull)
+            finalOp = TextDatumGetCString(finalDatum);
+    }
+    systable_endscan(scanDescriptor);
+    table_close(distFuns, NoLock);
+    return finalOp;
 }
 

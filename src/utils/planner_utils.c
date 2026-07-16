@@ -67,6 +67,13 @@ GetTilingSchemeInfo(Oid relationId)
     catalog.tileKey = DatumToString(PointerGetDatum(datumArray[Anum_MTS_tileKey]), TEXTOID);
     catalog.segmentation = DatumGetBool(datumArray[Anum_MTS_segmentation]);
     catalog.srid = DatumGetInt32(datumArray[Anum_MTS_srid]);
+    /* groupcol is NULL for rows written before this column existed (or for
+     * a source table with no usable primary key -- see getGroupCol) --
+     * leave catalog.groupCol as NULL rather than misreading the varlena
+     * header as string data (the same hazard tileKey's comment above
+     * warns about). */
+    catalog.groupCol = isNullArray[Anum_MTS_groupCol] ? NULL :
+        DatumToString(PointerGetDatum(datumArray[Anum_MTS_groupCol]), TEXTOID);
     systable_endscan(scanDescriptor);
     table_close(pgMTS, NoLock);
     return catalog;

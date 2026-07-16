@@ -20,6 +20,9 @@
 /* Scans the SELECT targetlist for distributed aggregates and records them into postProcessing. */
 extern void analyseSelectClause(List *targetList, PostProcessing *postProcessing);
 
+/* Rewrites a bare distributed-function call over a segmented table into a grouped-by-trip aggregate query; NULL if nothing to rewrite. */
+extern char *RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList);
+
 /* Analyses fromExpr's predicates against tbl's catalog to derive its candidate-tile filter. */
 extern CatalogFilter *AnalyseCatalog(STMultirelation *tbl, FromExpr * fromExpr);
 

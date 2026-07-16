@@ -102,6 +102,27 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
         return distributed_planner(parse, query_string, cursorOptions, boundParams);
     }
 
+    /*
+     * A bare (non-aggregate) call to a registered distributed function
+     * (e.g. `length(trip)`, no sum()/aggregate wrapper) over a
+     * shape-segmented table can't be answered as a plain per-row pushdown
+     * -- a single trip's fragments are scattered across tiles, so that
+     * would return one row per fragment instead of one row per trip. Catch
+     * that here and hand the rewritten (explicit aggregate + GROUP BY)
+     * query straight to Citus' own distributed planner, which already
+     * correctly combines per-tile partial aggregates across a GROUP BY.
+     * Returns NULL (falls through to the normal pipeline below) for every
+     * other query shape -- joins, non-segmented tables, already-explicit
+     * aggregates, plain columns, etc.
+     */
+    char *segmentedRewrite = RewriteSegmentedDistFuncCalls(parse, query_string, distPlan->tablesList);
+    if (segmentedRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = segmentedRewrite;
+        Query *rewrittenParse = ParseQueryString(segmentedRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, segmentedRewrite, cursorOptions, boundParams);
+    }
+
     /* Initialize the post processing phase */
     distPlan->postProcessing = InitializePostProcessing();
     analyseSelectClause(parse->targetList, distPlan->postProcessing);

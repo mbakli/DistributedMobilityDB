@@ -61,6 +61,9 @@ extern DistributedFunction *addDistributedFunction(TargetEntry *operation);
 /* True if targetEntry's expression is a registered distributable function. */
 extern bool IsDistFunc(TargetEntry *targetEntry);
 
+/* Looks up workerFuncName's registered "final" combining op (e.g. "sum" for "length"), or NULL if unregistered. */
+extern char *LookupDistFuncFinalOp(const char *workerFuncName);
+
 /* Builds a QOperation pairing a distributed op (des) with its argument column (cur). */
 extern QOperation * AddQOperation(Datum des, Datum cur);
 #endif /* DISTRIBUTED_FUNCTION_H */

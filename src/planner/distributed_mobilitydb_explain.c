@@ -87,9 +87,24 @@ distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into
 
     /* If our custom planning bailed out, the query was already handled by
      * Citus/Postgres directly and distPlan was never fully populated -
-     * delegate the explain output to Citus and skip our custom section. */
+     * delegate the explain output to Citus and skip our custom section.
+     *
+     * RewriteSegmentedDistFuncCalls is one such bail-out (a bare
+     * distributed-function call over a segmented table, rewritten into an
+     * explicit grouped aggregate and handed to Citus directly) -- but
+     * unlike a genuine bail-out, `query` itself was never touched, so
+     * explaining it as-is would show the original bare/ungrouped shape,
+     * not what's actually going to run. Explain the rewritten query text
+     * instead in that case. */
     if (result != NULL)
     {
+        if (distPlan->segmentedRewriteQuery != NULL)
+        {
+            Query *rewrittenQuery = ParseQueryString(distPlan->segmentedRewriteQuery, NULL, 0);
+            CitusExplainOneQuery(rewrittenQuery, cursorOptions, into, es,
+                                 distPlan->segmentedRewriteQuery, params, queryEnv);
+            return;
+        }
         CitusExplainOneQuery(query,cursorOptions,into,es,queryString,params,queryEnv);
         return;
     }

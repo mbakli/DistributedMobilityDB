@@ -61,7 +61,8 @@ CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_tables(
     distcoltype varchar(10),
     tilekey varchar(10),
     shapeSegmented boolean,
-    srid int
+    srid int,
+    groupcol varchar(50)
 );
 
 ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_tables
