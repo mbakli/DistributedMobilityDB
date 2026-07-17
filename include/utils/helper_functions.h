@@ -36,6 +36,22 @@ extern char *change_sentence (char *sentence, char *find, char *replace);
 /* Returns a lowercased copy of str. */
 extern char *toLower(char *str);
 
+/*
+ * Finds the first case-insensitive, whitespace-bounded occurrence of
+ * `keyword` in `lowered` (already-lowercased haystack, already-lowercase
+ * keyword) -- tolerates newlines/tabs/multiple spaces around it, unlike a
+ * plain strstr(haystack, " keyword "). Returns a pointer to the start of
+ * the keyword itself, or NULL if not found.
+ */
+extern char *FindKeywordToken(const char *lowered, const char *keyword);
+
+/*
+ * Like FindKeywordToken, but only matches an occurrence at paren-depth 0
+ * (not nested inside a subquery/CTE's own parenthesized definition) -- for
+ * locating a keyword that belongs to a whole query's outermost SELECT.
+ */
+extern char *FindTopLevelKeywordToken(const char *lowered, const char *keyword);
+
 /* True if val is a NULL/zero Datum (no value set). */
 extern bool IsDatumEmpty(Datum val);
 

@@ -126,6 +126,52 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
         return distributed_planner(rewrittenParse, segmentedRewrite, cursorOptions, boundParams);
     }
 
+    /*
+     * An *explicit* aggregate wrapping a registered distributed function
+     * over a replicated table's column (e.g.
+     * `SUM(length(atTime(t.Trip, p.Period))) ... GROUP BY l.Licence, ...`,
+     * BerlinMOD Q8) has the same underlying problem as the bare-call case
+     * above, just already wrapped in a user-written aggregate/GROUP BY
+     * instead of needing one synthesized: a trip replicated across N tiles
+     * contributes to the aggregate N times instead of once. Rewritten into
+     * a two-level dedupe/aggregate query and hand that to Citus directly,
+     * same reasoning as RewriteSegmentedDistFuncCalls. An earlier version
+     * of this rewrite built the two-level query by deparsing expressions
+     * via a locally-planned statement (standard_planner() +
+     * deparse_context_for_plan_tree()) -- that segfaulted the backend when
+     * called from this nested position inside our own already-executing
+     * planner_hook, so RewriteReplicatedAggregateQuery now extracts
+     * expression text by splitting the SELECT list on its own top-level
+     * commas instead, never calling into Postgres' planner internals.
+     * Returns NULL for every other shape (no GROUP BY, no replicated table
+     * involved, HAVING present, etc.) -- falls through to the normal
+     * pipeline below.
+     */
+    char *replicatedAggregateRewrite = RewriteReplicatedAggregateQuery(parse, query_string, distPlan->tablesList);
+    if (replicatedAggregateRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = replicatedAggregateRewrite;
+        Query *rewrittenParse = ParseQueryString(replicatedAggregateRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, replicatedAggregateRewrite, cursorOptions, boundParams);
+    }
+
+    /*
+     * Same problem, one level down: the aggregate-over-distributed-function
+     * can just as easily live inside one of the query's own CTEs (e.g.
+     * `WITH Distances AS (SELECT ... SUM(length(atTime(...))) ... GROUP BY
+     * ...) SELECT ... MAX(Dist) ... FROM Distances`) rather than at the top
+     * level -- the check above never sees it, since the top-level query's
+     * own aggregate there (MAX(Dist)) takes a plain Var on the CTE's output
+     * column, not a call to a registered distributed function.
+     */
+    char *cteAggregateRewrite = RewriteReplicatedAggregateInCTEs(parse, query_string, distPlan->tablesList);
+    if (cteAggregateRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = cteAggregateRewrite;
+        Query *rewrittenParse = ParseQueryString(cteAggregateRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, cteAggregateRewrite, cursorOptions, boundParams);
+    }
+
     /* Initialize the post processing phase */
     distPlan->postProcessing = InitializePostProcessing();
     analyseSelectClause(parse->targetList, distPlan->postProcessing);

@@ -30,6 +30,25 @@ extern void analyseSelectClause(List *targetList, PostProcessing *postProcessing
 extern char *RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList,
                                            char **explainNotesOut);
 
+/*
+ * Rewrites a query with an explicit aggregate over a registered distributed
+ * function applied to a replicated (isMobilityDB, segmented) table's column
+ * -- e.g. `SUM(length(atTime(t.Trip, p.Period))) ... GROUP BY ...` -- into a
+ * two-level dedupe/aggregate query, so a trip replicated across N tiles
+ * contributes to the aggregate once instead of N times. NULL if nothing to
+ * rewrite.
+ */
+extern char *RewriteReplicatedAggregateQuery(Query *parse, const char *query_string, STMultirelations *tablesList);
+
+/*
+ * Same problem as RewriteReplicatedAggregateQuery, but for a query whose
+ * aggregate-over-distributed-function lives inside one of its own CTEs
+ * (e.g. `WITH x AS (SELECT ... SUM(length(atTime(...))) ... GROUP BY ...)
+ * SELECT ... FROM x`) rather than at the top level; NULL if no CTE needed
+ * rewriting (or there are no CTEs at all).
+ */
+extern char *RewriteReplicatedAggregateInCTEs(Query *parse, const char *query_string, STMultirelations *tablesList);
+
 /* Analyses fromExpr's predicates against tbl's catalog to derive its candidate-tile filter. */
 extern CatalogFilter *AnalyseCatalog(STMultirelation *tbl, FromExpr * fromExpr);
 

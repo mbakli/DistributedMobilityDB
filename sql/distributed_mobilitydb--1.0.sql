@@ -92,6 +92,22 @@ CREATE TABLE dist_mobilitydb.pg_spatiotemporal_join_operations(
 );
 
 -- Add the OID for the distance and intersection query operations
+--
+-- GetPredicateOidAndArgs (src/planner/predicate_management.c) reads an
+-- OpExpr predicate's *operator* oid (opExpr->opno), not the oid of the
+-- function implementing it -- registering only pg_proc.oid values (as the
+-- two SELECTs below do) means an operator-written predicate like
+-- `t.Trip && p.Period` (the `&&` bbox/temporal-overlap operator,
+-- implemented by temporal_overlaps/span_overlaps/etc., but a *different*
+-- oid than those functions') never matched, even after the function
+-- itself was registered. For queries that use `&&` as their *only*
+-- spatiotemporal predicate (no accompanying eintersects/ST_Intersects/
+-- eDwithin, e.g. BerlinMOD Q8's "was this vehicle active during this
+-- period" check), that meant this extension's planner never engaged at
+-- all -- no tile pruning, none of its tile-boundary deduplication --
+-- reproduced as genuinely wrong (duplicated) results. The third SELECT
+-- below registers the `&&` *operator*'s own oid (from pg_operator) for
+-- every temporal/spatiotemporal type combination it's defined over.
 INSERT INTO dist_mobilitydb.pg_spatiotemporal_join_operations(op, opid, distance)
 SELECT proname,oid,true
 FROM pg_proc
@@ -99,7 +115,13 @@ WHERE proname like ANY(ARRAY['%dwithin%', '%distance%'])
 union all
 SELECT proname,oid,false
 FROM pg_proc
-WHERE proname like ANY(ARRAY['%intersects%', '%contains%', '%disjoint%']);
+WHERE proname like ANY(ARRAY['%intersects%', '%contains%', '%disjoint%', '%overlaps%'])
+union all
+SELECT '&&', o.oid, false
+FROM pg_operator o
+WHERE o.oprname = '&&'
+  AND (o.oprleft::regtype::text ~ 'tgeompoint|tgeogpoint|tbool|tint|tfloat|ttext|tnpoint|tstz'
+       OR o.oprright::regtype::text ~ 'tgeompoint|tgeogpoint|tbool|tint|tfloat|ttext|tnpoint|tstz');
 
 ALTER TABLE dist_mobilitydb.pg_spatiotemporal_join_operations
 SET SCHEMA pg_catalog;

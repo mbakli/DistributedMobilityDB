@@ -13,6 +13,7 @@
  *****************************************************************************/
 
 #include "postgres.h"
+#include <ctype.h>
 #include "executor/executor_tasks.h"
 #include "executor/multi_phase_executor.h"
 #include <distributed/multi_join_order.h>
@@ -516,6 +517,45 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
                                                      "intermediate", generalScan->query_string->data));
             resetStringInfo(generalScan->query_string);
             appendStringInfo(generalScan->query_string, "%s", temp->data);
+        }
+    }
+    /*
+     * A strategy like PredicatePushDown can push the *entire* original
+     * query text (GROUP BY/aggregate/ORDER BY and all) down to run
+     * independently per relevant tile/shard, then concatenate (UNION) each
+     * task's own output above -- any ORDER BY embedded in that pushed-down
+     * text only sorts *within* one task's own result, so the final
+     * concatenated result is a sequence of independently-sorted runs, not
+     * one globally sorted result (confirmed: a query combining a CTE,
+     * cross-table aggregation, and ORDER BY returned rows grouped by
+     * originating shard instead of by the ORDER BY key). Re-applying the
+     * original top-level ORDER BY once more, over the fully assembled
+     * result, fixes this regardless of how many tasks/strategies
+     * contributed to it -- and is a harmless no-op wrap for any query shape
+     * that was already correctly ordered.
+     */
+    if (distPlan->query->sortClause != NIL)
+    {
+        /* org_query_string was already lowercased in place by
+         * RunQueryExecutor above. FindTopLevelKeywordToken (not
+         * FindKeywordToken) is required here, not just for the whitespace
+         * tolerance, but because this is the *whole* query's text -- a CTE
+         * body can itself contain "order by"/"group by"/etc at a nested
+         * paren depth, which must not be mistaken for the outermost
+         * query's own trailing ORDER BY. */
+        char *orderByPos = FindTopLevelKeywordToken(distPlan->org_query_string, "order by");
+        if (orderByPos != NULL)
+        {
+            char *orderByText = pstrdup(orderByPos);
+            size_t len = strlen(orderByText);
+            while (len > 0 && (orderByText[len - 1] == ';' || isspace((unsigned char) orderByText[len - 1])))
+                orderByText[--len] = '\0';
+
+            StringInfo wrapped = makeStringInfo();
+            appendStringInfo(wrapped, "SELECT * FROM (%s) AS ordered_result %s",
+                             generalScan->query_string->data, orderByText);
+            resetStringInfo(generalScan->query_string);
+            appendStringInfo(generalScan->query_string, "%s", wrapped->data);
         }
     }
     generalScan->query = ParseQueryString(generalScan->query_string->data,
