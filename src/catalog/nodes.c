@@ -130,6 +130,50 @@ char * GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile)
 }
 
 /*
+ * GetReferenceTableShardName returns relationId's single shard's
+ * "<table>_<shardid> " identifier string, same format as GetRandomTileId
+ * but with no shardminvalue filter -- a Citus reference table has exactly
+ * one logical shard (replicated, under the same name, to every node), so
+ * there's no per-tile shard to select between and no rand_tile to match.
+ */
+extern char *
+GetReferenceTableShardName(Oid relationId)
+{
+    int spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    StringInfo catalogQuery = makeStringInfo();
+    appendStringInfo(catalogQuery, "SELECT concat('%s_',shard.shardid,' ')\n"
+                                   "FROM pg_dist_shard As shard\n"
+                                   "WHERE shard.logicalrelid = '%s'::regclass",
+                     get_rel_name(relationId), get_rel_name(relationId));
+    spi_result = SPI_execute(catalogQuery->data, true, 1);
+
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
+    {
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
+    }
+
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+
+    if (!found)
+        return NULL;
+
+    return SPI_getvalue(row, rowDescriptor, 1);
+}
+
+/*
  * GetShardHostNode looks up the (nodename, nodeport) actually hosting
  * relationId's shard whose shardminvalue matches rand_tile, for dispatching
  * a command to the specific worker that holds that tile's data (unlike

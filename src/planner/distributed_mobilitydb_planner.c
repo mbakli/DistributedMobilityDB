@@ -115,10 +115,13 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
      * other query shape -- joins, non-segmented tables, already-explicit
      * aggregates, plain columns, etc.
      */
-    char *segmentedRewrite = RewriteSegmentedDistFuncCalls(parse, query_string, distPlan->tablesList);
+    char *segmentedRewriteExplainNotes = NULL;
+    char *segmentedRewrite = RewriteSegmentedDistFuncCalls(parse, query_string, distPlan->tablesList,
+                                                           &segmentedRewriteExplainNotes);
     if (segmentedRewrite != NULL)
     {
         distPlan->segmentedRewriteQuery = segmentedRewrite;
+        distPlan->segmentedRewriteExplainNotes = segmentedRewriteExplainNotes;
         Query *rewrittenParse = ParseQueryString(segmentedRewrite, NULL, 0);
         return distributed_planner(rewrittenParse, segmentedRewrite, cursorOptions, boundParams);
     }
@@ -130,16 +133,25 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     {
         checkQueryType(parse, distPlan);
         needsSpatiotemporalPlanning = needsDistributedSpatiotemporalPlanning(distPlan);
-        /* NonColocation/Colocation strategies join tiles that were built by
-         * reshuffling on a spatiotemporal shape (see
+        /* NonColocation/Colocation/PredicatePushDown strategies all query
+         * tiles built from a spatiotemporal shape (see
          * analyzeDistributedSpatiotemporalTables/shapesegmented), which can
          * legitimately place the same row's shape-segmented copy in more
          * than one tile so a boundary-crossing match isn't missed by any
-         * single tile. That means the coordinator-level union of per-tile
-         * results can contain the same logical match more than once, so
-         * these strategies need a final deduplication pass. */
+         * single tile -- and for a MobilityDB table specifically, that
+         * "copy" is a full, unclipped duplicate of the whole row rather
+         * than a disjoint fragment (see RewriteSegmentedDistFuncCalls's
+         * isMobilityDB comment), making the duplication far more
+         * pronounced. PredicatePushDown runs its query independently
+         * against every one of a table's tiles/shards and Citus unions the
+         * per-shard results with no dedup of its own -- confirmed
+         * empirically on the BerlinMOD Q4/Q6 demo queries, which return
+         * ~13x the correct row count without this. All three strategies'
+         * coordinator-level output needs the same final deduplication
+         * pass. */
         if (StrategiesInclude(distPlan->strategies, NonColocation) ||
-            StrategiesInclude(distPlan->strategies, Colocation))
+            StrategiesInclude(distPlan->strategies, Colocation) ||
+            StrategiesInclude(distPlan->strategies, PredicatePushDown))
         {
             distPlan->postProcessing->coordinatorLevelOperator->dupRemOperator->active = true;
         }

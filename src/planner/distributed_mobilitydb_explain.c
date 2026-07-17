@@ -154,8 +154,36 @@ static void
 InitializeDistributedQueryExplain(DistributedQueryExplain *distributedQueryExplain,
                                   ExplainState *es, const char *queryString)
 {
+    /*
+     * replaceWord(..., "explain ", "") only matched a literal space right
+     * after "explain" -- a query with any other whitespace there (a
+     * newline after EXPLAIN, e.g. "EXPLAIN\nWITH Temp AS (...) SELECT ...",
+     * a common multi-line formatting style, or even just leading
+     * whitespace before "EXPLAIN" itself, e.g. a query string starting
+     * with a blank line) left the literal word "explain" embedded at the
+     * front of the "stripped" query string. That string is later
+     * re-parsed (ParseQueryString) as if it were the real query -- parsing
+     * it as a *nested* EXPLAIN statement instead, and handing that Query
+     * (wrapping an ExplainStmt, not a plain SELECT) to Citus'
+     * distributed_planner() segfaulted the backend (reproduced on the
+     * BerlinMOD Q6 query, and again via a query string with a leading
+     * blank line before EXPLAIN). Skip *any* leading whitespace first,
+     * then strip "explain" plus *any* following whitespace, instead of
+     * assuming the string starts with "explain" followed by exactly one
+     * space.
+     */
+    char *lowered = toLower((char *) queryString);
+    char *stripped = lowered;
+    while (*stripped == ' ' || *stripped == '\t' || *stripped == '\n' || *stripped == '\r')
+        stripped++;
+    if (strncmp(stripped, "explain", 7) == 0)
+    {
+        stripped += 7;
+        while (*stripped == ' ' || *stripped == '\t' || *stripped == '\n' || *stripped == '\r')
+            stripped++;
+    }
     StringInfo tmp = makeStringInfo();
-    appendStringInfo(tmp, "%s", replaceWord(toLower((char *)queryString), "explain ", ""));
+    appendStringInfo(tmp, "%s", stripped);
     distributedQueryExplain->query_string = tmp->data;
 }
 
@@ -242,11 +270,21 @@ ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainSta
     appendStringInfo(es->str, "Number of tiles: %d\n", table->catalogTableInfo.numTiles);
     appendStringInfoSpaces(es->str, es->indent * indent_group);
     appendStringInfo(es->str, "Group by (trip identifier): %s\n", table->catalogTableInfo.groupCol);
-    appendStringInfoSpaces(es->str, es->indent * indent_group);
-    appendStringInfo(es->str, "Combining operation: %s\n",
-                     table->catalogTableInfo.isMobilityDB ?
-                         "duplicate-collapsing (table's tiles hold full replicated copies, not disjoint fragments)" :
-                         "the registered final op (table's tiles hold genuinely disjoint clipped fragments)");
+    if (distPlan->segmentedRewriteExplainNotes != NULL)
+    {
+        appendStringInfoSpaces(es->str, es->indent * indent_group);
+        appendStringInfo(es->str, "Distributed functions:\n");
+        es->indent += indent_group;
+        char *notes = pstrdup(distPlan->segmentedRewriteExplainNotes);
+        char *line = strtok(notes, "\n");
+        while (line != NULL)
+        {
+            appendStringInfoSpaces(es->str, es->indent * indent_group);
+            appendStringInfo(es->str, "%s\n", line);
+            line = strtok(NULL, "\n");
+        }
+        es->indent -= indent_group;
+    }
     appendStringInfoSpaces(es->str, es->indent * indent_group);
     appendStringInfo(es->str, "Rewritten query: %s\n", distPlan->segmentedRewriteQuery);
     es->indent -= indent_group * 2;
@@ -256,12 +294,52 @@ ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainSta
     appendStringInfo(es->str, "-> Query Plan:\n");
     es->indent += indent_group;
     appendStringInfoSpaces(es->str, es->indent * indent_group);
-    appendStringInfo(es->str, "Combine per-tile fragments (GROUP BY %s):\n", table->catalogTableInfo.groupCol);
+    if (table->catalogTableInfo.isMobilityDB)
+        appendStringInfo(es->str, "Deduplicate replicated fragments (DISTINCT ON %s):\n",
+                         table->catalogTableInfo.groupCol);
+    else
+        appendStringInfo(es->str, "Combine per-tile fragments (GROUP BY %s):\n", table->catalogTableInfo.groupCol);
     es->indent += indent_group;
 
+    /*
+     * Capture Citus' own explain into a throwaway ExplainState (copying
+     * over the caller's format/verbosity options, but starting fresh at
+     * indent 0) rather than writing directly into `es`, so the
+     * "Custom Scan (Citus Adaptive)" line -- an internal Citus plan-node
+     * label, not something this rewrite's own steps need surfaced -- can
+     * be stripped before the (still real, accurate) rest of the plan is
+     * appended into the actual output at the right indentation.
+     */
+    ExplainState *citusEs = NewExplainState();
+    citusEs->format = es->format;
+    citusEs->costs = es->costs;
+    citusEs->verbose = es->verbose;
+    citusEs->analyze = es->analyze;
+    citusEs->timing = es->timing;
+    citusEs->buffers = es->buffers;
+    citusEs->summary = es->summary;
+    citusEs->settings = es->settings;
+    citusEs->wal = es->wal;
+
     Query *rewrittenQuery = ParseQueryString(distPlan->segmentedRewriteQuery, NULL, 0);
-    CitusExplainOneQuery(rewrittenQuery, cursorOptions, into, es,
+    CitusExplainOneQuery(rewrittenQuery, cursorOptions, into, citusEs,
                          distPlan->segmentedRewriteQuery, params, queryEnv);
+
+    char *citusPlanText = pstrdup(citusEs->str->data);
+    char *planLine = strtok(citusPlanText, "\n");
+    while (planLine != NULL)
+    {
+        char *trimmed = planLine;
+        while (*trimmed == ' ')
+            trimmed++;
+        if (strncmp(trimmed, "->  Custom Scan (Citus Adaptive)", strlen("->  Custom Scan (Citus Adaptive)")) != 0 &&
+            strncmp(trimmed, "Custom Scan (Citus Adaptive)", strlen("Custom Scan (Citus Adaptive)")) != 0)
+        {
+            appendStringInfoSpaces(es->str, es->indent * indent_group);
+            appendStringInfo(es->str, "%s\n", planLine);
+        }
+        planLine = strtok(NULL, "\n");
+    }
     es->indent -= indent_group * 2;
 
     ExplainCloseGroup("DistributedQueryExplain", "Distributed Query", true, es);
@@ -456,6 +534,15 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
     foreach(rangeTableCell, rangeTableList)
     {
         RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+        /*
+         * ExtractRangeTableEntryList recurses into CTEs/subqueries, so this
+         * list can include non-relation entries (RTE_CTE for a self-joined
+         * CTE reference, etc.) with no real relid at all -- skip those
+         * before doing any relid-based lookup (see the matching guard and
+         * comment in GetPhysicalTileQuery, which segfaulted without it).
+         */
+        if (rangeTableEntry->rtekind != RTE_RELATION)
+            continue;
         /* Only tables tiled by this extension's own machinery (a
          * distributed spatiotemporal table, or a plain table reshuffled
          * to be colocated with one) actually have a tile_key column --
@@ -512,6 +599,48 @@ GetPhysicalTileQuery(char *query_string, ExecTaskType taskType, int rand_tile, T
     foreach(rangeTableCell, rangeTableList)
     {
         RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+
+        /*
+         * ExtractRangeTableEntryList recurses into CTEs/subqueries (see the
+         * comment on its other call site in distributed_mobilitydb_planner.c),
+         * so this list can include non-relation entries (e.g. RTE_CTE for a
+         * self-joined CTE reference like "Temp t1, Temp t2") that have no
+         * real relid at all. IsCitusTableType/GetShardHostNode are raw Oid
+         * lookups, not defensive SPI-wrapped catalog scans -- calling them
+         * with an RTE_CTE's garbage/invalid relid segfaulted the backend
+         * (reproduced on the BerlinMOD Q6 query, a self-joined CTE). Skip
+         * anything that isn't a real table reference before touching relid.
+         */
+        if (rangeTableEntry->rtekind != RTE_RELATION)
+            continue;
+
+        /*
+         * A Citus reference table is replicated to every node under the
+         * same shard id/name everywhere -- it has no per-tile shard to
+         * match against rand_tile, so the ordinary shardminvalue=rand_tile
+         * lookup below always finds nothing for it and made this whole
+         * function bail out to NULL for any query joining a distributed
+         * spatiotemporal table against so much as one reference table
+         * (e.g. any query against vehicles_ref/points_ref/etc.) -- even
+         * though a reference table is trivially co-located with taskNode
+         * by definition (it's on every node), and even though the
+         * genuinely tiled table(s) in the same query COULD have been
+         * substituted correctly. Skip the co-location check for it
+         * entirely and look its one shard name up directly instead.
+         */
+        if (IsCitusTableType(rangeTableEntry->relid, REFERENCE_TABLE))
+        {
+            char *shardName = GetReferenceTableShardName(rangeTableEntry->relid);
+            if (shardName == NULL)
+                return NULL;
+
+            StringInfo tableName = makeStringInfo();
+            appendStringInfo(tableName, "%s ", get_rel_name(rangeTableEntry->relid));
+            char *rewritten = replaceWord(physicalQuery->data, tableName->data, shardName);
+            resetStringInfo(physicalQuery);
+            appendStringInfo(physicalQuery, "%s", rewritten);
+            continue;
+        }
 
         TaskNode *rteNode = GetShardHostNode(rangeTableEntry->relid, rand_tile);
         if (rteNode->node == (Datum) 0 || rteNode->port != taskNode->port ||

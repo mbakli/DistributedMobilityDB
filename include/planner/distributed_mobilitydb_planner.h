@@ -74,6 +74,15 @@ typedef struct DistributedSpatiotemporalQueryPlan
      * was really executed.
      */
     char *segmentedRewriteQuery;
+    /*
+     * Set alongside segmentedRewriteQuery: one line per rewritten function
+     * naming its registered worker/combiner/final ops (from
+     * pg_dist_spatiotemporal_dist_functions) and the op actually applied in
+     * the rewrite -- for EXPLAIN to show *why* the rewrite looks the way it
+     * does in this extension's own worker/combiner/final vocabulary,
+     * without asserting anything about replication vs. true segmentation.
+     */
+    char *segmentedRewriteExplainNotes;
 } DistributedSpatiotemporalQueryPlan;
 
 /* Filter Operation */

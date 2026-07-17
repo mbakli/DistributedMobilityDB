@@ -77,8 +77,8 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * into an ordinary SQL grouped aggregate, e.g.:
  *
  *   select length(trip) from trips_50t
- *   -> select sum(length(trip)) as length from trips_50t group by tripid  -- PostGIS linestring/polygon
- *   -> select max(length(trip)) as length from trips_50t group by tripid  -- MobilityDB tgeompoint
+ *   -> select sum(length(trip)) as length from trips_50t group by tripid              -- genuinely segmented (PostGIS linestring/polygon)
+ *   -> select distinct on (tripid) length(trip) as length from trips_50t order by tripid  -- replicated (MobilityDB tgeompoint)
  *
  * so Citus' own native distributed GROUP BY/aggregate pushdown -- already
  * proven correct for `sum(length(trip)) as length` without a GROUP BY --
@@ -86,11 +86,17 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * of every row silently collapsing into a single global total (see
  * IsDistFunc's comment for why a bare call collides with that mechanism in
  * the first place, and why it must not be the one to handle this case).
- * Which combining op is used (the registered "final" op, e.g. sum, vs a
- * plain duplicate-collapsing max) depends on whether the table's tiles
- * genuinely hold disjoint fragments or full duplicate copies -- see the
- * isMobilityDB check below for why those aren't the same thing despite
- * both being flagged "segmented" in the catalog.
+ *
+ * Which shape is used depends on whether the table's tiles genuinely hold
+ * disjoint fragments or full duplicate copies -- see the isMobilityDB
+ * check below for why those aren't the same thing despite both being
+ * flagged "segmented" in the catalog. A genuinely segmented table's final
+ * op (the registered combining function, e.g. sum) is a real aggregate
+ * over real partial values, so GROUP BY + that op is correct. A
+ * replicated table has nothing to combine -- every "fragment" already is
+ * the complete, correct answer -- so no distributed-function machinery
+ * applies there at all; the plain, ordinary function call is kept as-is
+ * and DISTINCT ON just removes the duplicate rows.
  *
  * GROUP BY doesn't require its key to be projected, so groupCol is never
  * added to the SELECT list on its own -- if the caller wants it in the
@@ -115,7 +121,8 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * should keep using the original query_string in that case.
  */
 extern char *
-RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList)
+RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList,
+                              char **explainNotesOut)
 {
     if (tablesList == NULL || tablesList->length != 1)
         return NULL;
@@ -137,6 +144,7 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
         return NULL;
 
     StringInfo selectList = makeStringInfo();
+    StringInfo explainNotes = makeStringInfo();
     bool foundAny = false;
 
     ListCell *targetEntryCell = NULL;
@@ -190,33 +198,44 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
         if (finalOp == NULL)
             return NULL;
 
-        /*
-         * shape_segmentation.sql's ST_Intersection-based clipping (safe to
-         * SUM back together) only applies to its 'linestring'/
-         * 'multilinestring'/'polygon'/'multipolygon' branches -- static
-         * PostGIS geometry. Its 'sequence'/'sequenceset' branch (every
-         * MobilityDB tgeompoint trajectory table this extension has, since
-         * a moving point's shape type is never one of those PostGIS
-         * types) does no clipping at all: it just re-packs the *whole*,
-         * unsplit trip into every tile whose bbox it overlaps (`WHERE
-         * distCol && bbox_with_srid` is a bbox-overlap test, not a cut).
-         * Confirmed empirically: every "fragment" of a multi-tile trip
-         * carries identical numinstants/startTimestamp/endTimestamp/
-         * length -- full duplicates, not disjoint partial pieces. Summing
-         * those would silently multiply the true value by however many
-         * tiles the trip happens to touch. The registered final op (sum
-         * for length -- correct for genuine partial-fragment reconstruction)
-         * doesn't apply here; any of several duplicate-but-identical rows
-         * is already the whole, correct answer, so MAX (or MIN, or any
-         * other order-independent pick) collapses them to one row without
-         * altering the value.
-         */
-        char *combiningOp = catalog->isMobilityDB ? "max" : finalOp;
+        char *combinerOp = LookupDistFuncCombinerOp(funcName);
+        if (explainNotes->len > 0)
+            appendStringInfoString(explainNotes, "\n");
+        appendStringInfo(explainNotes, "%s(%s): worker=%s, combiner=%s, final=%s",
+                         funcName, catalog->distCol, funcName,
+                         combinerOp != NULL ? combinerOp : "(none)", finalOp);
 
         if (selectList->len > 0)
             appendStringInfoString(selectList, ", ");
-        appendStringInfo(selectList, "%s(%s(%s)) as %s", combiningOp, funcName, catalog->distCol,
-                         targetEntry->resname != NULL ? targetEntry->resname : funcName);
+        /*
+         * shape_segmentation.sql's ST_Intersection-based clipping only
+         * applies to its 'linestring'/'multilinestring'/'polygon'/
+         * 'multipolygon' branches -- static PostGIS geometry. Its
+         * 'sequence'/'sequenceset' branch (every MobilityDB tgeompoint
+         * trajectory table this extension has, since a moving point's
+         * shape type is never one of those PostGIS types) does no
+         * clipping at all: it just re-packs the *whole*, unsplit trip
+         * into every tile whose bbox it overlaps (`WHERE distCol &&
+         * bbox_with_srid` is a bbox-overlap test, not a cut). Confirmed
+         * empirically: every "fragment" of a multi-tile trip carries
+         * identical numinstants/startTimestamp/endTimestamp/length -- full
+         * duplicates, not disjoint partial pieces.
+         *
+         * A genuinely segmented table's registered final op (e.g. sum) is
+         * a real aggregate over real partial values, so wrap the call in
+         * it as usual. A replicated (MobilityDB) table has nothing to
+         * combine -- summing duplicates would multiply the true value by
+         * however many tiles a trip touches -- so the plain, ordinary
+         * function call is projected completely unwrapped; the DISTINCT
+         * ON built into the final query (below) removes the duplicate
+         * rows without needing any aggregate at all.
+         */
+        if (catalog->isMobilityDB)
+            appendStringInfo(selectList, "%s(%s) as %s", funcName, catalog->distCol,
+                             targetEntry->resname != NULL ? targetEntry->resname : funcName);
+        else
+            appendStringInfo(selectList, "%s(%s(%s)) as %s", finalOp, funcName, catalog->distCol,
+                             targetEntry->resname != NULL ? targetEntry->resname : funcName);
         foundAny = true;
     }
 
@@ -282,8 +301,22 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
         last[--lastLen] = '\0';
 
     StringInfo newQuery = makeStringInfo();
-    appendStringInfo(newQuery, "select %s %s group by %s %s",
-                     selectList->data, core, catalog->groupCol, suffix);
+    if (catalog->isMobilityDB)
+        /*
+         * DISTINCT ON (groupcol) ... ORDER BY groupcol removes the
+         * duplicate replica rows without wrapping anything in an
+         * aggregate -- Postgres only requires ORDER BY to *start* with
+         * the DISTINCT ON expression(s), not that they also appear in the
+         * SELECT list, so groupcol still isn't forced into the output
+         * unless the caller's own target list already asked for it.
+         */
+        appendStringInfo(newQuery, "select distinct on (%s) %s %s order by %s %s",
+                         catalog->groupCol, selectList->data, core, catalog->groupCol, suffix);
+    else
+        appendStringInfo(newQuery, "select %s %s group by %s %s",
+                         selectList->data, core, catalog->groupCol, suffix);
+    if (explainNotesOut != NULL)
+        *explainNotesOut = explainNotes->data;
     return newQuery->data;
 }
 
