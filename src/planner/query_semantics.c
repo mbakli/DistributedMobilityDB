@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include <ctype.h>
 #include <distributed/multi_logical_planner.h>
+#include <nodes/nodeFuncs.h>
 #include <nodes/parsenodes.h>
 #include <parser/parsetree.h>
 #include <utils/lsyscache.h>
@@ -24,6 +25,31 @@
 #include "distributed_functions/distributed_function.h"
 #include "general/rte.h"
 
+/*
+ * TargetEntryReferencesGroupCol reports whether te's expression is a plain
+ * Var referencing replicatedTable's own groupCol column (e.g. writing
+ * `t.tripid` explicitly in the SELECT list) -- used by
+ * RewriteReplicatedAggregateQuery to avoid projecting the row identifier
+ * its inner DISTINCT needs a *second* time under the same alias when the
+ * caller's own target list already asked for it. Postgres allows
+ * constructing a subquery whose output has two same-named columns, but
+ * referencing that name from the enclosing query is then ambiguous --
+ * exactly the shape produced by unconditionally prepending groupCol
+ * without checking whether it's already there.
+ */
+static bool
+TargetEntryReferencesGroupCol(TargetEntry *te, Query *parse, STMultirelation *replicatedTable)
+{
+    if (!IsA(te->expr, Var))
+        return false;
+    Var *var = (Var *) te->expr;
+    RangeTblEntry *varRte = rt_fetch(var->varno, parse->rtable);
+    if (varRte->relid != replicatedTable->catalogTableInfo.table_oid)
+        return false;
+    char *varColName = get_attname(varRte->relid, var->varattno, false);
+    return varColName != NULL &&
+           strcasecmp(varColName, replicatedTable->catalogTableInfo.groupCol) == 0;
+}
 
 /*
  * analyseSelectClause analyses the select clause and
@@ -243,10 +269,10 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
         return NULL;
 
     char *lowered = toLower((char *) query_string);
-    char *fromKeyword = strstr(lowered, " from ");
+    char *fromKeyword = FindKeywordToken(lowered, "from");
     if (fromKeyword == NULL)
         return NULL;
-    size_t fromOffset = (fromKeyword - lowered) + 1; /* skip the leading space " from " matched on */
+    size_t fromOffset = fromKeyword - lowered;
 
     /*
      * ORDER BY/HAVING can reference the *original*, un-rewritten expression
@@ -258,7 +284,7 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
      * arbitrary ORDER BY/HAVING expression via text substitution.
      */
     char *loweredTail = lowered + fromOffset;
-    if (strstr(loweredTail, " order by ") != NULL || strstr(loweredTail, " having ") != NULL)
+    if (FindKeywordToken(loweredTail, "order by") != NULL || FindKeywordToken(loweredTail, "having") != NULL)
         return NULL;
 
     /*
@@ -270,10 +296,10 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
      * produced invalid SQL ("... LIMIT 2 GROUP BY tripid" -> syntax error).
      */
     char *splitPos = NULL;
-    const char *boundaryMarkers[] = { " limit ", " offset " };
+    const char *boundaryMarkers[] = { "limit", "offset" };
     for (int i = 0; i < 2; i++)
     {
-        char *found = strstr(loweredTail, boundaryMarkers[i]);
+        char *found = FindKeywordToken(loweredTail, boundaryMarkers[i]);
         if (found != NULL && (splitPos == NULL || found < splitPos))
             splitPos = found;
     }
@@ -318,6 +344,606 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
     if (explainNotesOut != NULL)
         *explainNotesOut = explainNotes->data;
     return newQuery->data;
+}
+
+/*
+ * ReplicatedAggregateSearch is expression_tree_walker's context for
+ * ReplicatedAggregateWalker: accumulates whether a registered distributed
+ * function call and a replicated table's Var were both found somewhere in
+ * the same expression subtree.
+ */
+typedef struct ReplicatedAggregateSearch
+{
+    Query *parse;
+    STMultirelations *tablesList;
+    bool foundDistFunc;
+    STMultirelation *replicatedTable;
+} ReplicatedAggregateSearch;
+
+/*
+ * ReplicatedAggregateWalker recurses through an Aggref argument expression
+ * (e.g. `length(atTime(t.Trip, p.Period))`) looking for (a) a call to a
+ * function registered in pg_dist_spatiotemporal_dist_functions and (b) a
+ * Var belonging to a table whose tiles hold full replicated copies rather
+ * than disjoint fragments (isMobilityDB && segmentation -- see
+ * RewriteSegmentedDistFuncCalls's comment for why those aren't the same as
+ * a genuinely segmented table). Both found anywhere in the same subtree
+ * means the aggregate's result will be silently multiplied by however many
+ * tiles a row happens to touch -- the join/explicit-aggregate
+ * generalization of the bug RewriteSegmentedDistFuncCalls fixes for the
+ * single-table case.
+ */
+static bool
+ReplicatedAggregateWalker(Node *node, ReplicatedAggregateSearch *search)
+{
+    if (node == NULL)
+        return false;
+
+    if (IsA(node, FuncExpr))
+    {
+        FuncExpr *funcExpr = (FuncExpr *) node;
+        char *funcName = get_func_name(funcExpr->funcid);
+        if (funcName != NULL && LookupDistFuncFinalOp(funcName) != NULL)
+            search->foundDistFunc = true;
+    }
+    else if (IsA(node, Var))
+    {
+        Var *var = (Var *) node;
+        if (var->varno > 0 && (int) var->varno <= list_length(search->parse->rtable))
+        {
+            RangeTblEntry *rte = rt_fetch(var->varno, search->parse->rtable);
+            if (rte->rtekind == RTE_RELATION)
+            {
+                ListCell *cell;
+                foreach(cell, search->tablesList->tables)
+                {
+                    Rte *rteNode = (Rte *) lfirst(cell);
+                    if (rteNode->RteType != STRte)
+                        continue;
+                    STMultirelation *table = (STMultirelation *) rteNode->rte;
+                    if (table->catalogTableInfo.table_oid == rte->relid &&
+                        table->catalogTableInfo.isMobilityDB &&
+                        table->catalogTableInfo.segmentation)
+                    {
+                        search->replicatedTable = table;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return expression_tree_walker(node, ReplicatedAggregateWalker, (void *) search);
+}
+
+/* TrimmedSubstring returns a newly palloc'd, whitespace-trimmed copy of the text spanning [start, end). */
+static char *
+TrimmedSubstring(const char *start, const char *end)
+{
+    while (start < end && isspace((unsigned char) *start))
+        start++;
+    while (end > start && isspace((unsigned char) *(end - 1)))
+        end--;
+    size_t len = end - start;
+    char *result = palloc(len + 1);
+    memcpy(result, start, len);
+    result[len] = '\0';
+    return result;
+}
+
+/*
+ * SplitTopLevelCommas splits text on commas that are not nested inside
+ * parentheses, returning a List of palloc'd, whitespace-trimmed C-string
+ * chunks in left-to-right order -- used to break a SELECT list's text into
+ * one chunk per target-list entry without misreading a comma inside a
+ * nested function call (e.g. `atTime(t.Trip, p.Period)`) as a top-level
+ * separator.
+ */
+static List *
+SplitTopLevelCommas(const char *text)
+{
+    List *chunks = NIL;
+    int depth = 0;
+    const char *chunkStart = text;
+    const char *p = text;
+    for (; *p; p++)
+    {
+        if (*p == '(')
+            depth++;
+        else if (*p == ')')
+            depth--;
+        else if (*p == ',' && depth == 0)
+        {
+            chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
+            chunkStart = p + 1;
+        }
+    }
+    chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
+    return chunks;
+}
+
+/*
+ * RewriteReplicatedAggregateQuery detects an explicit aggregate (e.g.
+ * `SUM(length(atTime(t.Trip, p.Period)))`) whose argument references both
+ * a registered distributed function and a replicated table's column, and
+ * rewrites the query into a two-level shape: an inner query that
+ * DISTINCT-deduplicates on the replicated table's own row identifier
+ * (groupCol) before computing the aggregate's argument once per row, and
+ * an outer query that applies the original aggregate/GROUP BY over that
+ * already-deduplicated result, e.g.:
+ *
+ *   select l.licence, p.periodid, p.period, sum(length(atTime(t.trip, p.period))) as dist
+ *   from trips_16t t, licences1 l, periods1 p
+ *   where t.vehicleid = l.vehicleid and t.trip && p.period
+ *   group by l.licence, p.periodid, p.period
+ *   ->
+ *   select licence, periodid, period, sum(agg_input) as dist
+ *   from (
+ *     select distinct tripid, l.licence as licence, p.periodid as periodid, p.period as period,
+ *       length(atTime(t.trip, p.period)) as agg_input
+ *     from trips_16t t, licences1 l, periods1 p
+ *     where t.vehicleid = l.vehicleid and t.trip && p.period
+ *   ) as dedup_agg
+ *   group by licence, periodid, period
+ *
+ * Without this, a row belonging to a trip replicated across N tiles
+ * contributes to the SUM N times (once per tile) instead of once, silently
+ * multiplying the result -- confirmed empirically comparing BerlinMOD Q8
+ * against trips_16t vs. the non-distributed source table `trips` (~4.3x
+ * inflated, matching how many tiles the affected trips' bboxes touch).
+ *
+ * Deliberately narrow: only triggers when there's a GROUP BY (an
+ * ungrouped, single-aggregate query is already handled correctly by
+ * Citus' own native aggregate pushdown, same as `sum(length(trip)) as
+ * length` without a GROUP BY); only the first qualifying Aggref found is
+ * rewritten (a target list combining several different replicated
+ * aggregates isn't handled); SELECT DISTINCT/ALL, HAVING isn't supported
+ * (its own expression could reference the pre-rewrite raw aggregate,
+ * unsafe to carry over as-is); and an ORDER BY referencing anything other
+ * than a plain target-list entry, or containing DESC, bails out rather
+ * than risk getting the rebuilt ORDER BY wrong. All these return NULL,
+ * falling back to the pre-existing (still-incorrect-for-this-case)
+ * behavior rather than risking broken or silently-wrong SQL.
+ *
+ * Expression text is extracted by splitting the SELECT list's own text on
+ * top-level commas (SplitTopLevelCommas) and matching each resulting chunk
+ * positionally against parse->targetList -- guaranteed to line up 1:1 in
+ * the same left-to-right order by SQL's own parsing rules -- rather than
+ * deparsing each target entry's expression via a locally-planned
+ * statement: calling standard_planner() from this nested position inside
+ * our own already-executing planner_hook segfaulted the backend
+ * (reproduced reliably on this exact query), so this avoids calling into
+ * Postgres' planner internals at all.
+ */
+extern char *
+RewriteReplicatedAggregateQuery(Query *parse, const char *query_string, STMultirelations *tablesList)
+{
+    if (parse->groupClause == NIL)
+        return NULL;
+
+    TargetEntry *aggTargetEntry = NULL;
+    STMultirelation *replicatedTable = NULL;
+
+    ListCell *tlCell;
+    foreach(tlCell, parse->targetList)
+    {
+        TargetEntry *te = lfirst(tlCell);
+        if (te->resjunk || !IsA(te->expr, Aggref))
+            continue;
+
+        Aggref *aggref = (Aggref *) te->expr;
+        ReplicatedAggregateSearch search;
+        search.parse = parse;
+        search.tablesList = tablesList;
+        search.foundDistFunc = false;
+        search.replicatedTable = NULL;
+
+        ListCell *argCell;
+        foreach(argCell, aggref->args)
+        {
+            TargetEntry *argTe = (TargetEntry *) lfirst(argCell);
+            ReplicatedAggregateWalker((Node *) argTe->expr, &search);
+        }
+
+        if (search.foundDistFunc && search.replicatedTable != NULL)
+        {
+            aggTargetEntry = te;
+            replicatedTable = search.replicatedTable;
+            break;
+        }
+    }
+
+    if (aggTargetEntry == NULL || replicatedTable->catalogTableInfo.groupCol == NULL)
+        return NULL;
+
+    Aggref *aggref = (Aggref *) aggTargetEntry->expr;
+    if (list_length(aggref->args) != 1)
+        return NULL;
+
+    char *aggFuncName = get_func_name(aggref->aggfnoid);
+    if (aggFuncName == NULL)
+        return NULL;
+
+    /*
+     * Locate the SELECT list's own text span: skip leading whitespace,
+     * require the query to start with "select" (bail out on anything
+     * before it, e.g. a leading CTE -- not handled by this rewrite), skip
+     * DISTINCT/ALL (not handled either), then take everything up to the
+     * query's own " from " keyword.
+     */
+    char *lowered = toLower((char *) query_string);
+    char *cursor = lowered;
+    while (isspace((unsigned char) *cursor))
+        cursor++;
+    if (strncmp(cursor, "select", 6) != 0)
+        return NULL;
+    cursor += 6;
+    while (isspace((unsigned char) *cursor))
+        cursor++;
+    if (strncmp(cursor, "distinct", 8) == 0 || strncmp(cursor, "all ", 4) == 0)
+        return NULL;
+    size_t selectListStart = cursor - lowered;
+
+    char *fromKeyword = FindKeywordToken(lowered + selectListStart, "from");
+    if (fromKeyword == NULL)
+        return NULL;
+    size_t selectListEnd = fromKeyword - lowered;
+
+    char *selectListText = TrimmedSubstring(query_string + selectListStart, query_string + selectListEnd);
+    List *chunks = SplitTopLevelCommas(selectListText);
+
+    StringInfo innerSelectList = makeStringInfo();
+    StringInfo outerSelectList = makeStringInfo();
+    StringInfo groupByList = makeStringInfo();
+    char *aggArgText = NULL;
+
+    /*
+     * groupCol is always needed in the inner DISTINCT to safely disambiguate
+     * two different trips that happen to produce identical output on every
+     * *other* projected column (e.g. same licence/period/length by
+     * coincidence) -- but only added here if the caller's own target list
+     * doesn't already project it explicitly (e.g. `SELECT t.tripid, ...`);
+     * otherwise the inner subquery would end up with two same-named output
+     * columns, making that name ambiguous from the outer query.
+     */
+    bool groupColProjected = false;
+    foreach(tlCell, parse->targetList)
+    {
+        TargetEntry *te = lfirst(tlCell);
+        if (te->resjunk || te == aggTargetEntry)
+            continue;
+        if (TargetEntryReferencesGroupCol(te, parse, replicatedTable))
+        {
+            groupColProjected = true;
+            break;
+        }
+    }
+    if (!groupColProjected)
+        appendStringInfo(innerSelectList, "%s", replicatedTable->catalogTableInfo.groupCol);
+
+    ListCell *chunkCell = list_head(chunks);
+    foreach(tlCell, parse->targetList)
+    {
+        TargetEntry *te = lfirst(tlCell);
+        if (te->resjunk)
+            continue;
+        /* Chunk count not matching the target list means something about
+         * this query's shape wasn't anticipated -- bail out rather than
+         * risk pairing the wrong chunk with the wrong entry. */
+        if (chunkCell == NULL)
+            return NULL;
+        char *chunkText = (char *) lfirst(chunkCell);
+        chunkCell = lnext(chunks, chunkCell);
+
+        if (te == aggTargetEntry)
+        {
+            /* chunkText looks like "<aggFuncName>( ... ) [AS alias]" -- an
+             * explicit alias on the aggregate itself (as opposed to relying
+             * on its resname) leaves trailing text after the wrapper's own
+             * closing paren, so its end can't just be assumed to be the
+             * chunk's last character; walk paren depth from the opening '('
+             * to find the *matching* close instead (the argument itself
+             * nests parens, e.g. length(atTime(t.Trip, p.Period))), then
+             * ignore anything after it -- the alias is already known via
+             * te->resname regardless of what this chunk spells it as. */
+            size_t nameLen = strlen(aggFuncName);
+            char *chunkLower = toLower(chunkText);
+            if (strncmp(chunkLower, aggFuncName, nameLen) != 0)
+                return NULL;
+            char *afterName = chunkText + nameLen;
+            while (isspace((unsigned char) *afterName))
+                afterName++;
+            if (*afterName != '(')
+                return NULL;
+            char *argStart = afterName + 1;
+            char *scan = argStart;
+            int depth = 1;
+            while (*scan != '\0' && depth > 0)
+            {
+                if (*scan == '(')
+                    depth++;
+                else if (*scan == ')')
+                    depth--;
+                if (depth > 0)
+                    scan++;
+            }
+            if (depth != 0)
+                return NULL;
+            aggArgText = TrimmedSubstring(argStart, scan);
+            continue;
+        }
+
+        if (te->resname == NULL)
+            return NULL;
+
+        if (innerSelectList->len > 0)
+            appendStringInfoString(innerSelectList, ", ");
+        appendStringInfo(innerSelectList, "%s as %s", chunkText, te->resname);
+        if (outerSelectList->len > 0)
+            appendStringInfoString(outerSelectList, ", ");
+        appendStringInfoString(outerSelectList, te->resname);
+        if (groupByList->len > 0)
+            appendStringInfoString(groupByList, ", ");
+        appendStringInfoString(groupByList, te->resname);
+    }
+    /* Leftover chunks, or the aggregate's own chunk never matched, means
+     * the chunk count didn't line up with the target list -- bail out
+     * rather than risk a silently wrong rewrite. */
+    if (chunkCell != NULL || aggArgText == NULL)
+        return NULL;
+    appendStringInfo(innerSelectList, ", %s as agg_input", aggArgText);
+
+    /*
+     * Preserve the FROM/WHERE clause text verbatim (same "find ' from '"
+     * technique as RewriteSegmentedDistFuncCalls), up to the query's own
+     * GROUP BY keyword -- that clause's *column list* is discarded, since
+     * it's already been rebuilt above from the target list's own
+     * (resname-aliased) expressions, avoiding any ambiguity between a
+     * GROUP BY entry written as `l.Licence` and its output alias
+     * `licence`.
+     */
+    size_t fromOffset = fromKeyword - lowered;
+
+    char *loweredTail = lowered + fromOffset;
+    char *groupByKeyword = FindKeywordToken(loweredTail, "group by");
+    if (groupByKeyword == NULL)
+        return NULL;
+    size_t fromWhereLen = groupByKeyword - loweredTail;
+
+    char *fromWhereText = palloc(fromWhereLen + 1);
+    memcpy(fromWhereText, query_string + fromOffset, fromWhereLen);
+    fromWhereText[fromWhereLen] = '\0';
+
+    if (FindKeywordToken(groupByKeyword, "having") != NULL)
+        return NULL;
+
+    /*
+     * ORDER BY, if present, is rebuilt from parse->sortClause (matching
+     * each SortGroupClause's tleSortGroupRef back to the target entry it
+     * sorts by, then using that entry's own alias) rather than carried
+     * over as text -- the original text can reference a target entry via
+     * its *input* expression (e.g. `ORDER BY l.Licence`), which won't
+     * resolve against the rewritten outer query's plain-aliased columns
+     * (`licence`). DESC (or any other case this rebuild can't faithfully
+     * reproduce) bails out rather than risk silently reordering results
+     * wrong; LIMIT/OFFSET don't reference columns at all, so are safe to
+     * carry over as plain text.
+     */
+    StringInfo outerSuffix = makeStringInfo();
+    if (parse->sortClause != NIL)
+    {
+        char *afterGroupBy = groupByKeyword + strlen("group by");
+        char *orderByPos = FindKeywordToken(afterGroupBy, "order by");
+        if (orderByPos == NULL)
+            return NULL;
+        char *orderByEnd = NULL;
+        char *limitPos = FindKeywordToken(orderByPos, "limit");
+        char *offsetPos = FindKeywordToken(orderByPos, "offset");
+        if (limitPos != NULL && (orderByEnd == NULL || limitPos < orderByEnd))
+            orderByEnd = limitPos;
+        if (offsetPos != NULL && (orderByEnd == NULL || offsetPos < orderByEnd))
+            orderByEnd = offsetPos;
+        size_t orderByTextLen = orderByEnd != NULL ? (size_t) (orderByEnd - orderByPos) : strlen(orderByPos);
+        char *orderByText = palloc(orderByTextLen + 1);
+        memcpy(orderByText, orderByPos, orderByTextLen);
+        orderByText[orderByTextLen] = '\0';
+        if (strstr(orderByText, "desc") != NULL)
+            return NULL;
+
+        StringInfo rebuiltOrderBy = makeStringInfo();
+        ListCell *sortCell;
+        foreach(sortCell, parse->sortClause)
+        {
+            SortGroupClause *sortClause = (SortGroupClause *) lfirst(sortCell);
+            TargetEntry *matchedTe = NULL;
+            foreach(tlCell, parse->targetList)
+            {
+                TargetEntry *te = lfirst(tlCell);
+                if (!te->resjunk && te->ressortgroupref == sortClause->tleSortGroupRef)
+                {
+                    matchedTe = te;
+                    break;
+                }
+            }
+            if (matchedTe == NULL || matchedTe->resname == NULL)
+                return NULL;
+            if (rebuiltOrderBy->len > 0)
+                appendStringInfoString(rebuiltOrderBy, ", ");
+            appendStringInfoString(rebuiltOrderBy, matchedTe->resname);
+        }
+        appendStringInfo(outerSuffix, " order by %s", rebuiltOrderBy->data);
+        if (orderByEnd != NULL)
+            appendStringInfo(outerSuffix, " %s", orderByEnd);
+    }
+    else
+    {
+        char *afterGroupBy = groupByKeyword + strlen("group by");
+        char *limitPos = FindKeywordToken(afterGroupBy, "limit");
+        char *offsetPos = FindKeywordToken(afterGroupBy, "offset");
+        char *tailStart = NULL;
+        if (limitPos != NULL && (tailStart == NULL || limitPos < tailStart))
+            tailStart = limitPos;
+        if (offsetPos != NULL && (tailStart == NULL || offsetPos < tailStart))
+            tailStart = offsetPos;
+        if (tailStart != NULL)
+            appendStringInfo(outerSuffix, " %s", tailStart);
+    }
+
+    /* Strip a trailing ";"/whitespace so the constructed query stays valid SQL. */
+    if (outerSuffix->len > 0)
+    {
+        size_t suffixLen = outerSuffix->len;
+        while (suffixLen > 0 && (outerSuffix->data[suffixLen - 1] == ';' ||
+                                 isspace((unsigned char) outerSuffix->data[suffixLen - 1])))
+            suffixLen--;
+        outerSuffix->data[suffixLen] = '\0';
+    }
+    else
+    {
+        size_t fwLen = strlen(fromWhereText);
+        while (fwLen > 0 && (fromWhereText[fwLen - 1] == ';' || isspace((unsigned char) fromWhereText[fwLen - 1])))
+            fwLen--;
+        fromWhereText[fwLen] = '\0';
+    }
+
+    StringInfo innerQuery = makeStringInfo();
+    /* fromWhereText already starts with "from " (see fromOffset above), so
+     * no literal "from" is added here -- doing so produced "... from from
+     * trips_16t ..." as invalid SQL. */
+    appendStringInfo(innerQuery, "select distinct %s %s", innerSelectList->data, fromWhereText);
+
+    StringInfo outerQuery = makeStringInfo();
+    appendStringInfo(outerQuery, "select %s, %s(agg_input) as %s from (%s) as dedup_agg group by %s%s",
+                     outerSelectList->data, aggFuncName, aggTargetEntry->resname,
+                     innerQuery->data, groupByList->data, outerSuffix->data);
+    return outerQuery->data;
+}
+
+/*
+ * FindCTEBodySpan locates cteName's own body text -- the span strictly
+ * between its "AS (" and the matching close paren -- within query_string.
+ * Uses the same whitespace-tolerant (FindKeywordToken) and paren-depth
+ * (walked manually here, since the open paren itself is what's being
+ * searched for, not a keyword) techniques used throughout this file.
+ * Returns true and sets *bodyStart/*bodyEnd (pointers into query_string;
+ * [start, end) exclusive of the parens themselves) on success; false if
+ * "<cteName> AS (" couldn't be located, or its parens are unbalanced.
+ */
+static bool
+FindCTEBodySpan(const char *query_string, const char *cteName, const char **bodyStart, const char **bodyEnd)
+{
+    char *lowered = toLower((char *) query_string);
+    char *loweredCteName = toLower((char *) cteName);
+    char *cursor = lowered;
+    while ((cursor = FindKeywordToken(cursor, loweredCteName)) != NULL)
+    {
+        char *afterName = cursor + strlen(loweredCteName);
+        while (isspace((unsigned char) *afterName))
+            afterName++;
+        /* Only accept "as" immediately following the name (mere whitespace
+         * in between, nothing else) -- a bare cteName match elsewhere in
+         * the string (e.g. inside the CTE's own body, referencing itself,
+         * or in a comment) isn't this CTE's own "<name> AS (" definition. */
+        bool isAsKeyword = strncmp(afterName, "as", 2) == 0 &&
+                            (isspace((unsigned char) afterName[2]) || afterName[2] == '(');
+        if (isAsKeyword)
+        {
+            char *afterAs = afterName + 2;
+            while (isspace((unsigned char) *afterAs))
+                afterAs++;
+            if (*afterAs == '(')
+            {
+                char *scan = afterAs + 1;
+                int depth = 1;
+                while (*scan != '\0' && depth > 0)
+                {
+                    if (*scan == '(')
+                        depth++;
+                    else if (*scan == ')')
+                        depth--;
+                    if (depth > 0)
+                        scan++;
+                }
+                if (depth == 0)
+                {
+                    *bodyStart = query_string + ((afterAs + 1) - lowered);
+                    *bodyEnd = query_string + (scan - lowered);
+                    return true;
+                }
+            }
+        }
+        cursor++;
+    }
+    return false;
+}
+
+/*
+ * RewriteReplicatedAggregateInCTEs generalizes RewriteReplicatedAggregateQuery
+ * to reach *inside* a query's own CTEs -- e.g.
+ *   WITH Distances AS (
+ *     SELECT p.PeriodId, p.Period, t.VehicleId,
+ *       SUM(length(atTime(t.Trip, p.Period))) AS Dist
+ *     FROM trips_16t t, periods_ref p
+ *     WHERE t.Trip && p.Period
+ *     GROUP BY p.PeriodId, p.Period, t.VehicleId
+ *   )
+ *   SELECT PeriodId, Period, MAX(Dist) AS MaxDist FROM Distances
+ *   GROUP BY PeriodId, Period ORDER BY PeriodId
+ * has the exact same replication-overcounting problem as BerlinMOD Q8
+ * (SUM(length(atTime(...))) over a replicated table, per-tile-copy
+ * overcounted instead of deduplicated) -- just one level down, inside the
+ * CTE, rather than at the top level. RewriteReplicatedAggregateQuery only
+ * ever looked at the top-level query's own targetList/groupClause, so it
+ * never saw this shape at all (the top level's own aggregate, MAX(Dist),
+ * takes a plain Var on the CTE's *output* column -- no distributed
+ * function call in sight from up there).
+ *
+ * For each of parse's CTEs (in order, so a later CTE's own body span is
+ * always located within the *already-rewritten* text if an earlier one
+ * changed), locates that CTE's own body text (FindCTEBodySpan) and runs
+ * the existing single-query rewrite against it (cte->ctequery is a
+ * complete, independent Query, so RewriteReplicatedAggregateQuery's
+ * existing logic -- which was already written generically against
+ * whatever Query/text pair it's handed, not hardcoded to the top level --
+ * applies unchanged); if it rewrote anything, splices the rewritten body
+ * text back in place of the original and keeps going. Returns the final
+ * combined query_string if any CTE was rewritten, NULL if none needed it
+ * (or parse has no CTEs at all).
+ */
+extern char *
+RewriteReplicatedAggregateInCTEs(Query *parse, const char *query_string, STMultirelations *tablesList)
+{
+    if (parse->cteList == NIL)
+        return NULL;
+
+    char *currentQueryString = NULL;
+    bool rewroteAny = false;
+
+    ListCell *cteCell;
+    foreach(cteCell, parse->cteList)
+    {
+        CommonTableExpr *cte = (CommonTableExpr *) lfirst(cteCell);
+        if (!IsA(cte->ctequery, Query))
+            continue;
+        Query *cteQuery = (Query *) cte->ctequery;
+
+        const char *base = currentQueryString != NULL ? currentQueryString : query_string;
+        const char *bodyStart, *bodyEnd;
+        if (!FindCTEBodySpan(base, cte->ctename, &bodyStart, &bodyEnd))
+            continue;
+
+        char *cteBodyText = TrimmedSubstring(bodyStart, bodyEnd);
+        char *rewrittenBody = RewriteReplicatedAggregateQuery(cteQuery, cteBodyText, tablesList);
+        if (rewrittenBody == NULL)
+            continue;
+
+        StringInfo combined = makeStringInfo();
+        appendBinaryStringInfo(combined, base, bodyStart - base);
+        appendStringInfoString(combined, rewrittenBody);
+        appendStringInfoString(combined, bodyEnd);
+        currentQueryString = combined->data;
+        rewroteAny = true;
+    }
+    return rewroteAny ? currentQueryString : NULL;
 }
 
 /*
