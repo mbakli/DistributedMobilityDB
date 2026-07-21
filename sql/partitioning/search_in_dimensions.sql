@@ -1,24 +1,39 @@
 ----------------------------------------------------------------------------------------------------------------------
+-- Granularity-aware bucket assignment (equal row count vs. equal weighted count)
+----------------------------------------------------------------------------------------------------------------------
+/*
+ * Returns a window-function expression (text, spliced into the caller's own
+ * dynamic SELECT) that assigns each row to one of num_buckets_expr buckets:
+ * plain ntile() (equal ROW count) for 'shape-based'; a cumulative-weight
+ * quantile bucketing (equal TOTAL WEIGHT, e.g. instant count) for
+ * 'point-based', which ntile() can't express. weight_expr/order_expr are
+ * caller-supplied expression text; partition_clause is '' or a literal
+ * 'PARTITION BY ...'. Used by period_method and hierarchical_method so both
+ * respect tiling.granularity.
+ */
+CREATE OR REPLACE FUNCTION WeightedNtileExpr(granularity text, num_buckets_expr text, weight_expr text, partition_clause text, order_expr text)
+    RETURNS text AS $$
+BEGIN
+    IF granularity = 'point-based' THEN
+        RETURN format(
+            'LEAST(%s, GREATEST(1, ceil(sum(%s) OVER (%s ORDER BY %s) * %s::numeric / sum(%s) OVER (%s))))::integer',
+            num_buckets_expr, weight_expr, partition_clause, order_expr, num_buckets_expr, weight_expr, partition_clause);
+    ELSE
+        RETURN format('ntile(%s) OVER (%s ORDER BY %s)', num_buckets_expr, partition_clause, order_expr);
+    END IF;
+END;
+$$ LANGUAGE 'plpgsql';
+
+----------------------------------------------------------------------------------------------------------------------
 -- Warning for an undersized shared_buffers relative to the table being distributed
 ----------------------------------------------------------------------------------------------------------------------
 /*
- * WarnIfSharedBuffersUndersized emits a RAISE WARNING (nothing else -- no
- * config is changed) when table_name_in's on-disk size exceeds the
- * instance's shared_buffers. Unlike the parallel-query settings below,
- * shared_buffers has GUC context 'postmaster': it can only be set at server
- * startup (postgresql.conf + a restart) and can't be changed, even
- * temporarily, from a running session or function -- so there is no
- * automatic fix to apply here, only a diagnostic.
- *
- * Confirmed by direct measurement this matters: BinarySearch and the
- * segmentation/allocation step both repeatedly re-scan overlapping portions
- * of table_name_in. With shared_buffers smaller than the table, every one
- * of those scans re-fetches from the OS page cache into Postgres' own
- * buffers from scratch (observed: 3 back-to-back identical queries all
- * showed ~68.5k buffer *reads*, 0 improvement between runs). Raising
- * shared_buffers past the table's size on the same test data/queries
- * showed the 2nd/3rd run drop to 0 reads (100% hit), and cut a real
- * 4-tile distribution's total time from ~68s to ~59s.
+ * RAISE WARNING (no config change -- shared_buffers is postmaster-context,
+ * restart-only) when table_name_in's on-disk size exceeds shared_buffers.
+ * Confirmed to matter: BinarySearch/segmentation repeatedly re-scan
+ * overlapping portions of the table; undersized, every scan re-fetches from
+ * OS cache with 0% hit rate, versus 100% once shared_buffers covers it
+ * (measured ~68s -> ~59s on a real 4-tile distribution).
  */
 CREATE OR REPLACE FUNCTION WarnIfSharedBuffersUndersized(table_name_in text)
     RETURNS void AS $$
@@ -39,33 +54,14 @@ $$ LANGUAGE 'plpgsql';
 -- Auto-tuning parallel query settings for BinarySearch
 ----------------------------------------------------------------------------------------------------------------------
 /*
- * AutoTuneParallelQueryForDistribution derives and applies transaction-local
- * parallel-query settings from specs Postgres already knows about this
- * machine, so BinarySearch's repeated count(*)/sum(numInstants(...)) scans
- * below (up to ~100 rounds per dimension split, each independently
- * seq-scanning the source table) can actually use its idle cores instead of
- * running serially under the (usually conservative) session/database
- * defaults -- confirmed the planner never parallelizes these on its own,
- * since max_parallel_workers_per_gather defaults to 2 and its cost model
- * doesn't account for MobilityDB's && overlap operator being expensive
- * per-row on tgeompoint (large TOASTed trajectories).
- *
- * max_parallel_workers is the instance-wide cap on concurrently active
- * parallel workers, already sized to this machine by whoever configured
- * postgresql.conf (defaults to max_worker_processes, itself normally set
- * relative to CPU count) -- plain SQL/plpgsql has no direct nproc()-style
- * primitive, so reading this GUC back is the portable stand-in for "how
- * much parallelism does Postgres think this machine can support." Applied
- * via set_config(..., true) (transaction-local, like SET LOCAL): reverts
- * automatically at the end of the calling transaction, never leaking into
- * the caller's session. Does not touch BinarySearch/crange_method's own
- * search logic -- called once, at the top of
- * create_spatiotemporal_distributed_table.
- *
- * Measured effect (BerlinMOD SF1, 4-tile `trips` distribution): tile
- * generation went from 4m13s to 1m7s (~3.8x) with max_parallel_workers=8
- * on the test machine; the actual number here scales with whatever
- * max_parallel_workers is configured to on the host it runs on.
+ * Applies transaction-local parallel-query settings (via set_config(...,
+ * true), auto-reverting -- never leaks into the caller's session) derived
+ * from max_parallel_workers, so BinarySearch's repeated scans can use idle
+ * cores instead of running serially under conservative defaults (the
+ * planner never parallelizes these on its own: default
+ * max_parallel_workers_per_gather=2, and its cost model underrates
+ * MobilityDB's && operator on large TOASTed trajectories). Doesn't touch any
+ * search logic. Measured ~3.8x (4m13s -> 1m7s) on a 4-tile BerlinMOD SF1 run.
  */
 CREATE OR REPLACE FUNCTION AutoTuneParallelQueryForDistribution()
     RETURNS void AS $$

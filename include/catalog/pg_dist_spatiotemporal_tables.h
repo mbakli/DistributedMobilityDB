@@ -8,7 +8,7 @@
  * the Free Software Foundation, either version 2 of the License, or
  * (at your option) any later version.
  *
- * Copyright (c) 2023-2024 Mohamed Bakli <mohamed_bakli@hotmail.com>
+ * Copyright (c) 2020-2026 Mohamed Bakli <mohamed_bakli@hotmail.com>
  *
  *****************************************************************************/
 

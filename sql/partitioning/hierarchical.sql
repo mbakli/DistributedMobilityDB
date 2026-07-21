@@ -5,11 +5,9 @@
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 
 /*
- * DetermineHierarchicalPeriods reports each period's boundaries/count from an
- * already-populated period_assign_table (row_id, period_no, row_ts, geohash)
- * -- see hierarchical_method, which assigns period_no via a single ntile()
- * pass before calling this. Kept separate from that assignment step so the
- * boundary-reporting logic is independently readable/testable.
+ * Reports each period's boundaries/count from an already-populated
+ * period_assign_table (row_id, period_no, row_ts, geohash, weight) --
+ * hierarchical_method assigns period_no before calling this.
  */
 CREATE OR REPLACE FUNCTION DetermineHierarchicalPeriods(period_assign_table text)
     RETURNS TABLE(period_no integer, period_start timestamptz, period_end timestamptz, period_count bigint) AS $$
@@ -23,54 +21,33 @@ END;
 $$ LANGUAGE 'plpgsql';
 
 /*
- * hierarchical_method builds a spatiotemporal tiling scheme for table_name_in
- * as (period x spatial-chunk) STBOX cells:
+ * hierarchical_method tiles table_name_in as (period x spatial-chunk) STBOX
+ * cells: every trajectory is assigned to one of num_periods equi-count
+ * temporal periods (by start time), then within each period bucketed by
+ * geohash (a Z-order/Morton-locality proxy) into tiles_per_period further
+ * equi-count spatial chunks. num_periods/tiles_per_period are auto-derived
+ * from tiling.numTiles as a balanced sqrt split.
  *
- *  1. Every trajectory is assigned to one of num_periods temporal periods via
- *     ntile() ordered by its start time -- equi-COUNT periods (~the same
- *     number of trajectories each), not equi-duration.
- *  2. Within each period, every trajectory's centroid is geohashed (a cheap,
- *     built-in Z-order/Morton-locality proxy: sorting by geohash string
- *     approximates a Z-order curve traversal without hand-written bit
- *     interleaving) and rows are bucketed into tiles_per_period further
- *     equi-count chunks ordered along that geohash -- so each chunk is
- *     spatially coherent (nearby trajectories grouped together).
+ * The per-period bucketing runs against a plain LOCAL table (intra-node
+ * parallel workers), not a second Citus-distributed table: an earlier
+ * version distributed it by period_no for genuine cross-worker concurrency
+ * (confirmed via EXPLAIN to push down per-shard, no repartition), but a
+ * second Citus-distributed table in the same transaction as the output
+ * table's own distribution corrupted worker connections under load
+ * (reproducible at num_tiles=8+: COPY protocol errors, silently-missing
+ * shards). Fixing that needs FUNCTIONs -> PROCEDUREs so the period table can
+ * commit separately -- out of scope for now.
  *
- * num_periods/tiles_per_period are auto-derived from tiling.numTiles (the
- * caller's total tile budget) as a balanced sqrt split, so the total
- * produced tile count never exceeds it (see the RAISE INFO below for the
- * exact numbers chosen).
+ * Scope: MobilityDB sequence/sequenceset columns only. Same flat
+ * catalog-table lifecycle as crange_method (build the temp catalog table,
+ * assign tileKey once, single add_distributed_table_metadata call) -- also
+ * what keeps this race-free, since every catalog write happens serially here
+ * after all per-shard computation is done.
  *
- * Concurrency: the per-period spatial bucketing (step 2 above) runs against a
- * PLAIN LOCAL (non-Citus-distributed) period-assignment table, using ordinary
- * intra-node parallel query workers (already tuned by
- * AutoTuneParallelQueryForDistribution) rather than spreading it across
- * worker nodes via a second Citus-distributed table. An earlier version of
- * this function did Citus-distribute the period-assignment table by
- * period_no for genuine cross-worker concurrency -- confirmed via EXPLAIN to
- * push the partition-aligned window function down per-shard with no
- * repartition step -- but creating and dropping a *second* Citus-distributed
- * table within the same transaction as the real output table's own
- * distribution corrupted Citus's worker connections under load: reproducibly
- * (not a one-off race) triggered "unexpected message type 0x58 during COPY
- * from stdin" / "protocol synchronization was lost" on worker connections at
- * num_tiles=8, with some shards silently never created at all ("relation ...
- * does not exist" mid-COPY). Fixing that properly would require converting
- * this call chain from FUNCTIONs to PROCEDUREs so the period-assignment
- * table's lifecycle could commit in its own transaction before the output
- * table's distribution begins (plain PL/pgSQL FUNCTIONs can't issue COMMIT
- * internally) -- a much larger, more invasive change than reverting to
- * single-node parallelism here.
- *
- * Scope: MobilityDB sequence/sequenceset (trajectory) columns only, shape-
- * based (trajectory-count) granularity -- mirrors crange_method's own flat
- * per-call catalog-table lifecycle (build <table_name_out>_catalog across
- * the whole run, assign tileKey serial once at the end, one single
- * add_distributed_table_metadata call) so the same query-time C code and
- * Citus shard-creation helpers (create_range_shards) that already work for
- * crange work here unchanged, and so no concurrent-writer race exists on
- * pg_dist_spatiotemporal_tiles (every write to shared catalog state happens
- * serially, in this one function, after all per-shard computation is done).
+ * Granularity: 'point-based' buckets both periods and spatial chunks by
+ * total instant count (via WeightedNtileExpr) instead of trajectory count;
+ * each row's weight is computed once and stored in period_assign_table for
+ * reuse in the spatial bucketing step.
  */
 CREATE OR REPLACE FUNCTION hierarchical_method(table_name_in text, table_name_out text, tiling tiling)
     RETURNS integer AS $$
@@ -90,6 +67,9 @@ DECLARE
     chunk_extent stbox;
     chunk_numshapes integer;
     chunk_numpoints bigint;
+    weight_expr text;
+    period_bucket_expr text;
+    spatial_bucket_expr text;
 BEGIN
     start_time := clock_timestamp();
     PERFORM AutoTuneParallelQueryForDistribution();
@@ -101,30 +81,36 @@ BEGIN
 
     num_periods := GREATEST(1, floor(sqrt(tiling.numTiles))::integer);
     tiles_per_period := GREATEST(1, floor(tiling.numTiles::numeric / num_periods)::integer);
-    RAISE INFO 'Hierarchical tiling: % period(s) x ~% spatial tile(s)/period (target %, max %)',
-        num_periods, tiles_per_period, tiling.numTiles, num_periods * tiles_per_period;
+    RAISE INFO 'Hierarchical tiling: % period(s) x ~% spatial tile(s)/period (target %, max %), granularity=%',
+        num_periods, tiles_per_period, tiling.numTiles, num_periods * tiles_per_period, tiling.granularity;
 
     PERFORM create_catalog_table(table_name_out, tiling.isMobilityDB);
     catalog_table := concat(table_name_out, '_catalog');
 
-    -- Step 1: plain local table -- see the concurrency note above for why
-    -- this isn't Citus-distributed.
+    -- Plain local table (see concurrency note above); weight is each row's
+    -- bucketing weight, computed once and reused by the chunking step below.
     period_assign_table := concat(table_name_out, '_period_assign');
     EXECUTE format('DROP TABLE IF EXISTS %I', period_assign_table);
-    EXECUTE format('CREATE TABLE %I (row_id integer, period_no integer, row_ts timestamptz, geohash text)', period_assign_table);
+    EXECUTE format('CREATE TABLE %I (row_id integer, period_no integer, row_ts timestamptz, geohash text, weight numeric)', period_assign_table);
 
-    -- Step 2: single pass -- assign every trajectory its period (equi-count,
-    -- by start time) and its Z-order proxy (geohash of its centroid), in one
-    -- INSERT ... SELECT over table_name_in. Plain local INSERT, eligible for
-    -- the same intra-node parallel workers AutoTuneParallelQueryForDistribution
-    -- already tunes for BinarySearch's scans elsewhere in this extension.
+    -- Single pass: assign each trajectory its period and Z-order proxy (geohash of its centroid).
     centroid_expr := format('ST_Transform(ST_SetSRID(ST_Centroid(trajectory(%I)), %s), 4326)', tiling.distCol, tiling.srid);
 
+    IF tiling.granularity = 'point-based' THEN
+        weight_expr := format('numInstants(%I)', tiling.distCol);
+    ELSE
+        weight_expr := '1';
+    END IF;
+    period_bucket_expr := WeightedNtileExpr(tiling.granularity, num_periods::text, 'w', '', 't');
+
     EXECUTE format('
-        INSERT INTO %I (row_id, period_no, row_ts, geohash)
-        SELECT %I, ntile(%s) OVER (ORDER BY starttimestamp(%I)), starttimestamp(%I), ST_GeoHash(%s, 20)
-        FROM %I',
-        period_assign_table, tiling.groupCol, num_periods, tiling.distCol, tiling.distCol, centroid_expr, table_name_in);
+        INSERT INTO %I (row_id, period_no, row_ts, geohash, weight)
+        SELECT row_id, %s, t, geohash, w
+        FROM (
+            SELECT %I AS row_id, starttimestamp(%I) AS t, ST_GeoHash(%s, 20) AS geohash, (%s)::numeric AS w
+            FROM %I
+        ) base',
+        period_assign_table, period_bucket_expr, tiling.groupCol, tiling.distCol, centroid_expr, weight_expr, table_name_in);
 
     -- Report + cache period boundaries (used below for each chunk's temporal range).
     period_starts := array_fill(NULL::timestamptz, ARRAY[num_periods]);
@@ -135,25 +121,23 @@ BEGIN
         period_ends[period_rec.period_no] := period_rec.period_end;
     END LOOP;
 
-    -- Step 3: within each period, bucket rows into tiles_per_period
-    -- equi-count, geohash-ordered chunks (PARTITION BY period_no keeps each
-    -- period's ntile() independent of the others).
+    -- Within each period, bucket into tiles_per_period geohash-ordered chunks
+    -- (PARTITION BY period_no keeps periods independent).
+    spatial_bucket_expr := WeightedNtileExpr(tiling.granularity, tiles_per_period::text, 'weight', 'PARTITION BY period_no', 'geohash');
     FOR chunk_rec IN
         EXECUTE format('
             SELECT period_no, spatial_chunk, array_agg(row_id) AS row_ids
             FROM (
                 SELECT row_id, period_no,
-                       ntile(%s) OVER (PARTITION BY period_no ORDER BY geohash) AS spatial_chunk
+                       %s AS spatial_chunk
                 FROM %I
             ) bucketed
             GROUP BY period_no, spatial_chunk
             ORDER BY period_no, spatial_chunk',
-            tiles_per_period, period_assign_table)
+            spatial_bucket_expr, period_assign_table)
     LOOP
-        -- Step 4: this chunk's tight spatial bbox, combined with its period's
-        -- temporal range -- same extent()/STBOX() construction pattern
-        -- crange_method uses throughout (xmin/xmax/ymin/ymax of a single
-        -- extent() call, wrapped into an envelope + tstzspan).
+        -- This chunk's tight spatial bbox + its period's temporal range,
+        -- via the same extent()/STBOX() pattern crange_method uses.
         EXECUTE format('SELECT extent(%I), count(*), sum(numInstants(%I)) FROM %I WHERE %I = ANY(%L)',
             tiling.distCol, tiling.distCol, table_name_in, tiling.groupCol, chunk_rec.row_ids)
         INTO chunk_stbox, chunk_numshapes, chunk_numpoints;
@@ -170,12 +154,8 @@ BEGIN
             chunk_rec.period_no, chunk_rec.spatial_chunk, chunk_extent, chunk_numshapes, chunk_numpoints;
     END LOOP;
 
-    -- Same finishing pattern as crange_method: assign dense tileKey values
-    -- once, refresh tiling.numTiles to the REAL produced count (only known
-    -- now, unlike crange's fixed-upfront count) before the single
-    -- add_distributed_table_metadata call -- avoids any concurrent-write
-    -- race on pg_dist_spatiotemporal_tiles, since every write above only
-    -- ever touched this one local temp catalog table.
+    -- Same finishing pattern as crange_method: assign tileKey once, refresh
+    -- tiling.numTiles to the real produced count, single metadata call.
     EXECUTE format('ALTER TABLE %I ADD column %I serial', catalog_table, tiling.tileKey);
     EXECUTE format('SELECT count(*) FROM %I', catalog_table) INTO tiling.numTiles;
 
