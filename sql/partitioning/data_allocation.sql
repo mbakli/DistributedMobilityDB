@@ -9,7 +9,19 @@ DECLARE
     group_by_clause text;
     org_table_name_in varchar(250);
 BEGIN
-    IF tiling.isMobilityDB and tiling.internalType not in('point','polygon', 'instant') and tiling.granularity = 'point-based' THEN
+    /*
+     * The exploded-per-instant _temp table is crange_method's own
+     * point-based preprocessing convention (create_temporary_points_table,
+     * see crange.sql) -- hierarchical_method/period_method also support
+     * tiling.granularity = 'point-based' (weighting each row's bucket
+     * assignment by its instant count via WeightedNtileExpr) but do so
+     * directly against the original whole-trajectory table, without ever
+     * creating that exploded table, so swapping to it here for their
+     * point-based runs errored with "relation ... _temp does not exist".
+     * Scoped to tiling.method = 'crange' specifically rather than to
+     * granularity alone.
+     */
+    IF tiling.method = 'crange' and tiling.isMobilityDB and tiling.internalType not in('point','polygon', 'instant') and tiling.granularity = 'point-based' THEN
         org_table_name_in := table_name_in;
         table_name_in := concat(table_name_in, '_temp');
     ELSE
