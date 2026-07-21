@@ -1,4 +1,45 @@
 ----------------------------------------------------------------------------------------------------------------------
+-- Granularity-aware bucket assignment (equal row count vs. equal weighted count)
+----------------------------------------------------------------------------------------------------------------------
+/*
+ * WeightedNtileExpr returns a SQL window-function EXPRESSION (as text, to be
+ * spliced into a caller's own dynamic SELECT) that assigns each row to one of
+ * num_buckets_expr buckets:
+ *  - granularity = 'shape-based' (or anything else): plain
+ *    ntile(num_buckets) OVER (partition_clause ORDER BY order_expr) --
+ *    every row counts equally, so each bucket gets ~the same ROW count.
+ *  - granularity = 'point-based': a cumulative-weight quantile bucketing --
+ *    each bucket instead gets ~the same TOTAL WEIGHT (e.g. sum of instant
+ *    counts), which plain ntile() can't express since it only equalizes row
+ *    counts, not a per-row weight. Buckets stay contiguous along order_expr
+ *    (running sum is monotonic in that order), same as ntile()'s own
+ *    contiguous-range behavior.
+ *
+ * weight_expr/order_expr are caller-supplied SQL expression text (already
+ * resolved against the caller's own query, e.g. a CTE column alias) -- this
+ * function only assembles the window-function text, it never touches any
+ * table itself. partition_clause is either '' (no partitioning) or a literal
+ * 'PARTITION BY ...' clause.
+ *
+ * Used by period_method (bucketing whole trajectories into temporal periods)
+ * and hierarchical_method (both its temporal period step and its per-period
+ * spatial Z-order chunking step) so both respect tiling.granularity instead
+ * of always assuming equal-row-count (shape-based) splitting.
+ */
+CREATE OR REPLACE FUNCTION WeightedNtileExpr(granularity text, num_buckets_expr text, weight_expr text, partition_clause text, order_expr text)
+    RETURNS text AS $$
+BEGIN
+    IF granularity = 'point-based' THEN
+        RETURN format(
+            'LEAST(%s, GREATEST(1, ceil(sum(%s) OVER (%s ORDER BY %s) * %s::numeric / sum(%s) OVER (%s))))::integer',
+            num_buckets_expr, weight_expr, partition_clause, order_expr, num_buckets_expr, weight_expr, partition_clause);
+    ELSE
+        RETURN format('ntile(%s) OVER (%s ORDER BY %s)', num_buckets_expr, partition_clause, order_expr);
+    END IF;
+END;
+$$ LANGUAGE 'plpgsql';
+
+----------------------------------------------------------------------------------------------------------------------
 -- Warning for an undersized shared_buffers relative to the table being distributed
 ----------------------------------------------------------------------------------------------------------------------
 /*

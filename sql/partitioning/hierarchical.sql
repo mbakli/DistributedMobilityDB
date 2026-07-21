@@ -6,10 +6,11 @@
 
 /*
  * DetermineHierarchicalPeriods reports each period's boundaries/count from an
- * already-populated period_assign_table (row_id, period_no, row_ts, geohash)
- * -- see hierarchical_method, which assigns period_no via a single ntile()
- * pass before calling this. Kept separate from that assignment step so the
- * boundary-reporting logic is independently readable/testable.
+ * already-populated period_assign_table (row_id, period_no, row_ts, geohash,
+ * weight) -- see hierarchical_method, which assigns period_no via a single
+ * WeightedNtileExpr-driven pass before calling this. Kept separate from that
+ * assignment step so the boundary-reporting logic is independently
+ * readable/testable.
  */
 CREATE OR REPLACE FUNCTION DetermineHierarchicalPeriods(period_assign_table text)
     RETURNS TABLE(period_no integer, period_start timestamptz, period_end timestamptz, period_count bigint) AS $$
@@ -62,15 +63,23 @@ $$ LANGUAGE 'plpgsql';
  * internally) -- a much larger, more invasive change than reverting to
  * single-node parallelism here.
  *
- * Scope: MobilityDB sequence/sequenceset (trajectory) columns only, shape-
- * based (trajectory-count) granularity -- mirrors crange_method's own flat
- * per-call catalog-table lifecycle (build <table_name_out>_catalog across
- * the whole run, assign tileKey serial once at the end, one single
- * add_distributed_table_metadata call) so the same query-time C code and
- * Citus shard-creation helpers (create_range_shards) that already work for
- * crange work here unchanged, and so no concurrent-writer race exists on
- * pg_dist_spatiotemporal_tiles (every write to shared catalog state happens
- * serially, in this one function, after all per-shard computation is done).
+ * Scope: MobilityDB sequence/sequenceset (trajectory) columns only. Mirrors
+ * crange_method's own flat per-call catalog-table lifecycle (build
+ * <table_name_out>_catalog across the whole run, assign tileKey serial once
+ * at the end, one single add_distributed_table_metadata call) so the same
+ * query-time C code and Citus shard-creation helpers (create_range_shards)
+ * that already work for crange work here unchanged, and so no
+ * concurrent-writer race exists on pg_dist_spatiotemporal_tiles (every write
+ * to shared catalog state happens serially, in this one function, after all
+ * per-shard computation is done).
+ *
+ * Granularity-aware: tiling.granularity = 'point-based' buckets both the
+ * temporal periods AND the per-period spatial chunks so each gets ~the same
+ * TOTAL instant count (via WeightedNtileExpr), instead of the default
+ * 'shape-based' ~equal trajectory COUNT. Each row's weight (numInstants, or
+ * 1 for shape-based) is computed once during the initial INSERT and stored
+ * in period_assign_table's own weight column, reused for the spatial
+ * bucketing step rather than recomputed.
  */
 CREATE OR REPLACE FUNCTION hierarchical_method(table_name_in text, table_name_out text, tiling tiling)
     RETURNS integer AS $$
@@ -90,6 +99,9 @@ DECLARE
     chunk_extent stbox;
     chunk_numshapes integer;
     chunk_numpoints bigint;
+    weight_expr text;
+    period_bucket_expr text;
+    spatial_bucket_expr text;
 BEGIN
     start_time := clock_timestamp();
     PERFORM AutoTuneParallelQueryForDistribution();
@@ -101,30 +113,44 @@ BEGIN
 
     num_periods := GREATEST(1, floor(sqrt(tiling.numTiles))::integer);
     tiles_per_period := GREATEST(1, floor(tiling.numTiles::numeric / num_periods)::integer);
-    RAISE INFO 'Hierarchical tiling: % period(s) x ~% spatial tile(s)/period (target %, max %)',
-        num_periods, tiles_per_period, tiling.numTiles, num_periods * tiles_per_period;
+    RAISE INFO 'Hierarchical tiling: % period(s) x ~% spatial tile(s)/period (target %, max %), granularity=%',
+        num_periods, tiles_per_period, tiling.numTiles, num_periods * tiles_per_period, tiling.granularity;
 
     PERFORM create_catalog_table(table_name_out, tiling.isMobilityDB);
     catalog_table := concat(table_name_out, '_catalog');
 
     -- Step 1: plain local table -- see the concurrency note above for why
-    -- this isn't Citus-distributed.
+    -- this isn't Citus-distributed. weight stores each row's bucketing
+    -- weight (numInstants for point-based, 1 for shape-based) computed once
+    -- here and reused by the spatial chunking step below.
     period_assign_table := concat(table_name_out, '_period_assign');
     EXECUTE format('DROP TABLE IF EXISTS %I', period_assign_table);
-    EXECUTE format('CREATE TABLE %I (row_id integer, period_no integer, row_ts timestamptz, geohash text)', period_assign_table);
+    EXECUTE format('CREATE TABLE %I (row_id integer, period_no integer, row_ts timestamptz, geohash text, weight numeric)', period_assign_table);
 
-    -- Step 2: single pass -- assign every trajectory its period (equi-count,
-    -- by start time) and its Z-order proxy (geohash of its centroid), in one
-    -- INSERT ... SELECT over table_name_in. Plain local INSERT, eligible for
-    -- the same intra-node parallel workers AutoTuneParallelQueryForDistribution
-    -- already tunes for BinarySearch's scans elsewhere in this extension.
+    -- Step 2: single pass -- assign every trajectory its period (via
+    -- WeightedNtileExpr: equi-count by start time for shape-based, equi-
+    -- instant-count for point-based) and its Z-order proxy (geohash of its
+    -- centroid), in one INSERT ... SELECT over table_name_in. Plain local
+    -- INSERT, eligible for the same intra-node parallel workers
+    -- AutoTuneParallelQueryForDistribution already tunes for BinarySearch's
+    -- scans elsewhere in this extension.
     centroid_expr := format('ST_Transform(ST_SetSRID(ST_Centroid(trajectory(%I)), %s), 4326)', tiling.distCol, tiling.srid);
 
+    IF tiling.granularity = 'point-based' THEN
+        weight_expr := format('numInstants(%I)', tiling.distCol);
+    ELSE
+        weight_expr := '1';
+    END IF;
+    period_bucket_expr := WeightedNtileExpr(tiling.granularity, num_periods::text, 'w', '', 't');
+
     EXECUTE format('
-        INSERT INTO %I (row_id, period_no, row_ts, geohash)
-        SELECT %I, ntile(%s) OVER (ORDER BY starttimestamp(%I)), starttimestamp(%I), ST_GeoHash(%s, 20)
-        FROM %I',
-        period_assign_table, tiling.groupCol, num_periods, tiling.distCol, tiling.distCol, centroid_expr, table_name_in);
+        INSERT INTO %I (row_id, period_no, row_ts, geohash, weight)
+        SELECT row_id, %s, t, geohash, w
+        FROM (
+            SELECT %I AS row_id, starttimestamp(%I) AS t, ST_GeoHash(%s, 20) AS geohash, (%s)::numeric AS w
+            FROM %I
+        ) base',
+        period_assign_table, period_bucket_expr, tiling.groupCol, tiling.distCol, centroid_expr, weight_expr, table_name_in);
 
     -- Report + cache period boundaries (used below for each chunk's temporal range).
     period_starts := array_fill(NULL::timestamptz, ARRAY[num_periods]);
@@ -136,19 +162,22 @@ BEGIN
     END LOOP;
 
     -- Step 3: within each period, bucket rows into tiles_per_period
-    -- equi-count, geohash-ordered chunks (PARTITION BY period_no keeps each
-    -- period's ntile() independent of the others).
+    -- geohash-ordered chunks via WeightedNtileExpr (PARTITION BY period_no
+    -- keeps each period's bucketing independent of the others) -- equi-count
+    -- for shape-based, equi-instant-count (reusing each row's already-
+    -- computed weight column) for point-based.
+    spatial_bucket_expr := WeightedNtileExpr(tiling.granularity, tiles_per_period::text, 'weight', 'PARTITION BY period_no', 'geohash');
     FOR chunk_rec IN
         EXECUTE format('
             SELECT period_no, spatial_chunk, array_agg(row_id) AS row_ids
             FROM (
                 SELECT row_id, period_no,
-                       ntile(%s) OVER (PARTITION BY period_no ORDER BY geohash) AS spatial_chunk
+                       %s AS spatial_chunk
                 FROM %I
             ) bucketed
             GROUP BY period_no, spatial_chunk
             ORDER BY period_no, spatial_chunk',
-            tiles_per_period, period_assign_table)
+            spatial_bucket_expr, period_assign_table)
     LOOP
         -- Step 4: this chunk's tight spatial bbox, combined with its period's
         -- temporal range -- same extent()/STBOX() construction pattern

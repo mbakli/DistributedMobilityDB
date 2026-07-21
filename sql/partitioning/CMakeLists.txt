@@ -4,6 +4,8 @@ SET(LOCAL_FILES
         search_in_dimensions.sql
         crange.sql
         hierarchical.sql
+        period.sql
+        quadtree.sql
         colocation.sql
         tiling.sql
         data_allocation.sql

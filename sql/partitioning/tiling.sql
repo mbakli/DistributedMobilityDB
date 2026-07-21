@@ -160,8 +160,18 @@ BEGIN
         tiling.method := 'hierarchical';
         SELECT hierarchical_method(table_name_in, table_name_out, tiling)
         INTO table_out_id;
+    ELSIF lower(tiling_method) = 'period' THEN
+        tiling.disjointTiles := TRUE;
+        tiling.method := 'period';
+        SELECT period_method(table_name_in, table_name_out, tiling)
+        INTO table_out_id;
+    ELSIF lower(tiling_method) = 'quadtree' THEN
+        tiling.disjointTiles := TRUE;
+        tiling.method := 'quadtree';
+        SELECT quadtree_method(table_name_in, table_name_out, tiling)
+        INTO table_out_id;
     ELSE
-        RAISE EXCEPTION 'Please choose one of the following tiling methods: CRANGE, HIERARCHICAL, STR, OCTREE, Quadtree';
+        RAISE EXCEPTION 'Please choose one of the following tiling methods: CRANGE, HIERARCHICAL, PERIOD, QUADTREE, STR, OCTREE';
     END IF;
     IF table_out_id < 1 THEN
         RAISE EXCEPTION 'Something went wrong with the tiling method!';
@@ -191,8 +201,17 @@ BEGIN
             RAISE INFO 'Run-time for multirelation:%', (clock_timestamp() - start_time);
         END IF;
     END IF;
+    /*
+     * IF EXISTS: only crange_method's own point-based preprocessing
+     * (create_temporary_points_table, see crange.sql) ever creates this
+     * exploded-per-instant _temp table -- hierarchical_method/period_method
+     * also support tiling.granularity = 'point-based' (via
+     * WeightedNtileExpr, weighting by instant count directly on the
+     * original table) without ever creating it, so a bare DROP TABLE here
+     * errored out for them with "relation ... does not exist".
+     */
     IF tiling.internaltype not in ('instant', 'point') and tiling.granularity = 'point-based' THEN
-        EXECUTE format('%s', concat('DROP TABLE ', table_name_in, '_temp'));
+        EXECUTE format('%s', concat('DROP TABLE IF EXISTS ', table_name_in, '_temp'));
     END IF;
     RAISE INFO 'Total elapsed time:%', (clock_timestamp() - temp_start_time);
     return true;
