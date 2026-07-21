@@ -62,6 +62,27 @@ typedef struct DistributedSpatiotemporalQueryPlan
     char *org_query_string;
     Datum range_bbox;
     PostProcessing *postProcessing;
+    /*
+     * Set when RewriteSegmentedDistFuncCalls rewrote the query (bare
+     * distributed-function call over a segmented table -> explicit grouped
+     * aggregate) and handed off to Citus' own planner directly. The
+     * EXPLAIN hook treats a non-NULL PlannedStmt from
+     * distributed_mobilitydb_planner_internal as "our custom planning
+     * bailed out, re-explain the original query" -- which is wrong here,
+     * since this *is* the plan that actually runs; without this, EXPLAIN
+     * would show the original bare (ungrouped) query shape instead of what
+     * was really executed.
+     */
+    char *segmentedRewriteQuery;
+    /*
+     * Set alongside segmentedRewriteQuery: one line per rewritten function
+     * naming its registered worker/combiner/final ops (from
+     * pg_dist_spatiotemporal_dist_functions) and the op actually applied in
+     * the rewrite -- for EXPLAIN to show *why* the rewrite looks the way it
+     * does in this extension's own worker/combiner/final vocabulary,
+     * without asserting anything about replication vs. true segmentation.
+     */
+    char *segmentedRewriteExplainNotes;
 } DistributedSpatiotemporalQueryPlan;
 
 /* Filter Operation */

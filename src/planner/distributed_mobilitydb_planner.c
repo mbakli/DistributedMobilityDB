@@ -102,6 +102,76 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
         return distributed_planner(parse, query_string, cursorOptions, boundParams);
     }
 
+    /*
+     * A bare (non-aggregate) call to a registered distributed function
+     * (e.g. `length(trip)`, no sum()/aggregate wrapper) over a
+     * shape-segmented table can't be answered as a plain per-row pushdown
+     * -- a single trip's fragments are scattered across tiles, so that
+     * would return one row per fragment instead of one row per trip. Catch
+     * that here and hand the rewritten (explicit aggregate + GROUP BY)
+     * query straight to Citus' own distributed planner, which already
+     * correctly combines per-tile partial aggregates across a GROUP BY.
+     * Returns NULL (falls through to the normal pipeline below) for every
+     * other query shape -- joins, non-segmented tables, already-explicit
+     * aggregates, plain columns, etc.
+     */
+    char *segmentedRewriteExplainNotes = NULL;
+    char *segmentedRewrite = RewriteSegmentedDistFuncCalls(parse, query_string, distPlan->tablesList,
+                                                           &segmentedRewriteExplainNotes);
+    if (segmentedRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = segmentedRewrite;
+        distPlan->segmentedRewriteExplainNotes = segmentedRewriteExplainNotes;
+        Query *rewrittenParse = ParseQueryString(segmentedRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, segmentedRewrite, cursorOptions, boundParams);
+    }
+
+    /*
+     * An *explicit* aggregate wrapping a registered distributed function
+     * over a replicated table's column (e.g.
+     * `SUM(length(atTime(t.Trip, p.Period))) ... GROUP BY l.Licence, ...`,
+     * BerlinMOD Q8) has the same underlying problem as the bare-call case
+     * above, just already wrapped in a user-written aggregate/GROUP BY
+     * instead of needing one synthesized: a trip replicated across N tiles
+     * contributes to the aggregate N times instead of once. Rewritten into
+     * a two-level dedupe/aggregate query and hand that to Citus directly,
+     * same reasoning as RewriteSegmentedDistFuncCalls. An earlier version
+     * of this rewrite built the two-level query by deparsing expressions
+     * via a locally-planned statement (standard_planner() +
+     * deparse_context_for_plan_tree()) -- that segfaulted the backend when
+     * called from this nested position inside our own already-executing
+     * planner_hook, so RewriteReplicatedAggregateQuery now extracts
+     * expression text by splitting the SELECT list on its own top-level
+     * commas instead, never calling into Postgres' planner internals.
+     * Returns NULL for every other shape (no GROUP BY, no replicated table
+     * involved, HAVING present, etc.) -- falls through to the normal
+     * pipeline below.
+     */
+    char *replicatedAggregateRewrite = RewriteReplicatedAggregateQuery(parse, query_string, distPlan->tablesList);
+    if (replicatedAggregateRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = replicatedAggregateRewrite;
+        Query *rewrittenParse = ParseQueryString(replicatedAggregateRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, replicatedAggregateRewrite, cursorOptions, boundParams);
+    }
+
+    /*
+     * Same problem, one level down: the aggregate-over-distributed-function
+     * can just as easily live inside one of the query's own CTEs (e.g.
+     * `WITH Distances AS (SELECT ... SUM(length(atTime(...))) ... GROUP BY
+     * ...) SELECT ... MAX(Dist) ... FROM Distances`) rather than at the top
+     * level -- the check above never sees it, since the top-level query's
+     * own aggregate there (MAX(Dist)) takes a plain Var on the CTE's output
+     * column, not a call to a registered distributed function.
+     */
+    char *cteAggregateRewrite = RewriteReplicatedAggregateInCTEs(parse, query_string, distPlan->tablesList);
+    if (cteAggregateRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = cteAggregateRewrite;
+        Query *rewrittenParse = ParseQueryString(cteAggregateRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, cteAggregateRewrite, cursorOptions, boundParams);
+    }
+
     /* Initialize the post processing phase */
     distPlan->postProcessing = InitializePostProcessing();
     analyseSelectClause(parse->targetList, distPlan->postProcessing);
@@ -109,16 +179,25 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     {
         checkQueryType(parse, distPlan);
         needsSpatiotemporalPlanning = needsDistributedSpatiotemporalPlanning(distPlan);
-        /* NonColocation/Colocation strategies join tiles that were built by
-         * reshuffling on a spatiotemporal shape (see
+        /* NonColocation/Colocation/PredicatePushDown strategies all query
+         * tiles built from a spatiotemporal shape (see
          * analyzeDistributedSpatiotemporalTables/shapesegmented), which can
          * legitimately place the same row's shape-segmented copy in more
          * than one tile so a boundary-crossing match isn't missed by any
-         * single tile. That means the coordinator-level union of per-tile
-         * results can contain the same logical match more than once, so
-         * these strategies need a final deduplication pass. */
+         * single tile -- and for a MobilityDB table specifically, that
+         * "copy" is a full, unclipped duplicate of the whole row rather
+         * than a disjoint fragment (see RewriteSegmentedDistFuncCalls's
+         * isMobilityDB comment), making the duplication far more
+         * pronounced. PredicatePushDown runs its query independently
+         * against every one of a table's tiles/shards and Citus unions the
+         * per-shard results with no dedup of its own -- confirmed
+         * empirically on the BerlinMOD Q4/Q6 demo queries, which return
+         * ~13x the correct row count without this. All three strategies'
+         * coordinator-level output needs the same final deduplication
+         * pass. */
         if (StrategiesInclude(distPlan->strategies, NonColocation) ||
-            StrategiesInclude(distPlan->strategies, Colocation))
+            StrategiesInclude(distPlan->strategies, Colocation) ||
+            StrategiesInclude(distPlan->strategies, PredicatePushDown))
         {
             distPlan->postProcessing->coordinatorLevelOperator->dupRemOperator->active = true;
         }

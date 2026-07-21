@@ -66,6 +66,15 @@ BEGIN
         RETURN true;
     END IF;
 
+    -- Auto-tune parallel query settings for the BinarySearch-driven tiling
+    -- pass below (see search_in_dimensions.sql for the full rationale);
+    -- transaction-local, reverts automatically once this call returns.
+    PERFORM AutoTuneParallelQueryForDistribution();
+    -- shared_buffers can't be auto-tuned the same way (postmaster-context
+    -- GUC, needs a restart) -- just warn if it looks undersized relative to
+    -- the source table, so the operator can decide whether to act on it.
+    PERFORM WarnIfSharedBuffersUndersized(table_name_in);
+
     temp_start_time := clock_timestamp();
     -- Preprocessing
     RAISE INFO 'Collecting information:';
@@ -103,6 +112,19 @@ BEGIN
         ELSE
             tiling.segmentation := shape_segmentation;
         end if;
+    ELSE
+        /*
+         * Previously missing: with no ELSE, tiling.segmentation stayed
+         * NULL (its palloc0 default) whenever the caller explicitly passed
+         * shape_segmentation => false, since the outer IF was never
+         * entered at all. add_distributed_table_metadata then embedded
+         * that NULL as a literal empty string in its dynamic INSERT text
+         * (concat() renders NULL as ''), producing "invalid input syntax
+         * for type boolean: ''" -- shape_segmentation => false was
+         * unreachable end-to-end even after fixing shape_allocation's
+         * missing sequence/sequenceset branch.
+         */
+        tiling.segmentation := false;
     end if;
     -- Get the tile key
     SELECT getTileKey(table_name_in)
@@ -133,12 +155,32 @@ BEGIN
     ELSIF lower(tiling_method) = 'colocation' THEN
         SELECT colocation_method(table_name_in, table_name_out, tiling)
         INTO table_out_id;
+    ELSIF lower(tiling_method) = 'hierarchical' THEN
+        tiling.disjointTiles := TRUE;
+        tiling.method := 'hierarchical';
+        SELECT hierarchical_method(table_name_in, table_name_out, tiling)
+        INTO table_out_id;
     ELSE
         RAISE EXCEPTION 'Please choose one of the following tiling methods: CRANGE, HIERARCHICAL, STR, OCTREE, Quadtree';
     END IF;
     IF table_out_id < 1 THEN
         RAISE EXCEPTION 'Something went wrong with the tiling method!';
     END IF;
+    /*
+     * crange's real tile count always equals tiling.numTiles by
+     * construction (it's the fixed target the whole algorithm builds
+     * around), so this was never needed before -- but hierarchical_method's
+     * real leaf count (periods x per-period spatial chunks) is only known
+     * after it finishes, and tiling was passed to it by value, so its own
+     * corrected tiling.numTiles never propagates back to this outer copy.
+     * Re-fetching it from the catalog row hierarchical_method (or crange)
+     * just wrote keeps citus.shard_count/create_range_shards below (inside
+     * spatiotemporal_data_allocation) in sync with the actual tile count
+     * regardless of which method produced it -- a no-op for crange, whose
+     * count already matched.
+     */
+    SELECT numTiles FROM pg_dist_spatiotemporal_tables WHERE id = table_out_id
+    INTO tiling.numTiles;
     -- Move data into tiles
     IF physical_partitioning THEN
         start_time := clock_timestamp();

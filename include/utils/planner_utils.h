@@ -29,7 +29,7 @@
 
 
 /* constants for tiles.options */
-#define Natts_MTS 14
+#define Natts_MTS 15
 #define Anum_MTS_oid 1
 #define Anum_MTS_numTiles 3
 #define Anum_MTS_method 4
@@ -42,7 +42,14 @@
 #define Anum_MTS_tileKey 11
 #define Anum_MTS_segmentation 12
 #define Anum_MTS_srid 13
-#define Anum_MTS_groupCol 5
+/* groupcol was appended as the table's 15th (0-indexed 14th) column --
+ * it did not exist when this catalog table was first designed, so unlike
+ * the constants above (which match physical column order), this one can't
+ * be slotted in without renumbering every constant after it. Previously
+ * defined as 5, colliding with Anum_MTS_type -- vestigial from a groupCol
+ * column that was never actually added to the table, so this was always
+ * dead/wrong (GetTilingSchemeInfo never read it). */
+#define Anum_MTS_groupCol 14
 
 /* MobilityDB and PostGIS variables */
 #define Var_MobilityDB_BBOX "mobdb_bbox"

@@ -13,6 +13,7 @@
  *****************************************************************************/
 
 #include "utils/helper_functions.h"
+#include <ctype.h>
 #include <utils/lsyscache.h>
 #include <utils/builtins.h>
 #include <executor/spi.h>
@@ -145,6 +146,67 @@ char *toLower(char *str)
         str_l[i] = tolower((unsigned char)str[i]);
     }
     return str_l;
+}
+
+/*
+ * FindKeywordToken finds the first case-insensitive occurrence of `keyword`
+ * in `lowered` that is bounded by whitespace on both sides (or string
+ * start/end), returning a pointer to the start of the keyword itself. Unlike
+ * a plain strstr(haystack, " keyword "), this tolerates any whitespace
+ * (newlines, tabs, multiple spaces) around the keyword, not just a single
+ * literal space -- multi-line-formatted SQL (e.g. a line break before a
+ * keyword, routine when queries are written across several lines) silently
+ * fails to match on an exact-space search. `lowered` must already be
+ * lowercased; `keyword` must already be lowercase and contain no
+ * leading/trailing space of its own (internal spaces, e.g. "group by", are
+ * fine).
+ */
+extern char *
+FindKeywordToken(const char *lowered, const char *keyword)
+{
+    size_t keywordLen = strlen(keyword);
+    const char *cursor = lowered;
+    while ((cursor = strstr(cursor, keyword)) != NULL)
+    {
+        bool precededByBoundary = (cursor == lowered) || isspace((unsigned char) cursor[-1]);
+        bool followedByBoundary = isspace((unsigned char) cursor[keywordLen]);
+        if (precededByBoundary && followedByBoundary)
+            return (char *) cursor;
+        cursor++;
+    }
+    return NULL;
+}
+
+/*
+ * FindTopLevelKeywordToken behaves like FindKeywordToken, but only matches
+ * an occurrence sitting at paren-depth 0 -- i.e. not nested inside a
+ * subquery/CTE's own parenthesized definition. Needed when scanning a
+ * *whole* query's text (which may itself contain nested SELECTs, e.g. a
+ * CTE body) for a keyword belonging to the outermost/final SELECT, such as
+ * a trailing ORDER BY/LIMIT that applies to the query as a whole.
+ */
+extern char *
+FindTopLevelKeywordToken(const char *lowered, const char *keyword)
+{
+    size_t keywordLen = strlen(keyword);
+    int depth = 0;
+    const char *cursor = lowered;
+    while (*cursor != '\0')
+    {
+        if (*cursor == '(')
+            depth++;
+        else if (*cursor == ')')
+            depth--;
+        else if (depth == 0 && strncmp(cursor, keyword, keywordLen) == 0)
+        {
+            bool precededByBoundary = (cursor == lowered) || isspace((unsigned char) cursor[-1]);
+            bool followedByBoundary = isspace((unsigned char) cursor[keywordLen]);
+            if (precededByBoundary && followedByBoundary)
+                return (char *) cursor;
+        }
+        cursor++;
+    }
+    return NULL;
 }
 
 /* IsDatumEmpty reports whether val is the zero/unset Datum (i.e. no value was assigned). */

@@ -29,6 +29,9 @@ extern TaskNode *GetShardHostNode(Oid relationId, int rand_tile);
 /* Table id of the tile assigned to a randomly-picked worker for relationId. */
 extern char* GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile);
 
+/* Physical shard name for a Citus reference table's single (every-node-replicated) shard. */
+extern char* GetReferenceTableShardName(Oid relationId);
+
 /* Looks up the tiling method used to distribute relationId; -1 if not distributed. */
 extern int TilingSearch(Oid relationId);
 

@@ -12,8 +12,8 @@ BEGIN
         column_type := 'geometry';
     END IF;
     EXECUTE format('%s', concat('' ||
-                            'INSERT INTO pg_dist_spatiotemporal_tables (tblOid, tableName, numTiles, tilingMethod, tilingType, granularity, disjoint, isMobilityDB, distcol, distcoltype, tilekey, shapeSegmented, srid) ' ||
-                            'VALUES (',0,',''',table_name_out,''',',tiling.numTiles,',''',tiling.method,''',''',tiling.type,''',''',tiling.granularity,''',''',tiling.disjointTiles,''',''',tiling.isMobilityDB,''', ''',tiling.distCol,''', ''',tiling.distColType,''', ''',tiling.tileKey,''', ''',tiling.segmentation,''', ',tiling.srid,') ' ||
+                            'INSERT INTO pg_dist_spatiotemporal_tables (tblOid, tableName, numTiles, tilingMethod, tilingType, granularity, disjoint, isMobilityDB, distcol, distcoltype, tilekey, shapeSegmented, srid, groupcol) ' ||
+                            'VALUES (',0,',''',table_name_out,''',',tiling.numTiles,',''',tiling.method,''',''',tiling.type,''',''',tiling.granularity,''',''',tiling.disjointTiles,''',''',tiling.isMobilityDB,''', ''',tiling.distCol,''', ''',tiling.distColType,''', ''',tiling.tileKey,''', ''',tiling.segmentation,''', ',tiling.srid,', ''',tiling.groupCol,''') ' ||
                                                                                                                                                                                                            'ON CONFLICT (tableName) ' ||
                                                                                                                                                                                                            'DO ' ||
                                                                                                                                                                                                            'UPDATE set tableName = EXCLUDED.tableName,' ||
@@ -27,7 +27,8 @@ BEGIN
                                                                                                                                                                                                            'distcoltype = EXCLUDED.distcoltype,' ||
                                                                                                                                                                                                            'tilekey = EXCLUDED.tilekey,' ||
                                                                                                                                                                                                            'shapeSegmented = EXCLUDED.shapeSegmented,' ||
-                                                                                                                                                                                                            'srid = EXCLUDED.srid'  ));
+                                                                                                                                                                                                            'srid = EXCLUDED.srid,' ||
+                                                                                                                                                                                                            'groupcol = EXCLUDED.groupcol'  ));
 
     EXECUTE format('%s', concat('SELECT id FROM pg_dist_spatiotemporal_tables WHERE tableName = ''',table_name_out,''''))
         INTO table_out_id;

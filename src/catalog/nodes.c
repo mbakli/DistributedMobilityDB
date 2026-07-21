@@ -100,23 +100,77 @@ char * GetRandomTileId(Oid relationId, ExecTaskType taskType, int rand_tile)
                                    "    AND shard.shardminvalue = %d::text",
                      logicalrel->data, logicalrel->data, rand_tile);
     spi_result = SPI_execute(catalogQuery->data, true, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
-    {
-        char * res = DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
-                                                  SPI_tuptable->tupdesc,
-                                                  1));
-        resetStringInfo(catalogQuery);
-        appendStringInfo(catalogQuery, "%s", res);
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
-        return catalogQuery->data;
 
+    /*
+     * SPI_copytuple (unlike SPI_getvalue) allocates in the context that was
+     * current before SPI_connect(), so row/rowDescriptor stay valid past
+     * SPI_finish() -- extracting the actual C string is deferred until
+     * after SPI_finish() below (mirroring GetDBName()) so the result isn't
+     * built from memory SPI_finish() is about to free out from under it.
+     */
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
+    {
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
     }
-    return NULL;
+
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+
+    if (!found)
+        return NULL;
+
+    return SPI_getvalue(row, rowDescriptor, 1);
+}
+
+/*
+ * GetReferenceTableShardName returns relationId's single shard's
+ * "<table>_<shardid> " identifier string, same format as GetRandomTileId
+ * but with no shardminvalue filter -- a Citus reference table has exactly
+ * one logical shard (replicated, under the same name, to every node), so
+ * there's no per-tile shard to select between and no rand_tile to match.
+ */
+extern char *
+GetReferenceTableShardName(Oid relationId)
+{
+    int spi_result = SPI_connect();
+    if (spi_result != SPI_OK_CONNECT)
+    {
+        elog(ERROR, "Could not connect to database using SPI");
+    }
+
+    StringInfo catalogQuery = makeStringInfo();
+    appendStringInfo(catalogQuery, "SELECT concat('%s_',shard.shardid,' ')\n"
+                                   "FROM pg_dist_shard As shard\n"
+                                   "WHERE shard.logicalrelid = '%s'::regclass",
+                     get_rel_name(relationId), get_rel_name(relationId));
+    spi_result = SPI_execute(catalogQuery->data, true, 1);
+
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
+    {
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
+    }
+
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+
+    if (!found)
+        return NULL;
+
+    return SPI_getvalue(row, rowDescriptor, 1);
 }
 
 /*
@@ -151,19 +205,40 @@ GetShardHostNode(Oid relationId, int rand_tile)
                      "  AND shard.shardminvalue = %d::text",
                      logicalrel->data, rand_tile);
     spi_result = SPI_execute(catalogQuery->data, true, 1);
-    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+
+    /*
+     * SPI_copytuple (unlike SPI_getvalue/CStringGetTextDatum) allocates in
+     * the context that was current before SPI_connect(), so row/
+     * rowDescriptor stay valid past SPI_finish() -- extracting nodename and
+     * building taskNode->node is deferred until after SPI_finish() below
+     * (mirroring GetDBName()) so those results aren't built from memory
+     * SPI_finish() is about to free out from under them. Building them
+     * beforehand (as this used to) left taskNode->node dangling into SPI's
+     * freed context, silently corrupted by whatever the next SPI call
+     * happened to allocate over that same memory -- observed as
+     * ExplainOnHostingWorker's target node name coming out mangled.
+     */
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
     {
-        bool isNull;
-        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
-        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
-        char *nodename = SPI_getvalue(row, rowDescriptor, 1);
-        taskNode->node = CStringGetTextDatum(nodename);
-        taskNode->port = DatumGetInt32(SPI_getbinval(row, rowDescriptor, 2, &isNull));
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
     }
+
     spi_result = SPI_finish();
     if (spi_result != SPI_OK_FINISH)
     {
         elog(ERROR, "Could not disconnect from database using SPI");
+    }
+
+    if (found)
+    {
+        bool isNull;
+        char *nodename = SPI_getvalue(row, rowDescriptor, 1);
+        taskNode->node = CStringGetTextDatum(nodename);
+        taskNode->port = DatumGetInt32(SPI_getbinval(row, rowDescriptor, 2, &isNull));
     }
     return taskNode;
 }

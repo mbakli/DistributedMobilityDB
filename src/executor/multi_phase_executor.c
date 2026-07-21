@@ -13,6 +13,7 @@
  *****************************************************************************/
 
 #include "postgres.h"
+#include <ctype.h>
 #include "executor/executor_tasks.h"
 #include "executor/multi_phase_executor.h"
 #include <distributed/multi_join_order.h>
@@ -38,6 +39,7 @@ static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *di
 static void IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
 static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor);
 static char *EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate);
+static char *StripOrderByAliasQualifiers(char *orderByText, Query *parse);
 
 
 
@@ -433,6 +435,40 @@ EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate
 }
 
 /*
+ * StripOrderByAliasQualifiers removes every "alias." qualifier belonging to
+ * one of parse's own FROM-clause range table entries from orderByText. The
+ * final ORDER BY is re-applied (see the sortClause handling in
+ * ConstructGeneralQuery below) outside a "SELECT * FROM (...) AS
+ * ordered_result" wrap whose only visible columns are the wrapped
+ * subquery's own unqualified output column names -- a table-qualified
+ * reference copied verbatim from the original query text (e.g. "p.pointid")
+ * is not in scope out there and fails with "missing FROM-clause entry for
+ * table \"p\"" (confirmed on a BerlinMOD Q4-style query: `... ORDER BY
+ * p.PointId, v.Licence` against trips_Nt joined with two reference tables).
+ * orderByText is already lowercased (it's sliced out of
+ * distPlan->org_query_string, itself lowercased in place by
+ * RunQueryExecutor), so the qualifiers built here are lowered to match.
+ */
+static char *
+StripOrderByAliasQualifiers(char *orderByText, Query *parse)
+{
+    char *result = orderByText;
+    ListCell *cell;
+    foreach(cell, parse->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
+        if (rte->rtekind != RTE_RELATION || !rte->inFromCl)
+            continue;
+        StringInfo qualifier = makeStringInfo();
+        appendStringInfo(qualifier, "%s.", rte->eref->aliasname);
+        char *lowerQualifier = toLower(qualifier->data);
+        while (strstr(result, lowerQualifier) != NULL)
+            result = change_sentence(result, lowerQualifier, "");
+    }
+    return result;
+}
+
+/*
  * ConstructGeneralQuery assembles the final SQL text to execute: it unions
  * together the worker-phase task query for each strategy used in the plan
  * (NonColocation -> neighbor scan, Colocation -> self-tiling scan,
@@ -516,6 +552,47 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
                                                      "intermediate", generalScan->query_string->data));
             resetStringInfo(generalScan->query_string);
             appendStringInfo(generalScan->query_string, "%s", temp->data);
+        }
+    }
+    /*
+     * A strategy like PredicatePushDown can push the *entire* original
+     * query text (GROUP BY/aggregate/ORDER BY and all) down to run
+     * independently per relevant tile/shard, then concatenate (UNION) each
+     * task's own output above -- any ORDER BY embedded in that pushed-down
+     * text only sorts *within* one task's own result, so the final
+     * concatenated result is a sequence of independently-sorted runs, not
+     * one globally sorted result (confirmed: a query combining a CTE,
+     * cross-table aggregation, and ORDER BY returned rows grouped by
+     * originating shard instead of by the ORDER BY key). Re-applying the
+     * original top-level ORDER BY once more, over the fully assembled
+     * result, fixes this regardless of how many tasks/strategies
+     * contributed to it -- and is a harmless no-op wrap for any query shape
+     * that was already correctly ordered.
+     */
+    if (distPlan->query->sortClause != NIL)
+    {
+        /* org_query_string was already lowercased in place by
+         * RunQueryExecutor above. FindTopLevelKeywordToken (not
+         * FindKeywordToken) is required here, not just for the whitespace
+         * tolerance, but because this is the *whole* query's text -- a CTE
+         * body can itself contain "order by"/"group by"/etc at a nested
+         * paren depth, which must not be mistaken for the outermost
+         * query's own trailing ORDER BY. */
+        char *orderByPos = FindTopLevelKeywordToken(distPlan->org_query_string, "order by");
+        if (orderByPos != NULL)
+        {
+            char *orderByText = pstrdup(orderByPos);
+            size_t len = strlen(orderByText);
+            while (len > 0 && (orderByText[len - 1] == ';' || isspace((unsigned char) orderByText[len - 1])))
+                orderByText[--len] = '\0';
+
+            orderByText = StripOrderByAliasQualifiers(orderByText, distPlan->query);
+
+            StringInfo wrapped = makeStringInfo();
+            appendStringInfo(wrapped, "SELECT * FROM (%s) AS ordered_result %s",
+                             generalScan->query_string->data, orderByText);
+            resetStringInfo(generalScan->query_string);
+            appendStringInfo(generalScan->query_string, "%s", wrapped->data);
         }
     }
     generalScan->query = ParseQueryString(generalScan->query_string->data,
