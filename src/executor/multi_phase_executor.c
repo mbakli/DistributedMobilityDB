@@ -39,6 +39,7 @@ static GeneralScan *ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *di
 static void IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiPhaseExecutor);
 static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor);
 static char *EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate);
+static char *StripOrderByAliasQualifiers(char *orderByText, Query *parse);
 
 
 
@@ -434,6 +435,40 @@ EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate
 }
 
 /*
+ * StripOrderByAliasQualifiers removes every "alias." qualifier belonging to
+ * one of parse's own FROM-clause range table entries from orderByText. The
+ * final ORDER BY is re-applied (see the sortClause handling in
+ * ConstructGeneralQuery below) outside a "SELECT * FROM (...) AS
+ * ordered_result" wrap whose only visible columns are the wrapped
+ * subquery's own unqualified output column names -- a table-qualified
+ * reference copied verbatim from the original query text (e.g. "p.pointid")
+ * is not in scope out there and fails with "missing FROM-clause entry for
+ * table \"p\"" (confirmed on a BerlinMOD Q4-style query: `... ORDER BY
+ * p.PointId, v.Licence` against trips_Nt joined with two reference tables).
+ * orderByText is already lowercased (it's sliced out of
+ * distPlan->org_query_string, itself lowercased in place by
+ * RunQueryExecutor), so the qualifiers built here are lowered to match.
+ */
+static char *
+StripOrderByAliasQualifiers(char *orderByText, Query *parse)
+{
+    char *result = orderByText;
+    ListCell *cell;
+    foreach(cell, parse->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
+        if (rte->rtekind != RTE_RELATION || !rte->inFromCl)
+            continue;
+        StringInfo qualifier = makeStringInfo();
+        appendStringInfo(qualifier, "%s.", rte->eref->aliasname);
+        char *lowerQualifier = toLower(qualifier->data);
+        while (strstr(result, lowerQualifier) != NULL)
+            result = change_sentence(result, lowerQualifier, "");
+    }
+    return result;
+}
+
+/*
  * ConstructGeneralQuery assembles the final SQL text to execute: it unions
  * together the worker-phase task query for each strategy used in the plan
  * (NonColocation -> neighbor scan, Colocation -> self-tiling scan,
@@ -550,6 +585,8 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
             size_t len = strlen(orderByText);
             while (len > 0 && (orderByText[len - 1] == ';' || isspace((unsigned char) orderByText[len - 1])))
                 orderByText[--len] = '\0';
+
+            orderByText = StripOrderByAliasQualifiers(orderByText, distPlan->query);
 
             StringInfo wrapped = makeStringInfo();
             appendStringInfo(wrapped, "SELECT * FROM (%s) AS ordered_result %s",

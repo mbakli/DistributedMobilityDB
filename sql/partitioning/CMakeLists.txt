@@ -3,6 +3,7 @@ SET(LOCAL_FILES
         shape_segmentation.sql
         search_in_dimensions.sql
         crange.sql
+        hierarchical.sql
         colocation.sql
         tiling.sql
         data_allocation.sql
