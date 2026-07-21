@@ -9,18 +9,10 @@ DECLARE
     group_by_clause text;
     org_table_name_in varchar(250);
 BEGIN
-    /*
-     * The exploded-per-instant _temp table is crange_method's own
-     * point-based preprocessing convention (create_temporary_points_table,
-     * see crange.sql) -- hierarchical_method/period_method also support
-     * tiling.granularity = 'point-based' (weighting each row's bucket
-     * assignment by its instant count via WeightedNtileExpr) but do so
-     * directly against the original whole-trajectory table, without ever
-     * creating that exploded table, so swapping to it here for their
-     * point-based runs errored with "relation ... _temp does not exist".
-     * Scoped to tiling.method = 'crange' specifically rather than to
-     * granularity alone.
-     */
+    -- The exploded-per-instant _temp table is crange_method's own point-based
+    -- preprocessing convention; hierarchical/period_method also support
+    -- point-based but weight against the original table directly, so this
+    -- swap is scoped to tiling.method='crange' (else "_temp does not exist").
     IF tiling.method = 'crange' and tiling.isMobilityDB and tiling.internalType not in('point','polygon', 'instant') and tiling.granularity = 'point-based' THEN
         org_table_name_in := table_name_in;
         table_name_in := concat(table_name_in, '_temp');
@@ -37,20 +29,10 @@ BEGIN
     IF not tiling.isMobilityDB and tiling.internaltype = 'linestring' THEN
         EXECUTE format('%s', concat('ALTER TABLE ', table_name_out,' ALTER COLUMN ', tiling.distCol,' TYPE geometry;'));
     END IF;
-    /*
-     * The distributed column holds large TOASTed values (whole/clipped
-     * trajectories for MobilityDB, geometries for PostGIS) -- switching its
-     * TOAST compression from the default pglz to lz4 (much faster to
-     * compress, at a modest space cost) cuts the segmentation/allocation
-     * INSERT's dominant cost, which is writing these rows, not scanning
-     * them (confirmed via EXPLAIN ANALYZE: the write phase alone accounts
-     * for the majority of this step's time, and that write can't be sped
-     * up by parallel workers -- Postgres disables parallel query entirely
-     * for any statement containing a write, regardless of GUCs). Measured
-     * ~2.75x faster (58.8s -> 21.4s) on a same-data before/after comparison
-     * of this exact INSERT. No effect on query results, only on-disk
-     * compression of this one column.
-     */
+    -- lz4 TOAST compression is faster to compress than the default pglz,
+    -- cutting the dominant cost of the segmentation/allocation INSERT (the
+    -- write itself, which parallel workers can't help with). Measured
+    -- ~2.75x faster (58.8s -> 21.4s); no effect on query results.
     EXECUTE format('%s', concat('ALTER TABLE ', table_name_out,' ALTER COLUMN ', tiling.distCol,' SET COMPRESSION lz4;'));
     -- Add the distributed column
     EXECUTE format('%s', concat('ALTER TABLE ',table_name_out, ' ADD column ',tiling.tileKey,' integer'));
@@ -142,17 +124,10 @@ BEGIN
             FROM ',table_name_in,' t1, pg_dist_spatiotemporal_tiles
             WHERE table_id=',table_id,' and ', tiling.distCol,' && ',bbox_with_srid));
     ELSIF tiling.internaltype in ('sequence','sequenceset') THEN
-        /*
-         * Mirrors the linestring/polygon branch above: replicate each trip
-         * whole (unclipped) into every tile it overlaps, rather than
-         * segmenting/clipping it (see segmentation_and_allocation for the
-         * clipping counterpart, selected instead whenever
-         * tiling.segmentation is true). Previously missing entirely --
-         * shape_segmentation => false (the "replicate" choice) fell into
-         * the catch-all ELSE below and errored out for any MobilityDB
-         * sequence/sequenceset table (e.g. BerlinMOD trips), even though
-         * the segmenting path already worked.
-         */
+        -- Mirrors linestring/polygon above: replicate each trip whole into
+        -- every tile it overlaps (vs. segmentation_and_allocation's clipping
+        -- counterpart). Was previously missing, so shape_segmentation=>false
+        -- errored out for MobilityDB sequence/sequenceset tables.
         RAISE INFO 'Distributing the %s into the overlapping tiles without segmenting (i.e., replication) them:',tiling.internaltype;
         EXECUTE format('%s', concat('
             INSERT INTO ',table_name_out,'

@@ -6,30 +6,19 @@
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 
 /*
- * period_method builds a spatiotemporal tiling scheme for table_name_in as a
- * flat sequence of temporal-only tiles: every trajectory is assigned to one
- * of tiling.numTiles periods via ntile() ordered by its start time --
- * equi-COUNT periods (~the same number of trajectories each), not
- * equi-duration, matching the same period-boundary approach as
- * hierarchical_method. Each tile's bbox pairs the table's own full x/y
- * extent (constant across every tile) with that period's own time range, so
- * this method partitions strictly by time -- no row is excluded from its
- * period's tile on spatial grounds.
+ * period_method tiles table_name_in as a flat sequence of temporal-only
+ * tiles: every trajectory is assigned to one of tiling.numTiles equi-count
+ * periods by start time (same period-boundary approach as
+ * hierarchical_method). Each tile's bbox pairs the table's full x/y extent
+ * (constant across tiles) with that period's own time range -- partitions
+ * strictly by time, no spatial exclusion.
  *
- * Mirrors crange_method's/hierarchical_method's own flat per-call
- * catalog-table lifecycle (build <table_name_out>_catalog across the whole
- * run, assign tileKey serial once at the end, one single
- * add_distributed_table_metadata call) so the same query-time C code and
- * Citus shard-creation helpers that already work for those methods work here
- * unchanged.
+ * Same flat catalog-table lifecycle as crange_method/hierarchical_method.
+ * Scope: MobilityDB sequence/sequenceset columns only.
  *
- * Scope: MobilityDB sequence/sequenceset (trajectory) columns only.
- *
- * Granularity-aware: tiling.granularity = 'point-based' buckets periods so
- * each gets ~the same TOTAL instant count (via WeightedNtileExpr), instead of
- * the default 'shape-based' ~equal trajectory COUNT -- matters when
- * trajectory lengths vary widely, since equal row counts wouldn't otherwise
- * balance actual data volume per period.
+ * Granularity: 'point-based' buckets periods by total instant count (via
+ * WeightedNtileExpr) instead of trajectory count -- matters when trajectory
+ * lengths vary widely.
  */
 CREATE OR REPLACE FUNCTION period_method(table_name_in text, table_name_out text, tiling tiling)
     RETURNS integer AS $$
@@ -58,8 +47,7 @@ BEGIN
     PERFORM create_catalog_table(table_name_out, tiling.isMobilityDB);
     catalog_table := concat(table_name_out, '_catalog');
 
-    -- Full spatial extent, shared by every period tile -- same STBOX()
-    -- construction pattern crange_method/hierarchical_method use throughout.
+    -- Full spatial extent, shared by every period tile.
     EXECUTE format('SELECT extent(%I) FROM %I', tiling.distCol, table_name_in) INTO full_extent;
 
     IF tiling.granularity = 'point-based' THEN
@@ -100,9 +88,8 @@ BEGIN
             period_rec.period_no, period_rec.period_start, period_rec.period_end, period_numshapes, period_numpoints;
     END LOOP;
 
-    -- Same finishing pattern as crange_method/hierarchical_method: assign
-    -- dense tileKey values once, refresh tiling.numTiles to the real
-    -- produced count, then a single add_distributed_table_metadata call.
+    -- Same finishing pattern as crange_method: assign tileKey once, refresh
+    -- tiling.numTiles to the real produced count, single metadata call.
     EXECUTE format('ALTER TABLE %I ADD column %I serial', catalog_table, tiling.tileKey);
     EXECUTE format('SELECT count(*) FROM %I', catalog_table) INTO tiling.numTiles;
 

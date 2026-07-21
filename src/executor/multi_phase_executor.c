@@ -8,7 +8,7 @@
  * the Free Software Foundation, either version 2 of the License, or
  * (at your option) any later version.
  *
- * Copyright (c) 2023-2024 Mohamed Bakli <mohamed_bakli@hotmail.com>
+ * Copyright (c) 2020-2026 Mohamed Bakli <mohamed_bakli@hotmail.com>
  *
  *****************************************************************************/
 
@@ -435,19 +435,12 @@ EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate
 }
 
 /*
- * StripOrderByAliasQualifiers removes every "alias." qualifier belonging to
- * one of parse's own FROM-clause range table entries from orderByText. The
- * final ORDER BY is re-applied (see the sortClause handling in
- * ConstructGeneralQuery below) outside a "SELECT * FROM (...) AS
- * ordered_result" wrap whose only visible columns are the wrapped
- * subquery's own unqualified output column names -- a table-qualified
- * reference copied verbatim from the original query text (e.g. "p.pointid")
- * is not in scope out there and fails with "missing FROM-clause entry for
- * table \"p\"" (confirmed on a BerlinMOD Q4-style query: `... ORDER BY
- * p.PointId, v.Licence` against trips_Nt joined with two reference tables).
- * orderByText is already lowercased (it's sliced out of
- * distPlan->org_query_string, itself lowercased in place by
- * RunQueryExecutor), so the qualifiers built here are lowered to match.
+ * Strips "alias." qualifiers (from parse's own FROM-clause RTEs) out of
+ * orderByText. The final ORDER BY gets re-applied outside a "SELECT * FROM
+ * (...) AS ordered_result" wrap whose only visible columns are unqualified,
+ * so a copied-verbatim "p.pointid" fails with "missing FROM-clause entry for
+ * table \"p\"" otherwise. orderByText is already lowercased, so qualifiers
+ * built here are too.
  */
 static char *
 StripOrderByAliasQualifiers(char *orderByText, Query *parse)

@@ -113,17 +113,9 @@ BEGIN
             tiling.segmentation := shape_segmentation;
         end if;
     ELSE
-        /*
-         * Previously missing: with no ELSE, tiling.segmentation stayed
-         * NULL (its palloc0 default) whenever the caller explicitly passed
-         * shape_segmentation => false, since the outer IF was never
-         * entered at all. add_distributed_table_metadata then embedded
-         * that NULL as a literal empty string in its dynamic INSERT text
-         * (concat() renders NULL as ''), producing "invalid input syntax
-         * for type boolean: ''" -- shape_segmentation => false was
-         * unreachable end-to-end even after fixing shape_allocation's
-         * missing sequence/sequenceset branch.
-         */
+        -- Previously missing: with no ELSE, tiling.segmentation stayed NULL
+        -- here, which rendered as an invalid empty-string boolean literal
+        -- in add_distributed_table_metadata's INSERT.
         tiling.segmentation := false;
     end if;
     -- Get the tile key
@@ -176,19 +168,10 @@ BEGIN
     IF table_out_id < 1 THEN
         RAISE EXCEPTION 'Something went wrong with the tiling method!';
     END IF;
-    /*
-     * crange's real tile count always equals tiling.numTiles by
-     * construction (it's the fixed target the whole algorithm builds
-     * around), so this was never needed before -- but hierarchical_method's
-     * real leaf count (periods x per-period spatial chunks) is only known
-     * after it finishes, and tiling was passed to it by value, so its own
-     * corrected tiling.numTiles never propagates back to this outer copy.
-     * Re-fetching it from the catalog row hierarchical_method (or crange)
-     * just wrote keeps citus.shard_count/create_range_shards below (inside
-     * spatiotemporal_data_allocation) in sync with the actual tile count
-     * regardless of which method produced it -- a no-op for crange, whose
-     * count already matched.
-     */
+    -- Re-fetch the real tile count: crange's always matches tiling.numTiles
+    -- by construction, but hierarchical/period/quadtree's real count is only
+    -- known after they finish (and tiling was passed by value, so their own
+    -- corrected numTiles doesn't propagate back here otherwise).
     SELECT numTiles FROM pg_dist_spatiotemporal_tables WHERE id = table_out_id
     INTO tiling.numTiles;
     -- Move data into tiles
@@ -201,15 +184,8 @@ BEGIN
             RAISE INFO 'Run-time for multirelation:%', (clock_timestamp() - start_time);
         END IF;
     END IF;
-    /*
-     * IF EXISTS: only crange_method's own point-based preprocessing
-     * (create_temporary_points_table, see crange.sql) ever creates this
-     * exploded-per-instant _temp table -- hierarchical_method/period_method
-     * also support tiling.granularity = 'point-based' (via
-     * WeightedNtileExpr, weighting by instant count directly on the
-     * original table) without ever creating it, so a bare DROP TABLE here
-     * errored out for them with "relation ... does not exist".
-     */
+    -- IF EXISTS: only crange's point-based preprocessing creates this _temp
+    -- table; other methods' point-based support never creates it.
     IF tiling.internaltype not in ('instant', 'point') and tiling.granularity = 'point-based' THEN
         EXECUTE format('%s', concat('DROP TABLE IF EXISTS ', table_name_in, '_temp'));
     END IF;

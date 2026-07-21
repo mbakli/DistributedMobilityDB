@@ -7,66 +7,28 @@
 --------------------------------------------------------------------------------------------------------------------------------------------------------
 
 /*
- * quadtree_method builds a spatiotemporal tiling scheme for table_name_in as
- * a flat set of purely-spatial STBOX tiles, produced by a data-adaptive
- * recursive quadtree: starting from the table's own full x/y extent (the
- * root cell), a cell is only quartered into 4 children (NW/NE/SW/SE, split
- * at its own x/y midpoint) if its own row/point count -- of trajectories
- * genuinely CLIPPED to the cell via atStbox, not just bbox-overlapping it --
- * exceeds a target derived from tiling.numTiles; otherwise it's a leaf tile
- * as-is. Clipping first (rather than a plain "&&" overlap count) matters
- * specifically for wide-spanning trajectories: confirmed empirically that a
- * raw overlap count doesn't shrink as cells get smaller (a trip's bbox
- * either touches a cell or it doesn't, regardless of the cell's size), so
- * the recursion never converged near num_tiles with that cheaper check --
- * clipped content genuinely shrinks with cell size instead.
+ * quadtree_method: data-adaptive recursive quadtree over table_name_in's
+ * full x/y extent -- a cell is quartered (NW/NE/SW/SE) only while its
+ * genuinely-clipped content (atStbox, not just bbox overlap -- a raw
+ * overlap count never shrinks with cell size for wide-spanning
+ * trajectories) exceeds a target derived from tiling.numTiles; otherwise
+ * it's a leaf. Not a fixed depth: uniform geometric splits ignore density
+ * (same limitation GeoSpark/Sedona's quadtree partitioner documents),
+ * matching crange_method's own target-convergence philosophy.
  *
- * This is deliberately NOT a fixed-depth quadtree (e.g. always splitting
- * exactly 3 levels for a constant 4^3=64 tiles): a fixed geometric depth
- * ignores density heterogeneity entirely -- if trips cluster more densely in
- * some areas than others (as BerlinMOD's do, around the city center), a
- * uniform geometric split produces wildly uneven per-tile content even
- * though the CELLS are evenly sized. Confirmed via research into how actual
- * distributed spatial partitioners handle this (GeoSpark/Sedona's quadtree
- * partitioner explicitly documents this same limitation for uniform
- * geometric splits, and uses a leaf-capacity/density-adaptive stopping rule
- * instead, same as here) -- and matches this codebase's own existing
- * philosophy: crange_method's BinarySearch converges on a target row/point
- * count per tile too, rather than splitting at fixed geometric midpoints.
+ * Implemented as an explicit work-queue (temp table), not PL/pgSQL
+ * recursion, with a max-depth safety cap. cell_* column names avoid
+ * xmin/xmax, which collide with Postgres system columns.
  *
- * Implemented as an explicit work-queue (a temp table of pending cells),
- * processed iteratively rather than via PL/pgSQL recursion: pop one pending
- * cell, check its content against the target, and either record it as a
- * leaf tile or push its 4 children back onto the queue. A max-depth safety
- * cap (mirroring crange's BinarySearch "rounds > 100" safety valve) prevents
- * runaway recursion for degenerate cases (e.g. many trips clustered at
- * effectively the same point, which no amount of further splitting would
- * ever separate below the target). The queue table's cell_* column names
- * avoid xmin/xmax specifically because those collide with Postgres's own
- * reserved system column names.
+ * Granularity: 'point-based' targets equal instant count per leaf;
+ * 'shape-based' targets equal trajectory count, but converges far worse
+ * here (empirically: 7-17x num_tiles, worsening at larger num_tiles,
+ * vs ~2.5-3x for point-based) since trip-count-per-cell shrinks linearly
+ * with cell size, not quadratically like point density -- hence the
+ * RAISE WARNING below rather than silently switching granularity.
  *
- * Granularity-aware: tiling.granularity = 'point-based' targets ~equal
- * TOTAL instant count per leaf; the default 'shape-based' targets ~equal
- * trajectory COUNT per leaf.
- *
- * IMPORTANT, empirically confirmed: 'shape-based' converges far worse than
- * 'point-based' specifically for this method, and gets WORSE (not better) at
- * higher num_tiles -- e.g. on a 1500-trip BerlinMOD sample, num_tiles=4
- * produced 28 leaves (7x) and num_tiles=16 produced 280 (17.5x) with
- * shape-based, versus 10 (2.5x) and 43 (2.7x) with point-based. Root cause:
- * a trajectory's *trip-count* contribution to a cell (how many distinct
- * trips merely pass through it) shrinks only roughly linearly with cell side
- * length as cells get smaller (a single route can still touch arbitrarily
- * many small cells along its path), not quadratically with cell area the
- * way point/instant *density* does -- so a shape-based target needs far more
- * splitting to converge. A RAISE WARNING below surfaces this to the caller
- * for shape-based runs rather than silently overriding their choice.
- *
- * Scope: MobilityDB sequence/sequenceset (trajectory) columns only. Mirrors
- * crange_method's/hierarchical_method's/period_method's own flat per-call
- * catalog-table lifecycle (build <table_name_out>_catalog across the whole
- * run, assign tileKey serial once at the end, one single
- * add_distributed_table_metadata call).
+ * Scope: MobilityDB sequence/sequenceset columns only. Same flat
+ * catalog-table lifecycle as crange_method/hierarchical_method/period_method.
  */
 CREATE OR REPLACE FUNCTION quadtree_method(table_name_in text, table_name_out text, tiling tiling)
     RETURNS integer AS $$
@@ -137,19 +99,9 @@ BEGIN
                 ST_MakePoint(cell_rec.cell_xmin, cell_rec.cell_ymin),
                 ST_MakePoint(cell_rec.cell_xmax, cell_rec.cell_ymax))), tiling.srid));
 
-        /*
-         * Genuinely clipped content (atStbox), not a raw bbox-overlap count:
-         * a wide-spanning trajectory's bbox can overlap a cell far smaller
-         * than the trajectory itself, so a plain "&& count" doesn't shrink
-         * as cells get smaller and the recursion never converges (confirmed
-         * empirically -- see the comment block above). Clipping first means
-         * content genuinely shrinks with cell size. atStbox can legitimately
-         * return NULL for a bbox-overlapping-but-actually-disjoint
-         * trajectory (same subtlety already handled for the real
-         * segmentation step this session), so those are excluded via
-         * "WHERE clipped IS NOT NULL" rather than counted as zero-length
-         * content.
-         */
+        -- Clip first (atStbox), not a raw "&&" count -- see top comment.
+        -- atStbox can legitimately return NULL for an overlapping-but-
+        -- disjoint trajectory, hence "WHERE clipped IS NOT NULL".
         EXECUTE format('
             SELECT count(*), sum(numInstants(clipped)) FROM (
                 SELECT atStbox(%I, %L::stbox) AS clipped FROM %I WHERE %I && %L::stbox
