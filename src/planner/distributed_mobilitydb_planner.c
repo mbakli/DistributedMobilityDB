@@ -514,6 +514,34 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
             continue;
         ProcessQueryPredicates((Query *) cte->ctequery, distPlan);
     }
+
+    /* Same gap as the CTE case above, but for a FROM-clause derived table
+     * instead of a WITH clause -- e.g. "SELECT count(*) FROM (SELECT ...
+     * WHERE ST_Intersects(trajectory(t.Trip), p.Geom) ...) t". The
+     * predicate lives inside the subquery's own jointree, which the outer
+     * query's parse->jointree/parse->rtable never expose (the outer
+     * query's own rtable has just one RTE_SUBQUERY entry for "t"; the
+     * tables referenced inside it -- trips_16_crange, vehicles_ref,
+     * points_ref here -- only show up in that RTE's own ->subquery->rtable).
+     * Reproduced directly: the identical inner query, run standalone,
+     * chose PredicatePushDown and returned a full plan (Push Down Scan,
+     * task/worker details, real local EXPLAIN); wrapped in an outer
+     * "SELECT count(*) FROM (...) t", it fell through to
+     * "Query Type: Other" with an empty strategies list and a blank
+     * "-> Query Plan:" section -- ProcessQueryPredicates was simply never
+     * called on the subquery's own Query node, so no predicate was ever
+     * inspected and no strategy ever chosen. Scanned one level deep only,
+     * same as the CTE handling above (not recursive into a subquery nested
+     * inside another subquery) -- matches the existing "TODO: the rest is
+     * excluded for now" scope rather than expanding it. */
+    ListCell *rteCell;
+    foreach(rteCell, parse->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) lfirst(rteCell);
+        if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+            continue;
+        ProcessQueryPredicates(rte->subquery, distPlan);
+    }
     /* TODO: The rest is excluded for now and will be added after testing the main features */
 }
 
