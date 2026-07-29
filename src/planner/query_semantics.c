@@ -19,6 +19,8 @@
 #include <nodes/parsenodes.h>
 #include <parser/parsetree.h>
 #include <utils/lsyscache.h>
+#include <utils/builtins.h>
+#include <optimizer/optimizer.h>
 #include "planner/query_semantics.h"
 #include "utils/planner_utils.h"
 #include "utils/helper_functions.h"
@@ -103,8 +105,7 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * into an ordinary SQL grouped aggregate, e.g.:
  *
  *   select length(trip) from trips_50t
- *   -> select sum(length(trip)) as length from trips_50t group by tripid              -- genuinely segmented (PostGIS linestring/polygon)
- *   -> select distinct on (tripid) length(trip) as length from trips_50t order by tripid  -- replicated (MobilityDB tgeompoint)
+ *   -> select sum(length(trip)) as length from trips_50t group by tripid
  *
  * so Citus' own native distributed GROUP BY/aggregate pushdown -- already
  * proven correct for `sum(length(trip)) as length` without a GROUP BY --
@@ -113,16 +114,18 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * IsDistFunc's comment for why a bare call collides with that mechanism in
  * the first place, and why it must not be the one to handle this case).
  *
- * Which shape is used depends on whether the table's tiles genuinely hold
- * disjoint fragments or full duplicate copies -- see the isMobilityDB
- * check below for why those aren't the same thing despite both being
- * flagged "segmented" in the catalog. A genuinely segmented table's final
- * op (the registered combining function, e.g. sum) is a real aggregate
- * over real partial values, so GROUP BY + that op is correct. A
- * replicated table has nothing to combine -- every "fragment" already is
- * the complete, correct answer -- so no distributed-function machinery
- * applies there at all; the plain, ordinary function call is kept as-is
- * and DISTINCT ON just removes the duplicate rows.
+ * Always wrapped in the table's registered final op (e.g. sum) and grouped
+ * by groupCol, regardless of catalog->isMobilityDB -- this used to branch
+ * on that flag, using a plain unwrapped call + DISTINCT ON instead on the
+ * theory that a segmented MobilityDB table's tiles hold full duplicate
+ * copies of each trip rather than disjoint fragments. Empirically false
+ * for at least trips_9t (isMobilityDB=true, segmentation=true): its tiles
+ * hold genuinely disjoint, clipped fragments -- sum(length(trip)) GROUP BY
+ * tripid over it reproduces the true untiled length, while DISTINCT ON
+ * would silently keep one arbitrary fragment's partial value instead. This
+ * function's only prerequisite (catalog->segmentation being true, checked
+ * below) is exactly the condition under which the final op is a real
+ * aggregate over real partial values, so it's always correct to use it.
  *
  * GROUP BY doesn't require its key to be projected, so groupCol is never
  * added to the SELECT list on its own -- if the caller wants it in the
@@ -234,34 +237,27 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
         if (selectList->len > 0)
             appendStringInfoString(selectList, ", ");
         /*
-         * shape_segmentation.sql's ST_Intersection-based clipping only
-         * applies to its 'linestring'/'multilinestring'/'polygon'/
-         * 'multipolygon' branches -- static PostGIS geometry. Its
-         * 'sequence'/'sequenceset' branch (every MobilityDB tgeompoint
-         * trajectory table this extension has, since a moving point's
-         * shape type is never one of those PostGIS types) does no
-         * clipping at all: it just re-packs the *whole*, unsplit trip
-         * into every tile whose bbox it overlaps (`WHERE distCol &&
-         * bbox_with_srid` is a bbox-overlap test, not a cut). Confirmed
-         * empirically: every "fragment" of a multi-tile trip carries
-         * identical numinstants/startTimestamp/endTimestamp/length -- full
-         * duplicates, not disjoint partial pieces.
-         *
-         * A genuinely segmented table's registered final op (e.g. sum) is
-         * a real aggregate over real partial values, so wrap the call in
-         * it as usual. A replicated (MobilityDB) table has nothing to
-         * combine -- summing duplicates would multiply the true value by
-         * however many tiles a trip touches -- so the plain, ordinary
-         * function call is projected completely unwrapped; the DISTINCT
-         * ON built into the final query (below) removes the duplicate
-         * rows without needing any aggregate at all.
+         * Always wrapped in the registered final op (e.g. sum) -- NOT
+         * conditioned on catalog->isMobilityDB the way this used to read.
+         * The MobilityDB branch this replaced assumed a segmented
+         * MobilityDB table's tiles hold full duplicate copies of each trip
+         * (shape_segmentation.sql's sequence/sequenceset branch doing a
+         * bbox-overlap repack with no clipping), so a plain unwrapped call
+         * plus DISTINCT ON was enough to dedupe. Empirically false for at
+         * least trips_9t (isMobilityDB=true, segmentation=true): its tiles
+         * hold genuinely disjoint, clipped fragments -- sum(length(trip))
+         * GROUP BY tripid over it reproduces the true untiled length
+         * (confirmed against the source table to available floating-point
+         * precision), while DISTINCT ON silently picked one arbitrary
+         * fragment's partial value instead of the trip's real one. This
+         * function's only prerequisite for reaching here at all is
+         * catalog->segmentation being true (checked above), which is
+         * exactly the condition under which the registered final op is a
+         * real aggregate over real partial values -- so it's always
+         * correct to wrap in it, regardless of isMobilityDB.
          */
-        if (catalog->isMobilityDB)
-            appendStringInfo(selectList, "%s(%s) as %s", funcName, catalog->distCol,
-                             targetEntry->resname != NULL ? targetEntry->resname : funcName);
-        else
-            appendStringInfo(selectList, "%s(%s(%s)) as %s", finalOp, funcName, catalog->distCol,
-                             targetEntry->resname != NULL ? targetEntry->resname : funcName);
+        appendStringInfo(selectList, "%s(%s(%s)) as %s", finalOp, funcName, catalog->distCol,
+                         targetEntry->resname != NULL ? targetEntry->resname : funcName);
         foundAny = true;
     }
 
@@ -327,20 +323,8 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
         last[--lastLen] = '\0';
 
     StringInfo newQuery = makeStringInfo();
-    if (catalog->isMobilityDB)
-        /*
-         * DISTINCT ON (groupcol) ... ORDER BY groupcol removes the
-         * duplicate replica rows without wrapping anything in an
-         * aggregate -- Postgres only requires ORDER BY to *start* with
-         * the DISTINCT ON expression(s), not that they also appear in the
-         * SELECT list, so groupcol still isn't forced into the output
-         * unless the caller's own target list already asked for it.
-         */
-        appendStringInfo(newQuery, "select distinct on (%s) %s %s order by %s %s",
-                         catalog->groupCol, selectList->data, core, catalog->groupCol, suffix);
-    else
-        appendStringInfo(newQuery, "select %s %s group by %s %s",
-                         selectList->data, core, catalog->groupCol, suffix);
+    appendStringInfo(newQuery, "select %s %s group by %s %s",
+                     selectList->data, core, catalog->groupCol, suffix);
     if (explainNotesOut != NULL)
         *explainNotesOut = explainNotes->data;
     return newQuery->data;
@@ -459,6 +443,353 @@ SplitTopLevelCommas(const char *text)
     }
     chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
     return chunks;
+}
+
+/*
+ * RewriteWhereClauseDistFuncCalls detects a bare (non-aggregate) call to a
+ * registered distributed function used as a WHERE-clause filter -- e.g.
+ * `WHERE length(trip) > 5000` -- over a single shape-segmented distributed
+ * spatiotemporal table. Evaluating that per-fragment, the way a plain
+ * pushdown would, is wrong: a trip split across several tiles has each
+ * fragment see only part of the trajectory, so filtering each fragment
+ * independently can both wrongly admit a trip whose *complete* value
+ * doesn't actually pass the filter (e.g. one short fragment happens to
+ * exceed a length threshold on its own) and wrongly exclude one whose
+ * complete value does (no single fragment alone crosses the threshold, only
+ * their sum) -- the same fragmentation problem RewriteSegmentedDistFuncCalls
+ * fixes for the SELECT-list case, just triggered from the WHERE clause
+ * instead.
+ *
+ * Rewritten into a two-level query: an inner query projecting the caller's
+ * original plain (non-aggregate) target-list columns plus the function's
+ * properly *combined* value (grouped by the table's own row identifier,
+ * same worker/combiner/final technique as RewriteSegmentedDistFuncCalls),
+ * and an outer query that filters on that combined value -- moving the
+ * filter from a per-row WHERE to a post-combination one, effectively a
+ * HAVING -- then re-projects the caller's original target list (so the
+ * combined-value column never reaches the client), applying any of the
+ * caller's own aggregates (e.g. count(*)) in the outer query, over the
+ * now-correctly-filtered rows. E.g.:
+ *
+ *   select tripid from trips_50t where length(trip) > 5000
+ *   -> select tripid from (
+ *        select tripid as tripid, sum(length(trip)) as __dmdb_wc_filter
+ *        from trips_50t group by tripid
+ *      ) as dmdb_wc_sub where __dmdb_wc_filter > 5000::numeric
+ *
+ *   select count(*) from trips_50t where length(trip) > 5000
+ *   -> select count(*) as count from (
+ *        select sum(length(trip)) as __dmdb_wc_filter
+ *        from trips_50t group by tripid
+ *      ) as dmdb_wc_sub where __dmdb_wc_filter > 5000::numeric
+ *
+ *   select count(distinct tripid) from trips_50t where length(trip) > 5000
+ *   -> select count(distinct tripid) as count from (
+ *        select tripid as tripid, sum(length(trip)) as __dmdb_wc_filter
+ *        from trips_50t group by tripid
+ *      ) as dmdb_wc_sub where __dmdb_wc_filter > 5000::numeric
+ *
+ * A caller's own aggregate is carried into the outer query as-is, and any
+ * column it references (other than distCol -- see below) is pulled out
+ * and projected into the inner query too, so the outer reference resolves;
+ * safe despite the inner query's own GROUP BY groupCol, since groupCol is
+ * the table's own primary key and Postgres's functional-dependency rule
+ * lets any other same-table column be projected without its own
+ * aggregation or GROUP BY entry.
+ *
+ * Deliberately narrow, matching RewriteSegmentedDistFuncCalls's own scope
+ * limits: single table, no join; the *entire* WHERE clause must be exactly
+ * one comparison between a bare distfunc call over the table's distCol and
+ * a constant (a combined WHERE clause would need its other conjuncts
+ * relocated into the inner query's own WHERE, which this first version
+ * doesn't attempt -- it bails out to NULL instead of risking a partially
+ * wrong rewrite); no pre-existing GROUP BY/ORDER BY/HAVING (this rewrite
+ * introduces its own); a caller's aggregate referencing distCol itself
+ * (e.g. `count(distinct trip)`) bails out too -- the inner query's per-row
+ * value for that column is one fragment's own value, not the trip's real
+ * combined one, and this rewrite has no second combination layer to fix
+ * that up. Returns NULL when the query doesn't match this shape -- the
+ * caller falls back to whatever handling the query would otherwise get.
+ */
+extern char *
+RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList)
+{
+    if (tablesList == NULL || tablesList->length != 1)
+        return NULL;
+    if (parse->groupClause != NIL || parse->sortClause != NIL || parse->havingQual != NULL)
+        return NULL;
+
+    Rte *rteNode = (Rte *) linitial(tablesList->tables);
+    if (rteNode->RteType != STRte)
+        return NULL;
+
+    STMultirelation *table = (STMultirelation *) rteNode->rte;
+    STMultirelationCatalog *catalog = &table->catalogTableInfo;
+    if (!catalog->segmentation || catalog->groupCol == NULL)
+        return NULL;
+
+    List *whereClauseList = WhereClauseList(parse->jointree);
+    if (list_length(whereClauseList) != 1)
+        return NULL;
+
+    Node *clause = (Node *) linitial(whereClauseList);
+    if (!IsA(clause, OpExpr))
+        return NULL;
+
+    OpExpr *opExpr = (OpExpr *) clause;
+    if (list_length(opExpr->args) != 2)
+        return NULL;
+
+    char *opName = get_opname(opExpr->opno);
+    if (opName == NULL)
+        return NULL;
+    bool isComparisonOp = strcmp(opName, "=") == 0 || strcmp(opName, "<>") == 0 ||
+                          strcmp(opName, "<") == 0 || strcmp(opName, "<=") == 0 ||
+                          strcmp(opName, ">") == 0 || strcmp(opName, ">=") == 0;
+    if (!isComparisonOp)
+        return NULL;
+
+    Node *leftArg = (Node *) linitial(opExpr->args);
+    Node *rightArg = (Node *) lsecond(opExpr->args);
+
+    FuncExpr *funcExpr;
+    Const *constArg;
+    bool funcOnLeft;
+    if (IsA(leftArg, FuncExpr) && IsA(rightArg, Const))
+    {
+        funcExpr = (FuncExpr *) leftArg;
+        constArg = (Const *) rightArg;
+        funcOnLeft = true;
+    }
+    else if (IsA(rightArg, FuncExpr) && IsA(leftArg, Const))
+    {
+        funcExpr = (FuncExpr *) rightArg;
+        constArg = (Const *) leftArg;
+        funcOnLeft = false;
+    }
+    else
+        return NULL;
+
+    if (constArg->constisnull)
+        return NULL;
+
+    if (list_length(funcExpr->args) != 1 || !IsA(linitial(funcExpr->args), Var))
+        return NULL;
+
+    Var *arg = (Var *) linitial(funcExpr->args);
+    RangeTblEntry *rte = rt_fetch(arg->varno, parse->rtable);
+    char *argColName = get_attname(rte->relid, arg->varattno, false);
+    if (argColName == NULL || strcasecmp(argColName, catalog->distCol) != 0)
+        return NULL;
+
+    char *funcName = get_func_name(funcExpr->funcid);
+    if (funcName == NULL)
+        return NULL;
+    char *finalOp = LookupDistFuncFinalOp(funcName);
+    if (finalOp == NULL)
+        return NULL;
+
+    /*
+     * Reproduced textually via the type's own output function plus an
+     * explicit cast, rather than trying to locate the constant's original
+     * source text in query_string -- robust regardless of how the constant
+     * was written (5000, '5000', a parameter that already got folded to a
+     * Const, etc.); the explicit ::type cast avoids the rewritten literal
+     * being parsed back with a different inferred type than the original
+     * (same reasoning as the STBOX-literal casts used elsewhere in this
+     * extension's dynamic SQL).
+     */
+    char *constText = DatumToString(constArg->constvalue, constArg->consttype);
+    char *constTypeName = format_type_be(constArg->consttype);
+    char *constTextWithCast = psprintf("%s::%s", constText, constTypeName);
+
+    /*
+     * Locate the SELECT list's own text span, same technique as
+     * RewriteReplicatedAggregateQuery: skip leading whitespace, require
+     * "select" (no DISTINCT/ALL -- not handled), everything up to " from ".
+     */
+    char *lowered = toLower((char *) query_string);
+    char *cursor = lowered;
+    while (isspace((unsigned char) *cursor))
+        cursor++;
+    if (strncmp(cursor, "select", 6) != 0)
+        return NULL;
+    cursor += 6;
+    while (isspace((unsigned char) *cursor))
+        cursor++;
+    if (strncmp(cursor, "distinct", 8) == 0 || strncmp(cursor, "all ", 4) == 0)
+        return NULL;
+    size_t selectListStart = cursor - lowered;
+
+    char *fromKeyword = FindKeywordToken(lowered + selectListStart, "from");
+    if (fromKeyword == NULL)
+        return NULL;
+    size_t selectListEnd = fromKeyword - lowered;
+
+    char *selectListText = TrimmedSubstring(query_string + selectListStart, query_string + selectListEnd);
+    List *chunks = SplitTopLevelCommas(selectListText);
+
+    StringInfo innerSelectList = makeStringInfo();
+    StringInfo outerSelectList = makeStringInfo();
+    /* Column names (C strings) already projected by innerSelectList, so an
+     * aggregate referencing the same column twice (or a column a plain
+     * target entry already projects under its own alias) doesn't get
+     * projected again under a second, redundant alias. */
+    List *innerProjectedCols = NIL;
+
+    ListCell *tlCell;
+    ListCell *chunkCell = list_head(chunks);
+    foreach(tlCell, parse->targetList)
+    {
+        TargetEntry *te = lfirst(tlCell);
+        if (te->resjunk)
+            continue;
+        /* Chunk count not matching the target list means something about
+         * this query's shape wasn't anticipated -- bail out rather than
+         * risk pairing the wrong chunk with the wrong entry. */
+        if (chunkCell == NULL || te->resname == NULL)
+            return NULL;
+        char *chunkText = (char *) lfirst(chunkCell);
+        chunkCell = lnext(chunks, chunkCell);
+
+        /*
+         * An aggregate belongs only in the outer query, over the inner
+         * subquery's already-combined-and-filtered rows -- e.g. count(*)
+         * needs to count qualifying trips, not run per-tripid-group inside
+         * the inner query alongside its own GROUP BY. Any actual column it
+         * references (count(tripid), count(distinct tripid), ...) needs to
+         * be available from the inner subquery's own output first, though,
+         * or the outer reference won't resolve -- pulled out of the
+         * aggregate's arguments (recursing through any nested expression,
+         * not just a bare Var) and projected into the inner query,
+         * deduplicated against what's already there. Safe to add
+         * unconditionally despite the inner query's own GROUP BY groupCol:
+         * groupCol is the table's own primary key, so Postgres's
+         * functional-dependency rule lets any other same-table column be
+         * projected without its own aggregation or GROUP BY entry.
+         *
+         * The one column this can't safely handle is distCol itself (e.g.
+         * `count(distinct trip)`): the inner query's per-row value for it
+         * is one fragment's own value, not the trip's real combined one,
+         * and this rewrite has no second combination layer to fix that up
+         * -- bail out rather than risk a plausible-looking wrong answer.
+         */
+        if (IsA(te->expr, Aggref))
+        {
+            Aggref *aggref = (Aggref *) te->expr;
+            List *aggVars = pull_var_clause((Node *) aggref->args,
+                                            PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS);
+            ListCell *varCell;
+            foreach(varCell, aggVars)
+            {
+                Var *var = (Var *) lfirst(varCell);
+                if (var->varno <= 0 || (int) var->varno > list_length(parse->rtable))
+                    return NULL;
+                RangeTblEntry *varRte = rt_fetch(var->varno, parse->rtable);
+                if (varRte->rtekind != RTE_RELATION)
+                    return NULL;
+                char *varColName = get_attname(varRte->relid, var->varattno, false);
+                if (varColName == NULL)
+                    return NULL;
+                if (strcasecmp(varColName, catalog->distCol) == 0)
+                    return NULL;
+
+                bool alreadyProjected = false;
+                ListCell *projCell;
+                foreach(projCell, innerProjectedCols)
+                {
+                    if (strcasecmp((char *) lfirst(projCell), varColName) == 0)
+                    {
+                        alreadyProjected = true;
+                        break;
+                    }
+                }
+                if (!alreadyProjected)
+                {
+                    if (innerSelectList->len > 0)
+                        appendStringInfoString(innerSelectList, ", ");
+                    appendStringInfo(innerSelectList, "%s as %s", varColName, varColName);
+                    innerProjectedCols = lappend(innerProjectedCols, varColName);
+                }
+            }
+
+            if (outerSelectList->len > 0)
+                appendStringInfoString(outerSelectList, ", ");
+            appendStringInfo(outerSelectList, "%s as %s", chunkText, te->resname);
+            continue;
+        }
+
+        if (innerSelectList->len > 0)
+            appendStringInfoString(innerSelectList, ", ");
+        appendStringInfo(innerSelectList, "%s as %s", chunkText, te->resname);
+        innerProjectedCols = lappend(innerProjectedCols, te->resname);
+        if (outerSelectList->len > 0)
+            appendStringInfoString(outerSelectList, ", ");
+        appendStringInfoString(outerSelectList, te->resname);
+    }
+    if (chunkCell != NULL || outerSelectList->len == 0)
+        return NULL;
+
+    /*
+     * Always wrap in the registered final op and GROUP BY groupCol -- NOT
+     * conditioned on catalog->isMobilityDB the way RewriteSegmentedDistFunc
+     * Calls's SELECT-list rewrite is (its doc comment claims a
+     * segmented+isMobilityDB table's tiles hold full duplicate copies, so a
+     * plain unwrapped call plus DISTINCT ON suffices). Empirically false for
+     * at least trips_9t (isMobilityDB=true, segmentation=true): its tiles
+     * hold genuinely disjoint, clipped fragments -- sum(length(trip)) GROUP
+     * BY tripid over it reproduces the true untiled length (confirmed
+     * against the source table to the available floating-point precision),
+     * while any single fragment's raw length() is far smaller. A DISTINCT
+     * ON here would silently filter on one arbitrary fragment's partial
+     * value instead of the trip's real one. RewriteSegmentedDistFuncCalls's
+     * own DISTINCT ON path likely has the same bug for this same data
+     * shape, but that's a pre-existing SELECT-list issue left alone here --
+     * out of scope for this WHERE-clause rewrite.
+     */
+    StringInfo filterExpr = makeStringInfo();
+    appendStringInfo(filterExpr, "%s(%s(%s))", finalOp, funcName, catalog->distCol);
+
+    /*
+     * Preserve the FROM clause text verbatim (same "find ' from '"
+     * technique used throughout this file), stopping at the query's own
+     * WHERE keyword -- the single predicate this rewrite already extracted
+     * (confirmed above to be the *entire* WHERE clause) is what's being
+     * relocated, so nothing of it needs to survive into the inner query.
+     */
+    size_t fromOffset = fromKeyword - lowered;
+    char *loweredTail = lowered + fromOffset;
+    char *whereKeyword = FindKeywordToken(loweredTail, "where");
+    if (whereKeyword == NULL)
+        return NULL;
+    size_t fromTextLen = whereKeyword - loweredTail;
+    char *fromText = palloc(fromTextLen + 1);
+    memcpy(fromText, query_string + fromOffset, fromTextLen);
+    fromText[fromTextLen] = '\0';
+    while (fromTextLen > 0 && (fromText[fromTextLen - 1] == ';' || isspace((unsigned char) fromText[fromTextLen - 1])))
+        fromText[--fromTextLen] = '\0';
+
+    /*
+     * innerSelectList can be empty -- e.g. `SELECT count(*) FROM ... WHERE
+     * length(trip) > 5000` has no plain column, only the aggregate (routed
+     * to outerSelectList above) -- in which case a leading ", " would
+     * produce invalid SQL ("select , sum(...) as __dmdb_wc_filter ...").
+     */
+    StringInfo innerQuery = makeStringInfo();
+    if (innerSelectList->len > 0)
+        appendStringInfo(innerQuery, "select %s, %s as __dmdb_wc_filter %s group by %s",
+                         innerSelectList->data, filterExpr->data, fromText, catalog->groupCol);
+    else
+        appendStringInfo(innerQuery, "select %s as __dmdb_wc_filter %s group by %s",
+                         filterExpr->data, fromText, catalog->groupCol);
+
+    StringInfo outerQuery = makeStringInfo();
+    appendStringInfo(outerQuery, "select %s from (%s) as dmdb_wc_sub where %s %s %s",
+                     outerSelectList->data, innerQuery->data,
+                     funcOnLeft ? "__dmdb_wc_filter" : constTextWithCast,
+                     opName,
+                     funcOnLeft ? constTextWithCast : "__dmdb_wc_filter");
+    return outerQuery->data;
 }
 
 /*

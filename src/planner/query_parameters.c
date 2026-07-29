@@ -36,10 +36,29 @@ extern void ExplainQueryParameters(DistributedSpatiotemporalQueryPlan *distPlan,
     appendStringInfoSpaces(es->str, es->indent * indent_group);
     es->indent += indent_group;
     appendStringInfo(es->str, "-> Query Parameters: \n");
-    appendStringInfoSpaces(es->str, es->indent * indent_group);
-    appendStringInfo(es->str, "Joining column: %s\n", distPlan->joining_col);
-    ExplainMainPredicate(distPlan->predicatesList->predicateType, distPlan->predicatesList->predicateInfo,
-                         es, indent_group);
+    /* joining_col is set in analyzeDistributedSpatiotemporalTables for any
+     * distributed spatiotemporal table found in the range table, whether or
+     * not the query actually joins on (or even references) that column --
+     * e.g. "SELECT count(*) FROM trips_9t WHERE vehicleid = 5" set it to
+     * "trip" despite having no join and never mentioning trip at all. Only
+     * meaningful once a strategy was actually chosen (Colocated,
+     * NonColocated, Range, Knn); for Full Scan/Filtered Scan, where nothing
+     * was joined or spatially filtered, it's misleading and skipped.
+     *
+     * predicatesList->predicateType has the same problem: it's palloc0'd
+     * and only ever explicitly set to DISTANCE, never to INTERSECTION or
+     * OTHER, so a query with no detected predicate silently reads as
+     * INTERSECTION (enum value 0) rather than "no predicate" -- printing
+     * "Main predicate: Intersection-based" for e.g. a bare
+     * "SELECT count(*) FROM trips_9t" with nothing intersection-related in
+     * it at all. Gated behind the same condition as Joining column. */
+    if (list_length(distPlan->strategies) > 0)
+    {
+        appendStringInfoSpaces(es->str, es->indent * indent_group);
+        appendStringInfo(es->str, "Joining column: %s\n", distPlan->joining_col);
+        ExplainMainPredicate(distPlan->predicatesList->predicateType, distPlan->predicatesList->predicateInfo,
+                             es, indent_group);
+    }
 
     ExplainDistributedTables(distPlan->tablesList, es, indent_group);
     if (IsReshufflingRequired(distPlan->strategies))

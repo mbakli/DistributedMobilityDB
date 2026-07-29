@@ -36,6 +36,7 @@
 
 static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
                                        DistributedSpatiotemporalQueryPlan *distPlan);
+static FromExpr * FindOwningJointree(Query *topQuery, Oid relid);
 static void PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan);
 static void checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
 static void ProcessQueryPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
@@ -124,6 +125,25 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
         distPlan->segmentedRewriteExplainNotes = segmentedRewriteExplainNotes;
         Query *rewrittenParse = ParseQueryString(segmentedRewrite, NULL, 0);
         return distributed_planner(rewrittenParse, segmentedRewrite, cursorOptions, boundParams);
+    }
+
+    /*
+     * Same underlying problem, but the bare distributed-function call is a
+     * WHERE-clause filter (e.g. `WHERE length(trip) > 5000`) instead of a
+     * SELECT-list projection: evaluating it per-fragment against a
+     * segmented table's tiles can both wrongly admit and wrongly exclude
+     * rows, since no single fragment sees the trip's complete trajectory.
+     * Rewritten into a query that filters on the function's properly
+     * combined value instead (see RewriteWhereClauseDistFuncCalls for the
+     * full shape and scope limits) and handed to Citus directly, same
+     * pattern as the SELECT-list case above.
+     */
+    char *whereClauseRewrite = RewriteWhereClauseDistFuncCalls(parse, query_string, distPlan->tablesList);
+    if (whereClauseRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = whereClauseRewrite;
+        Query *rewrittenParse = ParseQueryString(whereClauseRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, whereClauseRewrite, cursorOptions, boundParams);
     }
 
     /*
@@ -287,6 +307,74 @@ GetSpatiotemporalDistributedPlan(CustomScan *customScan)
 }
 
 /*
+ * FindOwningJointree returns the jointree of whichever query -- the
+ * top-level query itself, one of its CTEs, or one of its FROM-clause
+ * subqueries -- actually contains relid as a direct (non-recursive) table
+ * reference in its own rtable, so AnalyseCatalog inspects the WHERE clause
+ * that actually surrounds this table instead of always the outermost
+ * query's.
+ *
+ * Reproduced directly: for a query like "SELECT count(*) FROM (SELECT ...
+ * WHERE ST_Intersects(...) ...) t", the outer query's own jointree has no
+ * WHERE clause at all -- AnalyseCatalog's WhereClauseList() over it returns
+ * an empty list, so its predicate-scanning loop (query_semantics.c) never
+ * executes even once, leaving CatalogFilter at its palloc0 zero value
+ * (candidates = 0) instead of the table's real tile count. That surfaced
+ * as EXPLAIN showing "Task Count: 0" for a query that actually has (and,
+ * after the strategy-selection fix in checkQueryType above, correctly
+ * plans and runs against) 16 tiles.
+ *
+ * Only one level deep (CTE/subquery, not nested further) -- matches the
+ * same scope as checkQueryType's identical CTE/subquery handling; falls
+ * back to topQuery->jointree (the previous, unconditional behavior) if
+ * relid isn't found directly in any of those, which shouldn't normally
+ * happen since relid always comes from ExtractRangeTableEntryList(topQuery)
+ * in the first place.
+ */
+static FromExpr *
+FindOwningJointree(Query *topQuery, Oid relid)
+{
+    ListCell *rteCell;
+    foreach(rteCell, topQuery->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) lfirst(rteCell);
+        if (rte->rtekind == RTE_RELATION && rte->relid == relid)
+            return topQuery->jointree;
+    }
+
+    ListCell *cteCell;
+    foreach(cteCell, topQuery->cteList)
+    {
+        CommonTableExpr *cte = (CommonTableExpr *) lfirst(cteCell);
+        if (!IsA(cte->ctequery, Query))
+            continue;
+        Query *cteQuery = (Query *) cte->ctequery;
+        foreach(rteCell, cteQuery->rtable)
+        {
+            RangeTblEntry *rte = (RangeTblEntry *) lfirst(rteCell);
+            if (rte->rtekind == RTE_RELATION && rte->relid == relid)
+                return cteQuery->jointree;
+        }
+    }
+
+    foreach(rteCell, topQuery->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) lfirst(rteCell);
+        if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+            continue;
+        ListCell *innerCell;
+        foreach(innerCell, rte->subquery->rtable)
+        {
+            RangeTblEntry *innerRte = (RangeTblEntry *) lfirst(innerCell);
+            if (innerRte->rtekind == RTE_RELATION && innerRte->relid == relid)
+                return rte->subquery->jointree;
+        }
+    }
+
+    return topQuery->jointree;
+}
+
+/*
  * analyzeDistributedSpatiotemporalTables gets a list of range table entries
  * and detects the spatiotemporal distributed relation range
  * table entry in the list.
@@ -351,7 +439,8 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
 
 
                 spatiotemporal_table->catalogFilter = AnalyseCatalog(spatiotemporal_table,
-                                                                     distPlan->query->jointree);
+                                                                     FindOwningJointree(distPlan->query,
+                                                                                        rangeTableEntry->relid));
                 distPlan->reshuffled_table_base = spatiotemporal_table;
                 Rte *rteNode = GetRteNode((Node *) spatiotemporal_table, STRte, rangeTableEntry->alias);
                 rtes = lappend(rtes , rteNode);
@@ -527,7 +616,7 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
      * chose PredicatePushDown and returned a full plan (Push Down Scan,
      * task/worker details, real local EXPLAIN); wrapped in an outer
      * "SELECT count(*) FROM (...) t", it fell through to
-     * "Query Type: Other" with an empty strategies list and a blank
+     * "Query Type: Full Scan" with an empty strategies list and a blank
      * "-> Query Plan:" section -- ProcessQueryPredicates was simply never
      * called on the subquery's own Query node, so no predicate was ever
      * inspected and no strategy ever chosen. Scanned one level deep only,
@@ -562,6 +651,12 @@ ProcessQueryPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPla
         /* TODO: subquery is excluded for now */
         ereport(ERROR, (errmsg("A sub query is not supported yet in Distributed MobilityDB!")));
     }
+    /* Recorded here, before it's known whether any conjunct actually picks a
+     * strategy below -- getQueryType only needs "was there a WHERE clause at
+     * all", to distinguish "Filtered Scan" from "Full Scan" once neither
+     * this query nor its CTEs/subqueries end up choosing one. */
+    if (whereClauseList != NIL)
+        distPlan->hasWhereClause = true;
     /* Iterate over the where clause conditions */
     foreach(clauseCell, whereClauseList)
     {

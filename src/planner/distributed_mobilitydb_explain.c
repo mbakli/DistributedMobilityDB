@@ -38,13 +38,14 @@ static void ExplainWorkerPlan(PlannedStmt *plannedstmt, DestReceiver *dest, Expl
 static void InitializeDistributedQueryExplain(DistributedQueryExplain *distributedQueryExplain,
                                               ExplainState *es, const char *queryString);
 static void ExplainQueryType(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es);
-static char * getQueryType(List *strategies);
+static char * getQueryType(List *strategies, bool hasWhereClause);
 static void ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
                                     int cursorOptions, IntoClause *into, ParamListInfo params,
                                     QueryEnvironment *queryEnv);
 
 static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
-                                       int indent_group);
+                             int indent_group, Query *query, int cursorOptions, IntoClause *into,
+                             const char *queryString, ParamListInfo params, QueryEnvironment *queryEnv);
 static void ExplainPlanStrategies(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es, int indent_group);
 static void ExplainOneTask(ExecutorTask *task, STMultirelation *base, ExplainState *es, int indent_group);
 static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile);
@@ -119,7 +120,7 @@ distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into
     ExplainOpenGroup("DistributedQueryExplain", "Distributed Query", true, es);
     ExplainQueryType(distPlan,es);
     ExplainQueryParameters(distPlan, es, 2);
-    ExplainQueryPlan(distPlan, es, 2);
+    ExplainQueryPlan(distPlan, es, 2, query, cursorOptions, into, queryString, params, queryEnv);
     ExplainCloseGroup("DistributedQueryExplain", "Distributed Query", true, es);
 
 }
@@ -188,17 +189,17 @@ InitializeDistributedQueryExplain(DistributedQueryExplain *distributedQueryExpla
 }
 
 /*
- * Explain the query type that can be one of the following: noncolocated, colocated, range, knn, other
+ * Explain the query type that can be one of the following: noncolocated, colocated, range, knn, full scan, filtered scan
  */
 static void ExplainQueryType(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es)
 {
     StringInfo temp = makeStringInfo();
-    appendStringInfo(temp, "(Query Type: %s)", getQueryType(distPlan->strategies));
+    appendStringInfo(temp, "(Query Type: %s)", getQueryType(distPlan->strategies, distPlan->hasWhereClause));
     ExplainPropertyText("Distributed Spatiotemporal Planner", temp->data, es);
 }
 
 /* getQueryType renders the combination of chosen strategies as a short human-readable label. */
-static char * getQueryType(List *strategies)
+static char * getQueryType(List *strategies, bool hasWhereClause)
 {
     ListCell *cell = NULL;
     bool colocated = false;
@@ -226,8 +227,10 @@ static char * getQueryType(List *strategies)
         return "Range";
     else if (knn)
         return "Knn";
+    else if (hasWhereClause)
+        return "Filtered Scan";
     else
-        return "Other";
+        return "Full Scan";
 }
 
 /*
@@ -294,11 +297,17 @@ ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainSta
     appendStringInfo(es->str, "-> Query Plan:\n");
     es->indent += indent_group;
     appendStringInfoSpaces(es->str, es->indent * indent_group);
-    if (table->catalogTableInfo.isMobilityDB)
-        appendStringInfo(es->str, "Deduplicate replicated fragments (DISTINCT ON %s):\n",
-                         table->catalogTableInfo.groupCol);
-    else
-        appendStringInfo(es->str, "Combine per-tile fragments (GROUP BY %s):\n", table->catalogTableInfo.groupCol);
+    /*
+     * Always GROUP BY now -- both RewriteSegmentedDistFuncCalls and
+     * RewriteWhereClauseDistFuncCalls dropped their isMobilityDB-conditioned
+     * DISTINCT ON path (it assumed a segmented MobilityDB table's tiles
+     * hold full duplicate copies of each trip, which turned out to be false
+     * for genuinely-clipped tables like trips_9t -- see those functions'
+     * own comments). This label used to branch the same way and had gone
+     * stale, printing "DISTINCT ON" over a plan that was actually a
+     * HashAggregate/GROUP BY the whole time.
+     */
+    appendStringInfo(es->str, "Combine per-tile fragments (GROUP BY %s):\n", table->catalogTableInfo.groupCol);
     es->indent += indent_group;
 
     /*
@@ -373,7 +382,8 @@ SpatiotemporalExplainScan(CustomScanState *node, List *ancestors, struct Explain
 }
 
 static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, ExplainState *es,
-                             int indent_group)
+                             int indent_group, Query *query, int cursorOptions, IntoClause *into,
+                             const char *queryString, ParamListInfo params, QueryEnvironment *queryEnv)
 {
     appendStringInfo(es->str, "-> Query Plan:\n");
     es->indent = indent_group;
@@ -400,6 +410,48 @@ static void ExplainQueryPlan(DistributedSpatiotemporalQueryPlan *distPlan, Expla
         appendStringInfoSpaces(es->str, es->indent * indent_group);
         es->indent -= indent_group;
         ExplainPlanStrategies(distPlan, es, indent_group + 2);
+    }
+    else
+    {
+        /*
+         * Full Scan / Filtered Scan: no strategy was chosen, so
+         * ExplainPlanStrategies (which relies on this extension's own
+         * multi-phase executor tasks) has nothing to build a plan from --
+         * this query type just runs as a normal Citus distributed query,
+         * no custom reshuffling involved. Embed Citus' own EXPLAIN of it
+         * instead of leaving the section blank, same technique
+         * ExplainSegmentedRewrite already uses for its own no-custom-
+         * strategy case: it's the real plan that actually runs on the
+         * workers, so shown directly rather than reimplemented by hand.
+         */
+        ExplainState *citusEs = NewExplainState();
+        citusEs->format = es->format;
+        citusEs->costs = es->costs;
+        citusEs->verbose = es->verbose;
+        citusEs->analyze = es->analyze;
+        citusEs->timing = es->timing;
+        citusEs->buffers = es->buffers;
+        citusEs->summary = es->summary;
+        citusEs->settings = es->settings;
+        citusEs->wal = es->wal;
+
+        CitusExplainOneQuery(copyObject(query), cursorOptions, into, citusEs, queryString, params, queryEnv);
+
+        char *citusPlanText = pstrdup(citusEs->str->data);
+        char *planLine = strtok(citusPlanText, "\n");
+        while (planLine != NULL)
+        {
+            char *trimmed = planLine;
+            while (*trimmed == ' ')
+                trimmed++;
+            if (strncmp(trimmed, "->  Custom Scan (Citus Adaptive)", strlen("->  Custom Scan (Citus Adaptive)")) != 0 &&
+                strncmp(trimmed, "Custom Scan (Citus Adaptive)", strlen("Custom Scan (Citus Adaptive)")) != 0)
+            {
+                appendStringInfoSpaces(es->str, es->indent * indent_group);
+                appendStringInfo(es->str, "%s\n", planLine);
+            }
+            planLine = strtok(NULL, "\n");
+        }
     }
 }
 
