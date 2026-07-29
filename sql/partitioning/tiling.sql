@@ -31,7 +31,16 @@ DECLARE
     table_out_id integer;
     temp text;
     tiling tiling;
+    staged_source text;
+    staged_fresh boolean;
 BEGIN
+    -- Needed for the hash-staging dblink connection further down (the
+    -- package/extension files being present on disk isn't the same as the
+    -- extension being CREATEd in this database yet). Via EXECUTE, not a
+    -- bare statement, to be certain this utility command runs correctly
+    -- from inside a plpgsql function body regardless of Postgres version
+    -- quirks.
+    EXECUTE 'CREATE EXTENSION IF NOT EXISTS dblink';
     PERFORM checkTileSizeCreations();
     -- Check if the output table exists or not
     EXECUTE format('%s', concat('SELECT to_regclass(''public.', table_name_out, ''')'))
@@ -89,6 +98,7 @@ BEGIN
         SELECT spatiotemporal_col_name
         INTO tiling.distCol;
     END IF;
+
     SELECT getDistColType(table_name_in, tiling.distCol)
     INTO tiling.distColType;
 
@@ -129,7 +139,8 @@ BEGIN
     -- set the number of tiles
     SELECT num_tiles
     INTO tiling.numTiles;
-    -- Granularity detection
+    -- Granularity detection -- against table_name_in, not staged_source
+    -- (which isn't staged yet at this point).
     IF tiling_granularity IS NULL THEN
         RAISE INFO 'Granularity Detection';
         SELECT tilingGranularityDetection(table_name_in, table_name_out, tiling)
@@ -138,29 +149,55 @@ BEGIN
     ELSE
         tiling.granularity := tiling_granularity;
     END IF;
+
+    -- Stage table_name_in as hash-distributed + GIST-indexed (if it isn't a
+    -- Citus table already), right here where it's first needed (the tiling
+    -- method dispatch right below). Run over a SEPARATE dblink connection,
+    -- not inline in this function's own transaction: Citus can't safely
+    -- create a second distributed table (this staging copy, alongside
+    -- table_name_out's own shards further down) within one transaction --
+    -- one worker's shard/connection metadata cache is left stale, causing a
+    -- "relation ... does not exist" error on the later INSERT. dblink
+    -- defaults to autocommit per statement when no explicit BEGIN is sent,
+    -- so stage_hash_distributed_source runs and COMMITS entirely within its
+    -- own session before this call even returns -- well before this
+    -- function's own (still-open) transaction goes on to create
+    -- table_name_out's shards below. A blocking call, not the async
+    -- send_query/get_result split tried previously: that let staging
+    -- overlap with granularity detection's own heavy queries, and the two
+    -- running concurrently against the same workers is suspected to have
+    -- contributed to an OOM kill on one worker during testing.
+    SELECT r.staged_table, r.was_freshly_staged
+    INTO staged_source, staged_fresh
+    FROM dblink(format('dbname=%s user=%s', current_database(), current_user),
+                format('SELECT * FROM stage_hash_distributed_source(%L, %L)', table_name_in, tiling.distCol))
+         AS r(staged_table text, was_freshly_staged boolean);
+    IF staged_fresh THEN
+        RAISE INFO 'Table % hash-distributed for the first time as % (staged in a separate session, already committed)', table_name_in, staged_source;
+    END IF;
     -- Check if the table exists, tell the user to write another table name
     IF lower(tiling_method) = 'crange' THEN
         tiling.disjointTiles := TRUE;
         tiling.method := 'crange';
-        SELECT crange_method(table_name_in, table_name_out, tiling)
+        SELECT crange_method(staged_source, table_name_out, tiling)
         INTO table_out_id;
     ELSIF lower(tiling_method) = 'colocation' THEN
-        SELECT colocation_method(table_name_in, table_name_out, tiling)
+        SELECT colocation_method(staged_source, table_name_out, tiling)
         INTO table_out_id;
     ELSIF lower(tiling_method) = 'hierarchical' THEN
         tiling.disjointTiles := TRUE;
         tiling.method := 'hierarchical';
-        SELECT hierarchical_method(table_name_in, table_name_out, tiling)
+        SELECT hierarchical_method(staged_source, table_name_out, tiling)
         INTO table_out_id;
     ELSIF lower(tiling_method) = 'period' THEN
         tiling.disjointTiles := TRUE;
         tiling.method := 'period';
-        SELECT period_method(table_name_in, table_name_out, tiling)
+        SELECT period_method(staged_source, table_name_out, tiling)
         INTO table_out_id;
     ELSIF lower(tiling_method) = 'quadtree' THEN
         tiling.disjointTiles := TRUE;
         tiling.method := 'quadtree';
-        SELECT quadtree_method(table_name_in, table_name_out, tiling)
+        SELECT quadtree_method(staged_source, table_name_out, tiling)
         INTO table_out_id;
     ELSE
         RAISE EXCEPTION 'Please choose one of the following tiling methods: CRANGE, HIERARCHICAL, PERIOD, QUADTREE, STR, OCTREE';
@@ -174,7 +211,20 @@ BEGIN
     -- corrected numTiles doesn't propagate back here otherwise).
     SELECT numTiles FROM pg_dist_spatiotemporal_tables WHERE id = table_out_id
     INTO tiling.numTiles;
-    -- Move data into tiles
+    -- Move data into tiles. Deliberately table_name_in here, not
+    -- staged_source: reproduced directly that INSERT INTO table_name_out
+    -- (range-distributed, exactly tiling.numTiles shards via
+    -- create_range_shards) SELECT ... FROM staged_source (hash-distributed,
+    -- Citus' own default shard count, no colocation relationship to
+    -- table_name_out at all) fails with "relation ... does not exist" on
+    -- whichever worker Citus picks -- the two tables aren't colocated, so
+    -- Citus can't safely push this down shard-by-shard the way it can for a
+    -- genuinely local (undistributed) source, which is what table_name_in
+    -- actually is here and what this INSERT has always run against
+    -- reliably. staged_source is only used above, for the read-only
+    -- granularity-detection/tile-boundary-search queries (the confirmed
+    -- slow part -- 13m26s of tile generation vs. ~8-10s for this allocation
+    -- step against the very same unstaged table), not for this write.
     IF physical_partitioning THEN
         start_time := clock_timestamp();
         PERFORM spatiotemporal_data_allocation(table_name_in, tiling, table_name_out, table_out_id);
@@ -185,9 +235,14 @@ BEGIN
         END IF;
     END IF;
     -- IF EXISTS: only crange's point-based preprocessing creates this _temp
-    -- table; other methods' point-based support never creates it.
+    -- table; other methods' point-based support never creates it. Named
+    -- from staged_source (what actually got passed into crange_method
+    -- above, which builds the _temp table's name from whatever table_name_in
+    -- value it receives), not the original table_name_in parameter -- those
+    -- differ whenever staging actually ran, and dropping the wrong name here
+    -- would silently leave the real _temp table behind.
     IF tiling.internaltype not in ('instant', 'point') and tiling.granularity = 'point-based' THEN
-        EXECUTE format('%s', concat('DROP TABLE IF EXISTS ', table_name_in, '_temp'));
+        EXECUTE format('%s', concat('DROP TABLE IF EXISTS ', staged_source, '_temp'));
     END IF;
     RAISE INFO 'Total elapsed time:%', (clock_timestamp() - temp_start_time);
     return true;

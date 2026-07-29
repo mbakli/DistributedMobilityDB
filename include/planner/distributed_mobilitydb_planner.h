@@ -83,6 +83,16 @@ typedef struct DistributedSpatiotemporalQueryPlan
      * without asserting anything about replication vs. true segmentation.
      */
     char *segmentedRewriteExplainNotes;
+    /*
+     * Set by ProcessQueryPredicates whenever a query (outer query, a CTE, or
+     * a FROM-clause subquery) has a WHERE clause, regardless of whether any
+     * conjunct turns out to be a registered spatiotemporal predicate. Lets
+     * getQueryType tell apart, once no strategy ends up chosen, "Filtered
+     * Scan" (WHERE present but nothing spatial in it, e.g. WHERE
+     * vehicleid = 5 -- still can't prune tiles) from "Full Scan" (no WHERE
+     * clause at all).
+     */
+    bool hasWhereClause;
 } DistributedSpatiotemporalQueryPlan;
 
 /* Filter Operation */

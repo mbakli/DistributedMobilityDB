@@ -31,6 +31,16 @@ extern char *RewriteSegmentedDistFuncCalls(Query *parse, const char *query_strin
                                            char **explainNotesOut);
 
 /*
+ * Rewrites a bare distributed-function call used as a WHERE-clause filter
+ * (e.g. `WHERE length(trip) > 5000`) over a single segmented distributed
+ * spatiotemporal table into a two-level query that filters on the
+ * function's properly-combined value instead of evaluating it per-fragment;
+ * NULL if nothing to rewrite. See the .c file for the full rationale and
+ * scope limits.
+ */
+extern char *RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList);
+
+/*
  * Rewrites a query with an explicit aggregate over a registered distributed
  * function applied to a replicated (isMobilityDB, segmented) table's column
  * -- e.g. `SUM(length(atTime(t.Trip, p.Period))) ... GROUP BY ...` -- into a
