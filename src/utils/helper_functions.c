@@ -91,6 +91,51 @@ char* replaceWord( char* s,  char* oldW,  char* newW)
     return bstr;
 }
 
+/* TrimmedSubstring returns a newly palloc'd, whitespace-trimmed copy of the text spanning [start, end). */
+extern char *
+TrimmedSubstring(const char *start, const char *end)
+{
+    while (start < end && isspace((unsigned char) *start))
+        start++;
+    while (end > start && isspace((unsigned char) *(end - 1)))
+        end--;
+    size_t len = end - start;
+    char *result = palloc(len + 1);
+    memcpy(result, start, len);
+    result[len] = '\0';
+    return result;
+}
+
+/*
+ * SplitTopLevelCommas splits text on commas that are not nested inside
+ * parentheses, returning a List of palloc'd, whitespace-trimmed C-string
+ * chunks in left-to-right order -- used to break a SELECT/ORDER BY list's
+ * text into one chunk per entry without misreading a comma inside a nested
+ * function call (e.g. `atTime(t.Trip, p.Period)`) as a top-level separator.
+ */
+extern List *
+SplitTopLevelCommas(const char *text)
+{
+    List *chunks = NIL;
+    int depth = 0;
+    const char *chunkStart = text;
+    const char *p = text;
+    for (; *p; p++)
+    {
+        if (*p == '(')
+            depth++;
+        else if (*p == ')')
+            depth--;
+        else if (*p == ',' && depth == 0)
+        {
+            chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
+            chunkStart = p + 1;
+        }
+    }
+    chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
+    return chunks;
+}
+
 /*
  * extract_between returns a newly allocated copy of the substring of str
  * found strictly between markers p1 and p2, or NULL if either marker isn't

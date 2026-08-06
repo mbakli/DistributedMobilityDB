@@ -625,7 +625,35 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
      */
     StringInfo key = makeStringInfo();
     appendStringInfo(key, "WHERE %s", tileKeyConditions->data);
-    return replaceWord(query_string, "where", key->data);
+
+    /*
+     * A case-sensitive search for the literal lowercase "where" (as
+     * replaceWord did here previously) breaks once an earlier stage (e.g.
+     * AddTilingKey's own self-join tile-key equality predicate, tile_tasks.c)
+     * has already injected its own capitalized "WHERE ... AND" clause into
+     * query_string: the search skips right past that clause and matches the
+     * *next* lowercase "where" instead, which can be out of scope for the
+     * conditions being inserted -- reproduced on BerlinMOD Q10 (a
+     * self-joined CTE over trips_16t): the CTE's own WHERE had already been
+     * capitalized this way, so this used to match the *outer* query's
+     * "where periods is not null" instead, splicing in "t1.tile_key = ..."
+     * where t1/t2 aren't in scope ("missing FROM-clause entry for table
+     * t1"). Locate the keyword case-insensitively via FindKeywordToken on a
+     * lowercased copy (same byte length as the original, so the returned
+     * offset is valid against it) and splice the new conditions in at that
+     * exact position instead.
+     */
+    char *lowered = toLower(query_string);
+    char *whereToken = FindKeywordToken(lowered, "where");
+    if (whereToken == NULL)
+        return query_string;
+
+    size_t offset = whereToken - lowered;
+    StringInfo result = makeStringInfo();
+    appendBinaryStringInfo(result, query_string, offset);
+    appendStringInfo(result, "%s", key->data);
+    appendStringInfo(result, "%s", query_string + offset + strlen("where"));
+    return result->data;
 }
 
 /*

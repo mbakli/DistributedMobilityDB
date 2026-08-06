@@ -445,20 +445,34 @@ getReshuffledColumns(DistributedSpatiotemporalQueryPlan *distPlan, Oid oid)
     }
     /* Execute the query, noting the readonly status of this SQL */
     spi_result = SPI_execute(catalogQuery->data, false, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /*
+     * This is a single-group aggregate (no GROUP BY), so it always returns exactly one row --
+     * unlike the SPI_tuptable->vals[0] bug fixed elsewhere in this codebase (table_ops.c,
+     * nodes.c, tile_tasks.c), the real risk here is array_agg() returning NULL when oid has no
+     * matching columns (e.g. it isn't actually a reshuffled table, or was dropped), which
+     * SPI_getvalue then also returns as a NULL C string -- silently handing the caller a NULL
+     * pointer that later gets formatted into reshufflingQuery's SQL text. The SPI_processed guard
+     * is added for consistency with the same pattern fixed elsewhere; the explicit NULL check
+     * below is what actually matters here, reporting it the same way the pre-existing
+     * non-SPI_OK_SELECT fallback already did instead of returning NULL to the caller.
+     */
+    char *reshuffledTableColumns = NULL;
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
-        char * reshuffledTableColumns = DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
-                                                                     SPI_tuptable->tupdesc,
-                                                                     1));
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
-        return reshuffledTableColumns;
+        reshuffledTableColumns = DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
+                                                               SPI_tuptable->tupdesc,
+                                                               1));
     }
-    elog(ERROR, "Could not read column list for relation %u", oid);
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+    if (reshuffledTableColumns == NULL)
+    {
+        elog(ERROR, "Could not read column list for relation %u", oid);
+    }
+    return reshuffledTableColumns;
 }
 
 /*

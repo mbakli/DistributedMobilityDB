@@ -60,4 +60,16 @@ extern char *DatumToString(Datum datum, Oid typeoid);
 
 /* Runs query via SPI, erroring out if its result status doesn't match expectedSpiOk (an SPI_OK_* constant). */
 extern void ExecuteQueryViaSPI(char *query, int expectedSpiOk);
+
+/* Returns a newly palloc'd, whitespace-trimmed copy of the text spanning [start, end). */
+extern char *TrimmedSubstring(const char *start, const char *end);
+
+/*
+ * Splits text on commas that are not nested inside parentheses, returning a
+ * List of palloc'd, whitespace-trimmed C-string chunks in left-to-right
+ * order -- e.g. breaking a SELECT/ORDER BY list's text into one chunk per
+ * entry without misreading a comma inside a nested function call (e.g.
+ * `atTime(t.Trip, p.Period)`) as a top-level separator.
+ */
+extern List *SplitTopLevelCommas(const char *text);
 #endif /* HELPER_FUNCTIONS_H */

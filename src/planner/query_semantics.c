@@ -399,51 +399,13 @@ ReplicatedAggregateWalker(Node *node, ReplicatedAggregateSearch *search)
     return expression_tree_walker(node, ReplicatedAggregateWalker, (void *) search);
 }
 
-/* TrimmedSubstring returns a newly palloc'd, whitespace-trimmed copy of the text spanning [start, end). */
-static char *
-TrimmedSubstring(const char *start, const char *end)
-{
-    while (start < end && isspace((unsigned char) *start))
-        start++;
-    while (end > start && isspace((unsigned char) *(end - 1)))
-        end--;
-    size_t len = end - start;
-    char *result = palloc(len + 1);
-    memcpy(result, start, len);
-    result[len] = '\0';
-    return result;
-}
-
 /*
- * SplitTopLevelCommas splits text on commas that are not nested inside
- * parentheses, returning a List of palloc'd, whitespace-trimmed C-string
- * chunks in left-to-right order -- used to break a SELECT list's text into
- * one chunk per target-list entry without misreading a comma inside a
- * nested function call (e.g. `atTime(t.Trip, p.Period)`) as a top-level
- * separator.
+ * TrimmedSubstring/SplitTopLevelCommas now live in utils/helper_functions.c
+ * (promoted from here so multi_phase_executor.c's positional ORDER BY
+ * rewrite could reuse them too -- same "make future text-parsing fixes
+ * reusable across files" pattern FindKeywordToken/FindTopLevelKeywordToken
+ * already followed).
  */
-static List *
-SplitTopLevelCommas(const char *text)
-{
-    List *chunks = NIL;
-    int depth = 0;
-    const char *chunkStart = text;
-    const char *p = text;
-    for (; *p; p++)
-    {
-        if (*p == '(')
-            depth++;
-        else if (*p == ')')
-            depth--;
-        else if (*p == ',' && depth == 0)
-        {
-            chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
-            chunkStart = p + 1;
-        }
-    }
-    chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
-    return chunks;
-}
 
 /*
  * RewriteWhereClauseDistFuncCalls detects a bare (non-aggregate) call to a
@@ -1002,6 +964,27 @@ RewriteReplicatedAggregateQuery(Query *parse, const char *query_string, STMultir
             aggArgText = TrimmedSubstring(argStart, scan);
             continue;
         }
+
+        /*
+         * Any *other* aggregate in the target list (e.g. a plain `count(*)`
+         * alongside the replicated one this rewrite is handling) can't be
+         * treated as a pass-through column the way a plain Var can: the code
+         * below embeds te's raw SQL text into the inner query's own
+         * `SELECT DISTINCT ...` list, which has no GROUP BY at all --
+         * mixing an aggregate into that list produces invalid SQL ("column
+         * ... must appear in the GROUP BY clause or be used in an aggregate
+         * function", reproduced directly with
+         * `SELECT tile_key, count(*), sum(numInstants(trip)) FROM t GROUP BY
+         * tile_key` against a real segmented MobilityDB table). This
+         * function's own doc comment already scopes it to "only the first
+         * qualifying Aggref found is rewritten" -- bailing out here when a
+         * second, unrelated aggregate is present is consistent with that,
+         * and with this function's existing philosophy of falling back to
+         * the pre-existing (imperfect but non-erroring) behavior rather than
+         * risking broken SQL.
+         */
+        if (IsA(te->expr, Aggref))
+            return NULL;
 
         if (te->resname == NULL)
             return NULL;

@@ -75,6 +75,7 @@ extern int
 DistributedColumnType(Oid relationId)
 {
     int spi_result;
+    int result = DIFFTYPE;
     /* Connect */
     spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
@@ -86,25 +87,33 @@ DistributedColumnType(Oid relationId)
     appendStringInfo(catalogQuery, "select distcoltype from pg_dist_spatiotemporal_tables WHERE tableName= '%s' ",
                      get_rel_name(relationId));
     spi_result = SPI_execute(catalogQuery->data, false, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /*
+     * Read back the PROJ text -- SPI_OK_SELECT only means the query ran as a SELECT, not that it
+     * matched any rows (e.g. a stale/mismatched relationId<->tableName lookup). SPI_processed must
+     * be checked before indexing SPI_tuptable->vals[0]; without it, a zero-row result reads past
+     * the end of an empty array. Reproduced directly under gdb: SIGSEGV inside SPI_getvalue,
+     * called from here with a zero-row SPI_tuptable, on every query against a table this lookup
+     * failed to match.
+     */
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
-       const char * columnType = (char *)DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
-                                                                       SPI_tuptable->tupdesc,
-                                                                       1));
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
+        const char *columnType = (char *) DatumGetCString(SPI_getvalue(SPI_tuptable->vals[0],
+                                                                        SPI_tuptable->tupdesc,
+                                                                        1));
         if (strcmp(columnType, "geometry") == 0)
-            return SPATIAL;
-        else if(strcmp(columnType, "tgeompoint") == 0)
-            return SPATIOTEMPORAL;
-        return DIFFTYPE;
+            result = SPATIAL;
+        else if (strcmp(columnType, "tgeompoint") == 0)
+            result = SPATIOTEMPORAL;
     }
-    else
-        return DIFFTYPE;
+    /* Always paired with SPI_connect() above, regardless of which branch was taken -- the
+     * previous version only called this inside the SPI_OK_SELECT branch, leaking the SPI
+     * connection on any other result status. */
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+    return result;
 }
 
 /*
@@ -129,6 +138,7 @@ GetSpatiotemporalCol(Oid relationId)
 {
     int spi_result;
     bool isNull = false;
+    char *result = NULL;
     /* Connect */
     spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
@@ -142,20 +152,27 @@ GetSpatiotemporalCol(Oid relationId)
                      get_rel_name(relationId));
 
     spi_result = SPI_execute(catalogQuery->data, true, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /* Same bug as DistributedColumnType above (and already fixed in GetLocalIndex/GetShapeCol
+     * below): a stale/mismatched relationId<->tableName lookup legitimately returns zero rows,
+     * and SPI_tuptable->vals[0] must not be read in that case -- confirmed under gdb, SIGSEGV
+     * inside SPI_getbinval, reached from here via analyzeDistributedSpatiotemporalTables ->
+     * GetMultirelationInfo on every query against a table this lookup failed to match. */
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
         TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
         Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
-        return DatumToString(distcol, TEXTOID);
+        if (!isNull)
+            result = DatumToString(distcol, TEXTOID);
     }
-    return NULL;
+    /* Always paired with SPI_connect() above -- the previous version returned NULL directly on a
+     * non-SPI_OK_SELECT result without ever calling this, leaking the SPI connection. */
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+    return result;
 }
 
 /*

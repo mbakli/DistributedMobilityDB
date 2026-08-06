@@ -133,21 +133,25 @@ GetRandTileNum(STMultirelation *rte)
                                    "ORDER BY random() limit 1;",
                      get_rel_name(rte->catalogTableInfo.table_oid));
     spi_result = SPI_execute(catalogQuery->data, true, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /* A table with no shards registered in pg_dist_shard yet legitimately returns zero rows here
+     * -- same SPI_tuptable->vals[0] bug fixed in table_ops.c (DistributedColumnType/
+     * GetSpatiotemporalCol) and nodes.c (GetNodeInfo/GetDBName): SPI_OK_SELECT alone doesn't
+     * guarantee any rows, and reading vals[0] without checking SPI_processed first reads past an
+     * empty result. */
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
         TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
         heap_deform_tuple(row, rowDescriptor, &datum,
                           &isNull);
         res = DatumGetInt32(datum);
-
-        spi_result = SPI_finish();
-
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
+    }
+    /* Always paired with SPI_connect() above -- the previous version only called this inside the
+     * SPI_OK_SELECT branch, leaking the SPI connection on any other result status. */
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
     }
     return res;
 }

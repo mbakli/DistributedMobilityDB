@@ -24,6 +24,7 @@
 #include "utils/planner_utils.h"
 #include "utils/helper_functions.h"
 #include "planner/planner_strategies.h"
+#include <optimizer/optimizer.h>
 
 static void ConstructNeighborScanQuery(Rte *tbl, char * query_string, STMultirelation *base,
                                        MultiPhaseExecutor *multiPhaseExecutor);
@@ -40,6 +41,8 @@ static void IndexReshuffledData(Rte *reshuffledTable, MultiPhaseExecutor *multiP
 static void ConstructPostProcessingPhase(CoordinatorLevelOperator *coordOp, MultiPhaseExecutor *multiPhaseExecutor);
 static char *EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate);
 static char *StripOrderByAliasQualifiers(char *orderByText, Query *parse);
+static char *BuildPositionalOrderBy(Query *parse, const char *orderByText);
+static char *FindEarliestSortModifier(const char *chunk);
 
 
 
@@ -435,12 +438,103 @@ EliminateShapeSegmentDuplicates(char *query_string, bool hasDistributedAggregate
 }
 
 /*
+ * FindEarliestSortModifier returns a pointer to the earliest whitespace-
+ * bounded occurrence of "asc", "desc", or "nulls" in chunk (chunk must
+ * already be lowercased), or NULL if none of those appear -- used to find
+ * where a single ORDER BY item's core expression ends and its direction/
+ * nulls-ordering modifier (if any) begins.
+ */
+static char *
+FindEarliestSortModifier(const char *chunk)
+{
+    char *asc = FindKeywordToken(chunk, "asc");
+    char *desc = FindKeywordToken(chunk, "desc");
+    char *nulls = FindKeywordToken(chunk, "nulls");
+    char *best = NULL;
+    if (asc != NULL && (best == NULL || asc < best))
+        best = asc;
+    if (desc != NULL && (best == NULL || desc < best))
+        best = desc;
+    if (nulls != NULL && (best == NULL || nulls < best))
+        best = nulls;
+    return best;
+}
+
+/*
+ * BuildPositionalOrderBy rewrites orderByText (still carrying its leading
+ * "order by" keyword, already-lowercased, e.g. "order by t1.licence,
+ * t2.licence") into the equivalent ordinal-position form (e.g.
+ * "order by 1, 2"), matching each comma-separated item against parse's own
+ * parsed sortClause/targetList by position rather than by name.
+ *
+ * This exists because the alternative -- textually stripping each item's
+ * "alias." qualifier so it resolves against the "SELECT * FROM (...) AS
+ * ordered_result" wrap's unqualified output columns (StripOrderByAliasQualifiers)
+ * -- can't handle two ORDER BY items that happen to share the same bare
+ * column name once unqualified, e.g. "ORDER BY t1.Licence, t2.Licence" where
+ * t1/t2 both alias the same CTE: stripping both to plain "licence" produces
+ * "ORDER BY licence, licence", ambiguous against two identically-named
+ * output columns (reproduced on BerlinMOD Q6). A 1-based ordinal position is
+ * unambiguous regardless of how many output columns share a name.
+ *
+ * Returns NULL (letting the caller fall back to StripOrderByAliasQualifiers)
+ * if the item count doesn't match sortClause's, or any item turns out to
+ * sort by a resjunk target entry (not part of the visible "SELECT *" output,
+ * so no ordinal position of it is meaningful) -- deliberately conservative,
+ * matching this codebase's existing convention of bailing out to the
+ * pre-existing (im)perfect behavior rather than risking a wrong rewrite.
+ */
+static char *
+BuildPositionalOrderBy(Query *parse, const char *orderByText)
+{
+    const char *itemsStart = orderByText + strlen("order by");
+    while (isspace((unsigned char) *itemsStart))
+        itemsStart++;
+
+    List *chunks = SplitTopLevelCommas(itemsStart);
+    elog(WARNING, "DEBUG BuildPositionalOrderBy: chunks=%d sortClause=%d itemsStart=%s",
+         list_length(chunks), list_length(parse->sortClause), itemsStart);
+    if (list_length(chunks) != list_length(parse->sortClause))
+        return NULL;
+
+    StringInfo result = makeStringInfo();
+    appendStringInfoString(result, "order by ");
+
+    ListCell *chunkCell = list_head(chunks);
+    ListCell *sortCell;
+    bool first = true;
+    foreach(sortCell, parse->sortClause)
+    {
+        SortGroupClause *sortGroupClause = (SortGroupClause *) lfirst(sortCell);
+        TargetEntry *targetEntry = get_sortgroupclause_tle(sortGroupClause, parse->targetList);
+        if (targetEntry == NULL || targetEntry->resjunk)
+            return NULL;
+
+        char *chunk = (char *) lfirst(chunkCell);
+        char *modifier = FindEarliestSortModifier(chunk);
+        elog(WARNING, "DEBUG item: resjunk=%d resno=%d chunk=%s", targetEntry->resjunk, targetEntry->resno, chunk);
+
+        if (!first)
+            appendStringInfoString(result, ", ");
+        appendStringInfo(result, "%d", targetEntry->resno);
+        if (modifier != NULL)
+            appendStringInfo(result, " %s", modifier);
+
+        first = false;
+        chunkCell = lnext(chunks, chunkCell);
+    }
+    elog(WARNING, "DEBUG BuildPositionalOrderBy result: %s", result->data);
+    return result->data;
+}
+
+/*
  * Strips "alias." qualifiers (from parse's own FROM-clause RTEs) out of
  * orderByText. The final ORDER BY gets re-applied outside a "SELECT * FROM
  * (...) AS ordered_result" wrap whose only visible columns are unqualified,
  * so a copied-verbatim "p.pointid" fails with "missing FROM-clause entry for
  * table \"p\"" otherwise. orderByText is already lowercased, so qualifiers
- * built here are too.
+ * built here are too. Fallback for when BuildPositionalOrderBy can't be used
+ * (item-count mismatch or a resjunk sort target).
  */
 static char *
 StripOrderByAliasQualifiers(char *orderByText, Query *parse)
@@ -450,7 +544,18 @@ StripOrderByAliasQualifiers(char *orderByText, Query *parse)
     foreach(cell, parse->rtable)
     {
         RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
-        if (rte->rtekind != RTE_RELATION || !rte->inFromCl)
+        /*
+         * A top-level FROM entry aliasing one of the query's own CTEs (e.g.
+         * "FROM Temp t1, Temp t2 ... ORDER BY t1.Licence") is RTE_CTE, not
+         * RTE_RELATION -- excluding it here left its qualifier
+         * unstripped, surviving into the "SELECT * FROM (...) AS
+         * ordered_result ORDER BY ..." wrap where it's out of scope
+         * ("missing FROM-clause entry", reproduced on BerlinMOD Q6/Q7/Q13/
+         * Q14, all of which order by a CTE-aliased column at the top
+         * level). Both kinds need the same treatment: strip any top-level
+         * FROM alias's qualifier, not just a real relation's.
+         */
+        if ((rte->rtekind != RTE_RELATION && rte->rtekind != RTE_CTE) || !rte->inFromCl)
             continue;
         StringInfo qualifier = makeStringInfo();
         appendStringInfo(qualifier, "%s.", rte->eref->aliasname);
@@ -579,11 +684,14 @@ ConstructGeneralQuery(DistributedSpatiotemporalQueryPlan *distPlan, MultiPhaseEx
             while (len > 0 && (orderByText[len - 1] == ';' || isspace((unsigned char) orderByText[len - 1])))
                 orderByText[--len] = '\0';
 
-            orderByText = StripOrderByAliasQualifiers(orderByText, distPlan->query);
+            char *positional = BuildPositionalOrderBy(distPlan->query, orderByText);
+            orderByText = positional != NULL ? positional :
+                          StripOrderByAliasQualifiers(orderByText, distPlan->query);
 
             StringInfo wrapped = makeStringInfo();
             appendStringInfo(wrapped, "SELECT * FROM (%s) AS ordered_result %s",
                              generalScan->query_string->data, orderByText);
+            elog(WARNING, "DEBUG final wrapped query: %s", wrapped->data);
             resetStringInfo(generalScan->query_string);
             appendStringInfo(generalScan->query_string, "%s", wrapped->data);
         }

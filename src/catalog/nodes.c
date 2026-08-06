@@ -51,8 +51,11 @@ GetNodeInfo()
     }
     spi_result = SPI_execute("SELECT nodename, nodeport FROM pg_dist_node ORDER BY random() limit 1",
                              true, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /* A cluster with no registered worker nodes legitimately returns zero rows here -- same
+     * SPI_tuptable->vals[0] bug fixed elsewhere in this file and in table_ops.c
+     * (DistributedColumnType/GetSpatiotemporalCol): SPI_OK_SELECT alone doesn't guarantee any
+     * rows, and reading vals[0] without checking SPI_processed first reads past an empty result. */
+    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
         TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
         HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
@@ -60,11 +63,13 @@ GetNodeInfo()
                           isNullArray);
         taskNode->node = PointerGetDatum(datumArray[Anum_DistNodes_nodename]);
         taskNode->port = DatumGetInt32(datumArray[Anum_DistNodes_nodeport]);
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
+    }
+    /* Always paired with SPI_connect() above -- the previous version only called this inside the
+     * SPI_OK_SELECT branch, leaking the SPI connection on any other result status. */
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
     }
 
     return taskNode;
@@ -256,18 +261,28 @@ GetDBName()
         elog(ERROR, "Could not connect to database using SPI");
     }
     spi_result = SPI_execute("SELECT current_database()", true, 1);
-    /* Read back the PROJ text */
-    if (spi_result == SPI_OK_SELECT)
+    /*
+     * current_database() always returns exactly one row in practice, but guarded here for
+     * consistency with the same SPI_tuptable->vals[0] bug fixed elsewhere in this file/
+     * table_ops.c. SPI_copytuple's row stays valid past SPI_finish() (see GetRandomTileId's
+     * comment above), so extraction is deferred until after it, same "found" pattern used by
+     * GetRandomTileId/GetReferenceTableShardName/GetShardHostNode above.
+     */
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
     {
-        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
-        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
-        spi_result = SPI_finish();
-        if (spi_result != SPI_OK_FINISH)
-        {
-            elog(ERROR, "Could not disconnect from database using SPI");
-        }
-        return SPI_getbinval(row, rowDescriptor, 1, &isNull);
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
     }
-    return 0;
+    spi_result = SPI_finish();
+    if (spi_result != SPI_OK_FINISH)
+    {
+        elog(ERROR, "Could not disconnect from database using SPI");
+    }
+    if (!found)
+        return (Datum) 0;
+    return SPI_getbinval(row, rowDescriptor, 1, &isNull);
 }
 
