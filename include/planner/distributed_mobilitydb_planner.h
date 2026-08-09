@@ -15,6 +15,41 @@
 #ifndef SPATIOTEMPORAL_PLANNER_H
 #define SPATIOTEMPORAL_PLANNER_H
 
+/* Marker prepended (as a SQL comment) to a query text dispatched via
+ * DispatchSameTileQueryAsync (multi_phase_executor.c) over a dblink
+ * connection -- that connection shares this same planner_hook, so without
+ * this marker the dispatched text (already the fully-resolved same-tile
+ * task) gets re-planned from scratch by distributed_mobilitydb_planner_internal,
+ * which can misclassify it and re-trigger reshuffle work concurrently with
+ * the reshuffle already in progress on the dispatching connection. Checked
+ * at the top of distributed_mobilitydb_planner_internal to bail out to
+ * Citus' own planner instead of recursing. */
+#define Var_Same_Tile_Dispatch_Marker "/* dmdb_same_tile_dispatch */"
+
+/*
+ * Marker prepended (as a SQL comment) to a query text ExplainOnHostingWorker
+ * (distributed_mobilitydb_explain.c) dispatches to a worker to get a real
+ * physical plan for one shard. Both planner_hook (distributed_mobilitydb_
+ * planner_internal) and ExplainOneQuery_hook (distributed_mobilitydb_
+ * explain_internal) are installed globally on every node, and Citus' own
+ * CitusExplainOneQuery -- which distributed_mobilitydb_explain_internal
+ * calls once it recognizes Var_Explain_Passthrough_Marker and bails out of
+ * custom explain handling -- itself goes through the standard planner path
+ * (and so re-enters planner_hook) to obtain a plan to explain. Without this
+ * marker also being checked in distributed_mobilitydb_planner_internal, that
+ * re-entry was invisible to it (it only recognized its own
+ * Var_Same_Tile_Dispatch_Marker), so the already-resolved, tile-substituted
+ * physical query got misclassified as a fresh top-level distributed
+ * spatiotemporal query and re-planned from scratch -- producing a nested
+ * duplicate "Distributed Spatiotemporal Planner" section in the EXPLAIN
+ * output (reproduced: both a Push Down Scan task and a self-join's Self
+ * Tiling Scan task hit this, non-deterministically, depending on which
+ * worker/shard GetRandTileNum happened to pick). Both
+ * hooks now check *both* markers, so any query text either hook's own
+ * dispatch functions produce is recognized as an internal passthrough by
+ * either hook, regardless of which one re-enters it. */
+#define Var_Explain_Passthrough_Marker "/* dmdb_explain_passthrough */"
+
 #include "postgres.h"
 #include "optimizer/planner.h"
 #include "multirelation/multirelation_utils.h"
@@ -93,6 +128,18 @@ typedef struct DistributedSpatiotemporalQueryPlan
      * clause at all).
      */
     bool hasWhereClause;
+    /*
+     * Set by ProcessQueryPredicates whenever the WHERE clause already
+     * contains an explicit tile_key = tile_key equality between two
+     * self-joined spatiotemporal range table entries. When present, the
+     * user has already restricted the join to same-tile pairs themselves --
+     * ProcessPredicateClause's distance/intersection handling checks this
+     * before force-adding NonColocation for a self-join, since a reshuffle
+     * built to catch cross-tile matches is pure wasted work when the query
+     * can never produce any (the tile_key equality and the reshuffle's own
+     * cross-tile pairing are mutually exclusive).
+     */
+    bool hasExplicitTileKeyEquality;
 } DistributedSpatiotemporalQueryPlan;
 
 /* Filter Operation */

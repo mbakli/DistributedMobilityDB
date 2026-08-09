@@ -22,19 +22,6 @@
 #include <nodes/parsenodes.h>
 
 /*
- * Rte
- *
- * A wrapper around a query range-table entry that tags it with which kind
- * of underlying node (`rte`) it holds, as identified by RteType.
- */
-typedef struct Rte
-{
-    Node *rte;
-    bool RteType;
-    Alias *alias;
-} Rte;
-
-/*
  * RteType
  *
  *   STRte    - a spatiotemporal/distributed table (see STMultirelation)
@@ -47,6 +34,19 @@ typedef enum RteType
     CitusRte,
     LocalRte
 } RteType;
+
+/*
+ * Rte
+ *
+ * A wrapper around a query range-table entry that tags it with which kind
+ * of underlying node (`rte`) it holds, as identified by RteType.
+ */
+typedef struct Rte
+{
+    Node *rte;
+    RteType RteType;
+    Alias *alias;
+} Rte;
 
 /* Metadata for a range-table entry backed by a Citus-distributed table. */
 typedef struct CitusRteNode

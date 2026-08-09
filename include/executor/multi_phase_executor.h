@@ -58,5 +58,5 @@ extern void CreateReshuffledTableIfNotExists(char * reshuffled_table, char * org
 extern Datum GetTaskType(ExecutorTask *task);
 
 /* True if `other` shares the same tiling/colocation as the base relation. */
-extern bool ColocateRte(STMultirelation *base, Rte *other);
+extern bool ColocateRte(STMultirelation *base, Rte *other, bool explain);
 #endif /* SPATIOTEMPORAL_EXECUTOR_H */

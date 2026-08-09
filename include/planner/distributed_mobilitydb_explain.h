@@ -35,6 +35,12 @@ extern void RegisterSpatiotemporalPlanMethods(void);
 /* True if any of `strategies` requires reshuffling tile data before execution. */
 extern bool IsReshufflingRequired(List *strategies);
 
+/* Marker-wraps an EXPLAIN command this extension is about to dispatch
+ * (locally or to a worker), so distributed_mobilitydb_explain recognizes the
+ * re-entry and doesn't recurse into the custom planner. See its definition
+ * in distributed_mobilitydb_explain.c for the full rationale. */
+extern char *WrapPassthroughExplainCommand(const char *command);
+
 /* Custom-scan execution state for a distributed spatiotemporal query. */
 typedef struct SpatiotemporalScanState
 {
