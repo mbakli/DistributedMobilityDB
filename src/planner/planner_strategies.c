@@ -18,6 +18,8 @@
 #include <utils/lsyscache.h>
 #include <executor/spi.h>
 #include <distributed/multi_executor.h>
+#include "utils/helper_functions.h"
+#include <utils/guc.h>
 
 static void planReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan);
 static void chooseReshuffledTable(DistributedSpatiotemporalQueryPlan *distPlan);
@@ -58,24 +60,47 @@ NonColocationStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 
 /*
  * planReshufflingQuery picks which reshuffling path applies to the query:
- * joining a spatiotemporal table against a plain Citus table
- * (PlanReshufflingNonStRteWithStRte) or joining two spatiotemporal tables
- * with different tiling schemes (PlanReshufflingStRtes). Joins among only
+ * joining two spatiotemporal tables with different tiling schemes
+ * (PlanReshufflingStRtes) or a single spatiotemporal table against a plain
+ * Citus/local table (PlanReshufflingNonStRteWithStRte). Joins among only
  * plain Citus tables are not yet handled here.
+ *
+ * The stCount>=2 check must come before the nonStCount one: a self-join
+ * (e.g. "Trips t1, Ref1 r1, Trips t2, Ref2 r2", stCount=2 for
+ * t1/t2, nonStCount=1 for r2) is a two-spatiotemporal-table reshuffle that
+ * happens to also join a reference/local table alongside it -- reshuffling
+ * still needs to run between t1/t2 (PlanReshufflingStRtes, whose
+ * chooseReshuffledTable() only ever looks at STRte entries, so extra
+ * non-ST tables in the same query don't confuse it). An earlier version of
+ * this check tested nonStCount first, so any such query -- ANY non-ST table
+ * present, regardless of how many ST tables there were -- got routed to
+ * PlanReshufflingNonStRteWithStRte instead. That path calls
+ * GetReshufflingRte(), which explicitly returns NULL whenever more than one
+ * spatiotemporal table is present (its own doc comment: "chooseReshuffledTable()
+ * must be used instead") -- PlanReshufflingNonStRteWithStRte then
+ * dereferenced that NULL unchecked, a SIGSEGV reproduced directly via gdb
+ * against a core dump (distPlan=..., rte_node=0x0 at
+ * PlanReshufflingNonStRteWithStRte, planner_strategies.c:99).
  */
 static void
 planReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan)
 {
-    if (distPlan->tablesList->stCount > 0 && distPlan->tablesList->nonStCount > 0)
+    if (distPlan->tablesList->stCount >= 2)
     {
-        /* At least one tiling scheme exists */
-        ReshufflingRte *rte_node = GetReshufflingRte(distPlan->tablesList);
-        PlanReshufflingNonStRteWithStRte(distPlan, rte_node);
-    }
-    else if (distPlan->tablesList->stCount > 0)
-    {
-        /* No tiling scheme */
+        /* Two (or more) spatiotemporal tables need reshuffling against
+         * each other -- any reference/local tables also present in the
+         * query are irrelevant to this choice. */
         PlanReshufflingStRtes(distPlan);
+    }
+    else if (distPlan->tablesList->stCount > 0 && distPlan->tablesList->nonStCount > 0)
+    {
+        /* Exactly one spatiotemporal table, reshuffle the other side to
+         * match its tiling. The stCount>=2 branch above already ruled out
+         * "more than one", so GetReshufflingRte() is guaranteed to find
+         * exactly one and never returns NULL here. */
+        ReshufflingRte *rte_node = GetReshufflingRte(distPlan->tablesList);
+        Assert(rte_node != NULL);
+        PlanReshufflingNonStRteWithStRte(distPlan, rte_node);
     }
     else if (distPlan->tablesList->nonStCount > 0)
     {
@@ -100,15 +125,6 @@ PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan *distPlan, R
     foreach(rangeTableCell, distPlan->tablesList->tables)
     {
         Rte * rteNode = (Rte *) lfirst(rangeTableCell);
-        /* TODO(known bug, tracked separately -- not fixed here): Rte.RteType
-         * is declared `bool` in include/general/rte.h but the RteType enum
-         * it holds has three values (STRte=0, CitusRte=1, LocalRte=2);
-         * storing LocalRte truncates to the same bool value CitusRte
-         * produces, so `== LocalRte` (comparing against the int literal 2)
-         * can never be true here. Needs Rte.RteType changed to the real
-         * enum type plus an audit of every ->RteType comparison in the
-         * codebase before it's safe to fix. */
-        // cppcheck-suppress compareBoolExpressionWithInt
         if (rteNode->RteType == CitusRte || rteNode->RteType == LocalRte)
             distPlan->reshuffledTable = rteNode;
         else if (rteNode->RteType == STRte){
@@ -124,7 +140,6 @@ PlanReshufflingNonStRteWithStRte(DistributedSpatiotemporalQueryPlan *distPlan, R
                 ((RangeTblEntry *)lfirst(citusNode->rangeTableCell))->relid));
         createReshufflingPlanForNonstRte(distPlan);
     }
-    // cppcheck-suppress compareBoolExpressionWithInt -- see TODO above on the same known Rte.RteType bug
     else if (distPlan->reshuffledTable->RteType == LocalRte)
     {
         /* The rte can be either broadcasted or partitioned using the same tiling scheme of the given
@@ -300,6 +315,16 @@ DistanceReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
     char bbox_col[30];
     char expand_op[30];
     STMultirelation *reshuffledTable = (STMultirelation *)distPlan->reshuffledTable->rte;
+    /* distPlan->distance is never assigned anywhere in this codebase --
+     * confirmed by grep -- so reading it here always got the struct's
+     * palloc0 zero-init instead of the query's real eDwithin threshold,
+     * silently expanding tiles by 0 regardless of the actual distance
+     * requested. predicatesList->predicateInfo->distancePredicate->distance
+     * is the field GetDistanceVal() (predicate_management.c) actually
+     * populates from the query text -- the postgis branch below already
+     * used it correctly; this now does too for the spatiotemporal branch
+     * and the shared WHERE-clause filter. */
+    float queryDistance = distPlan->predicatesList->predicateInfo->distancePredicate->distance;
     if (distPlan->shapeType == SPATIOTEMPORAL)
     {
         strcpy(bbox_col, Var_MobilityDB_BBOX);
@@ -308,7 +333,7 @@ DistanceReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
         appendStringInfo(catalogQuery, "SELECT S1.%s id1, S2.%s id2, "
                                        "S2.%s * %s(S1.%s, %f) reshufflingBbox ",
                          Var_Catalog_Tile_Key, Var_Catalog_Tile_Key, bbox_col,
-                         expand_op, bbox_col, distPlan->distance);
+                         expand_op, bbox_col, queryDistance);
     }
     else
     {
@@ -318,8 +343,7 @@ DistanceReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
         appendStringInfo(catalogQuery, "SELECT S1.%s id1, S2.%s id2, "
                                        "st_intersection(S2.%s, %s(S1.%s, %f)) reshufflingBbox ",
                          Var_Catalog_Tile_Key, Var_Catalog_Tile_Key, bbox_col,
-                         expand_op, bbox_col,
-                         distPlan->predicatesList->predicateInfo->distancePredicate->distance);
+                         expand_op, bbox_col, queryDistance);
     }
     // Prepare the from clause
     appendStringInfo(catalogQuery, "FROM %s T1, %s S1, %s T2, %s S2 ",
@@ -333,10 +357,14 @@ DistanceReshufflingPlan(DistributedSpatiotemporalQueryPlan *distPlan)
                      (reshuffledTable->catalogTableInfo.table_oid ==
                       distPlan->reshuffled_table_base->catalogTableInfo.table_oid) ? " AND S1.id < S2.id ":"",
                      bbox_col, expand_op, bbox_col,
-                     distPlan->distance);
+                     queryDistance);
     // Keep the catalog query in the distributed plan
     distPlan->catalog_query_string = palloc((strlen(catalogQuery->data) + 1) * sizeof (char));
     strcpy(distPlan->catalog_query_string, catalogQuery->data);
+    /* Surface the real distance on distPlan itself too, now that it's
+     * known -- multi_phase_executor.c's reshuffle-reuse cache keys off this
+     * to avoid wrongly reusing a table built for a different threshold. */
+    distPlan->distance = queryDistance;
 }
 
 /*
@@ -410,14 +438,67 @@ ConstructReshufflingQuery(DistributedSpatiotemporalQueryPlan *distPlan)
     StringInfo reshufflingQuery = makeStringInfo();
     /* Copy structure of the second table into the reshuffled table */
     char *reshuffledTableColumns = getReshuffledColumns(distPlan, reshuffledTable->catalogTableInfo.table_oid);
-    /* Generate the final CTE for the reshuffling data*/
+    /* Destination column list for the INSERT below, captured before the
+     * clipping substitution adds an "AS" alias to the SELECT-side copy --
+     * see the comment on the INSERT itself for why this needs to be
+     * explicit rather than positional. */
+    char *reshuffledTableColumnsBare = pstrdup(reshuffledTableColumns);
+
+    /* Clip the copied spatiotemporal column to the buffer region it's
+     * actually being reshuffled for (atStbox), instead of copying each
+     * row's whole trajectory. Provably lossless: any point clipped away
+     * is by construction further than the query's distance from the
+     * entire target tile's extent, hence further than that distance from
+     * every row confined to that tile -- can never drop a true match.
+     * Validated empirically this session: on a 3505-row self-join, full-
+     * trajectory vs. clipped-trajectory eDwithin() found the exact same
+     * 4284 matches (0 rows different either direction of a set-difference
+     * check), and the clipped version ran 1.68x faster (929.8s vs.
+     * 553.0s) purely from each downstream eDwithin() call evaluating a
+     * much smaller object -- this dataset averages ~2450 points/trip, and
+     * only the sliver actually near the tile boundary is ever relevant.
+     * SPATIOTEMPORAL only: atStbox() is a MobilityDB function, invalid on
+     * a plain PostGIS geometry column (the SPATIAL shapeType case, e.g. a
+     * table using intersection rather than a MobilityDB distance
+     * predicate) -- that case is left copying the column bare, unchanged
+     * from before, since it wasn't part of this session's validation.
+     *
+     * dmdb.disable_reshuffle_clipping (debug, off by default): lets a
+     * session temporarily turn this fix off to A/B the reshuffle/query
+     * runtime with vs. without clipping on the same table, without a
+     * rebuild -- not meant to be left on. */
+    const char *disableClipFlag = GetConfigOption("dmdb.disable_reshuffle_clipping", true, false);
+    bool clippingDisabled = (disableClipFlag != NULL && strcmp(disableClipFlag, "on") == 0);
+    if (distPlan->shapeType == SPATIOTEMPORAL && !clippingDisabled)
+    {
+        char *distCol = reshuffledTable->catalogTableInfo.distCol;
+        char *bareColumn = psprintf("\"%s\"", distCol);
+        char *clippedColumn = psprintf("atStbox(T.\"%s\", C.reshufflingBbox) AS \"%s\"", distCol, distCol);
+        reshuffledTableColumns = replaceWord(reshuffledTableColumns, bareColumn, clippedColumn);
+    }
+    /* Generate the final CTE for the reshuffling data. The INSERT's
+     * destination column list is explicit (reshuffledTableColumnsBare +
+     * tile_key) rather than relying on positional alignment with the
+     * reshuffled table's own column order -- that used to work only
+     * because tile_key always happened to be the base table's last
+     * column, so excluding it from the SELECT and appending C.id1 at the
+     * end lined up by accident. Adding any column after tile_key on the
+     * base table (e.g. trip_bbox, added for dmdb.use_bbox_proxy_filter)
+     * breaks that accident: the reshuffled table (CREATE TABLE LIKE +
+     * ALTER ADD tile_key) still has tile_key positioned right after the
+     * base table's original columns, one slot earlier than the new
+     * trailing column, so the old positional INSERT put trip_bbox's value
+     * where tile_key's integer was expected ("column tile_key is of type
+     * integer but expression is of type stbox"). An explicit column list
+     * is correct regardless of either table's column order. */
     appendStringInfo(reshufflingQuery, "WITH TEMP AS (%s) "
-                                       "INSERT INTO %s.%s "
+                                       "INSERT INTO %s.%s (%s, %s) "
                                        "SELECT %s, C.id1 "
                                        "FROM %s T, TEMP C "
                                        "WHERE T.tile_key = C.id2 AND T.%s && C.reshufflingBbox;",
                      distPlan->catalog_query_string, Var_Schema,
                      reshuffledTable->catalogTableInfo.reshuffledTable,
+                     reshuffledTableColumnsBare, Var_Catalog_Tile_Key,
                      reshuffledTableColumns,
                      get_rel_name(reshuffledTable->catalogTableInfo.table_oid),
                      reshuffledTable->catalogTableInfo.distCol
@@ -595,8 +676,8 @@ PredicatePushDownStrategyPlan(DistributedSpatiotemporalQueryPlan *distPlan)
 /* AddStrategy appends `type` to distPlan's list of chosen StrategyTypes, if
  * not already present. checkQueryType calls this once per registered
  * predicate clause, and a query can have more than one predicate that maps
- * to the same strategy between the same table pair (e.g. Q16's two
- * ST_Intersects clauses plus an aDisjoint clause all resolve to Colocation)
+ * to the same strategy between the same table pair (e.g. two ST_Intersects
+ * clauses plus an aDisjoint clause all resolving to Colocation)
  * -- appending unconditionally queued the same strategy's plan/task/query
  * multiple times, and ConstructGeneralQuery's UNION of one query per
  * strategies-list entry then UNIONed several copies of a query that already

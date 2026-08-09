@@ -28,6 +28,25 @@
 #include <executor/spi.h>
 #include <utils/builtins.h>
 
+/* Var_Explain_Passthrough_Marker and Var_Same_Tile_Dispatch_Marker are
+ * defined in distributed_mobilitydb_planner.h (included via this file's own
+ * header) -- see the comment there for why both hooks need to share one
+ * definition of each. */
+
+/*
+ * WrapPassthroughExplainCommand prefixes command with
+ * Var_Explain_Passthrough_Marker. Single choke point for every EXPLAIN
+ * command this extension itself dispatches (locally via SPI or remotely via
+ * run_command_on_workers/dblink) so that when it re-enters
+ * distributed_mobilitydb_explain -- on this same connection or a worker's --
+ * the marker is always there; a call site can no longer forget to add it by
+ * hand.
+ */
+extern char *
+WrapPassthroughExplainCommand(const char *command)
+{
+    return psprintf("%s %s", Var_Explain_Passthrough_Marker, command);
+}
 
 static Node *SpatiotemporalExecutorCreateScan(CustomScan *scan);
 static void SpatiotemporalPreExecutionScan(SpatiotemporalScanState *scanState);
@@ -52,6 +71,20 @@ static char * GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType,
 static char * GetPhysicalTileQuery(char *query_string, ExecTaskType taskType, int rand_tile,
                                    TaskNode *taskNode);
 static char * ExplainOnHostingWorker(char *physicalQuery, TaskNode *taskNode);
+static void distributed_mobilitydb_explain_internal(Query *query, int cursorOptions, IntoClause *into,
+                       ExplainState *es, const char *queryString, ParamListInfo params,
+                       QueryEnvironment *queryEnv);
+
+/*
+ * True while this backend is already inside distributed_mobilitydb_explain.
+ * Generic, same-process reentrancy guard: catches ANY nested EXPLAIN reached
+ * while our own hook is already running -- not just the one dispatch
+ * function (ExplainOnHostingWorker) the marker below was written for -- so a
+ * future dispatch site that forgets to prepend the marker still can't
+ * recurse. Reset in PG_FINALLY so an elog(ERROR) partway through can't leave
+ * it stuck true for the rest of the session.
+ */
+static bool dmdb_explain_in_progress = false;
 
 /* create custom scan method for the spatiotemporal executor */
 CustomScanMethods SpatiotemporalExecutorMethod = {
@@ -76,6 +109,62 @@ distributed_mobilitydb_explain(Query *query, int cursorOptions, IntoClause *into
                        ExplainState *es, const char *queryString, ParamListInfo params,
                        QueryEnvironment *queryEnv)
 {
+    /* dmdb_explain_in_progress: see its own comment. Covers same-process
+     * recursion generically; the marker check inside _internal still
+     * separately covers the cross-process case (a worker backend receiving
+     * a dispatched EXPLAIN has never entered this function before, so this
+     * flag is false there too). */
+    if (dmdb_explain_in_progress)
+    {
+        CitusExplainOneQuery(query, cursorOptions, into, es, queryString, params, queryEnv);
+        return;
+    }
+
+    dmdb_explain_in_progress = true;
+    PG_TRY();
+    {
+        distributed_mobilitydb_explain_internal(query, cursorOptions, into, es, queryString, params, queryEnv);
+    }
+    PG_FINALLY();
+    {
+        dmdb_explain_in_progress = false;
+    }
+    PG_END_TRY();
+}
+
+static void
+distributed_mobilitydb_explain_internal(Query *query, int cursorOptions, IntoClause *into,
+                       ExplainState *es, const char *queryString, ParamListInfo params,
+                       QueryEnvironment *queryEnv)
+{
+    /* Var_Explain_Passthrough_Marker (internal): ExplainOnHostingWorker below
+     * dispatches a literal "EXPLAIN (FORMAT JSON) <physical shard query>" to
+     * the owning worker via run_command_on_workers() to get a real physical
+     * plan for one shard. Since this extension's ExplainOneQuery_hook is
+     * loaded on every node, that dispatched EXPLAIN re-enters this very
+     * function on the worker -- and because the physical query still carries
+     * the self-join tile_key/eDwithin shape this planner looks for, it
+     * matches again and recurses into the full custom "Distributed
+     * Spatiotemporal Planner" section a second time. A session GUC can't
+     * signal this instead -- run_command_on_workers() opens a fresh
+     * connection per call, so a SET on one dispatch never carries over to
+     * another, and packing "SET ...; EXPLAIN ..." into one dispatched string
+     * doesn't work either, since run_command_on_workers() returns only the
+     * FIRST statement's result (confirmed empirically: 'SELECT 1; SELECT 2'
+     * returns 1). Instead, ExplainOnHostingWorker prepends this literal
+     * marker as a SQL comment directly in the dispatched query text --
+     * self-contained in the one query string over one one-shot connection,
+     * so detecting it here requires no session/connection state at all.
+     * Also checks Var_Same_Tile_Dispatch_Marker: see its comment in
+     * distributed_mobilitydb_planner.h for why both hooks need to recognize
+     * both markers. */
+    if (strstr(queryString, Var_Explain_Passthrough_Marker) != NULL ||
+        strstr(queryString, Var_Same_Tile_Dispatch_Marker) != NULL)
+    {
+        CitusExplainOneQuery(query, cursorOptions, into, es, queryString, params, queryEnv);
+        return;
+    }
+
     DistributedSpatiotemporalQueryPlan *distPlan = (DistributedSpatiotemporalQueryPlan *)
             palloc0(sizeof(DistributedSpatiotemporalQueryPlan));
     DistributedQueryExplain *curDistributedQueryExplain = (DistributedQueryExplain *)
@@ -158,17 +247,18 @@ InitializeDistributedQueryExplain(DistributedQueryExplain *distributedQueryExpla
     /*
      * replaceWord(..., "explain ", "") only matched a literal space right
      * after "explain" -- a query with any other whitespace there (a
-     * newline after EXPLAIN, e.g. "EXPLAIN\nWITH Temp AS (...) SELECT ...",
-     * a common multi-line formatting style, or even just leading
+     * newline right after EXPLAIN, a common multi-line formatting style,
+     * or even just leading
      * whitespace before "EXPLAIN" itself, e.g. a query string starting
      * with a blank line) left the literal word "explain" embedded at the
      * front of the "stripped" query string. That string is later
      * re-parsed (ParseQueryString) as if it were the real query -- parsing
      * it as a *nested* EXPLAIN statement instead, and handing that Query
      * (wrapping an ExplainStmt, not a plain SELECT) to Citus'
-     * distributed_planner() segfaulted the backend (reproduced on the
-     * BerlinMOD Q6 query, and again via a query string with a leading
-     * blank line before EXPLAIN). Skip *any* leading whitespace first,
+     * distributed_planner() segfaulted the backend (reproduced on a query
+     * spanning multiple lines with EXPLAIN on its own line, and again via a
+     * query string with a leading blank line before EXPLAIN). Skip *any*
+     * leading whitespace first,
      * then strip "explain" plus *any* following whitespace, instead of
      * assuming the string starts with "explain" followed by exactly one
      * space.
@@ -302,8 +392,8 @@ ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainSta
      * RewriteWhereClauseDistFuncCalls dropped their isMobilityDB-conditioned
      * DISTINCT ON path (it assumed a segmented MobilityDB table's tiles
      * hold full duplicate copies of each trip, which turned out to be false
-     * for genuinely-clipped tables like trips_9t -- see those functions'
-     * own comments). This label used to branch the same way and had gone
+     * for a genuinely-clipped table -- see those functions' own comments).
+     * This label used to branch the same way and had gone
      * stale, printing "DISTINCT ON" over a plan that was actually a
      * HashAggregate/GROUP BY the whole time.
      */
@@ -545,6 +635,18 @@ ExplainOneTask(ExecutorTask *task, STMultirelation *base,ExplainState *es, int i
 
     char *localPlanText = physicalQuery != NULL ?
         ExplainOnHostingWorker(physicalQuery, taskNode) : NULL;
+    /*
+     * Output-level safety net: if the marker somehow failed to protect this
+     * one dispatch (a nested "Distributed Spatiotemporal Planner" section
+     * inside localPlanText means the receiving worker re-ran full custom
+     * planning instead of falling through to a plain explain -- see
+     * Var_Explain_Passthrough_Marker's comment for the mechanism this
+     * guards; this catches it regardless of root cause, current or future),
+     * treat it the same as a failed dispatch rather than embedding
+     * contaminated, duplicated text in the user-visible plan.
+     */
+    if (localPlanText != NULL && strstr(localPlanText, "Distributed Spatiotemporal Planner") != NULL)
+        localPlanText = NULL;
     if (localPlanText != NULL)
     {
         es->indent += 6;
@@ -599,9 +701,9 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
          * distributed spatiotemporal table, or a plain table reshuffled
          * to be colocated with one) actually have a tile_key column --
          * unconditionally pinning every range table entry (as this used
-         * to) added "alias.tile_key = N" for reference tables too (e.g.
-         * vehicles_ref/points_ref), which have no such column at all,
-         * producing "column v.tile_key does not exist" instead of a plan. */
+         * to) added "alias.tile_key = N" for reference tables too, which
+         * have no such column at all, producing "column v.tile_key does
+         * not exist" instead of a plan. */
         if (!IsDistributedSpatiotemporalTable(rangeTableEntry->relid) &&
             !IsReshuffledTable(rangeTableEntry->relid))
             continue;
@@ -616,8 +718,8 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
      * Inserted right after the query's own WHERE keyword rather than
      * appended at the very end -- appending unconditionally landed these
      * AND-joined conditions after a trailing ORDER BY whenever the task
-     * query had one (e.g. Q16's per-tile query), silently folding them
-     * into the ORDER BY expression list instead of the WHERE clause:
+     * query had one, silently folding them into the ORDER BY expression
+     * list instead of the WHERE clause:
      * "ORDER BY ..., l2.licence AND t1.tile_key = 5 AND ..." parses as one
      * AND-expression whose left operand is l2.licence (text), producing
      * "argument of AND must be type boolean, not type text" instead of
@@ -633,12 +735,12 @@ GetLocalQuery(char *query_string, Oid base, ExecTaskType taskType, int rand_tile
      * has already injected its own capitalized "WHERE ... AND" clause into
      * query_string: the search skips right past that clause and matches the
      * *next* lowercase "where" instead, which can be out of scope for the
-     * conditions being inserted -- reproduced on BerlinMOD Q10 (a
-     * self-joined CTE over trips_16t): the CTE's own WHERE had already been
-     * capitalized this way, so this used to match the *outer* query's
-     * "where periods is not null" instead, splicing in "t1.tile_key = ..."
-     * where t1/t2 aren't in scope ("missing FROM-clause entry for table
-     * t1"). Locate the keyword case-insensitively via FindKeywordToken on a
+     * conditions being inserted -- reproduced on a self-joined CTE whose own
+     * WHERE had already been capitalized this way: the outer query had a
+     * second, later WHERE outside the CTE, so this used to match that one
+     * instead, splicing in "t1.tile_key = ..." where t1/t2 aren't in scope
+     * ("missing FROM-clause entry for table t1"). Locate the keyword
+     * case-insensitively via FindKeywordToken on a
      * lowercased copy (same byte length as the original, so the returned
      * offset is valid against it) and splice the new conditions in at that
      * exact position instead.
@@ -688,8 +790,8 @@ GetPhysicalTileQuery(char *query_string, ExecTaskType taskType, int rand_tile, T
          * real relid at all. IsCitusTableType/GetShardHostNode are raw Oid
          * lookups, not defensive SPI-wrapped catalog scans -- calling them
          * with an RTE_CTE's garbage/invalid relid segfaulted the backend
-         * (reproduced on the BerlinMOD Q6 query, a self-joined CTE). Skip
-         * anything that isn't a real table reference before touching relid.
+         * (reproduced on a self-joined CTE). Skip anything that isn't a
+         * real table reference before touching relid.
          */
         if (rangeTableEntry->rtekind != RTE_RELATION)
             continue;
@@ -700,9 +802,8 @@ GetPhysicalTileQuery(char *query_string, ExecTaskType taskType, int rand_tile, T
          * match against rand_tile, so the ordinary shardminvalue=rand_tile
          * lookup below always finds nothing for it and made this whole
          * function bail out to NULL for any query joining a distributed
-         * spatiotemporal table against so much as one reference table
-         * (e.g. any query against vehicles_ref/points_ref/etc.) -- even
-         * though a reference table is trivially co-located with taskNode
+         * spatiotemporal table against so much as one reference table --
+         * even though a reference table is trivially co-located with taskNode
          * by definition (it's on every node), and even though the
          * genuinely tiled table(s) in the same query COULD have been
          * substituted correctly. Skip the co-location check for it
@@ -754,10 +855,35 @@ GetPhysicalTileQuery(char *query_string, ExecTaskType taskType, int rand_tile, T
 static char *
 ExplainOnHostingWorker(char *physicalQuery, TaskNode *taskNode)
 {
+    /* Saved so planText can be copied back into the caller's own context
+     * below, before SPI_finish() tears down the context SPI_connect()
+     * switched CurrentMemoryContext to. SPI_getvalue's return value lives in
+     * that context and doesn't survive SPI_finish() -- returning it
+     * unabridged left a dangling pointer that the NEXT allocation in the
+     * same (now-freed) memory happens to overwrite before the caller ever
+     * reads it, corrupting the "JSON plan" text into a copy of whatever got
+     * allocated there instead. In practice that next allocation is es->str's
+     * own buffer growing (via repalloc) as ExplainOneTask keeps appending to
+     * it right after this call returns -- so the printed "plan" ends up
+     * being a stray copy of the *outer* explain's own already-written
+     * header text, byte for byte, landing right where the real JSON plan
+     * should have gone (reproduced directly: an elog() call placed right
+     * after this function returned showed the plan text containing that
+     * elog's own formatted message instead of JSON, proving the pointer was
+     * already dangling and getting overwritten by whatever allocated next).
+     */
+    MemoryContext callerContext = CurrentMemoryContext;
+
     char *targetNode = DatumToString(taskNode->node, TEXTOID);
 
-    StringInfo explainCommand = makeStringInfo();
-    appendStringInfo(explainCommand, "EXPLAIN (FORMAT JSON) %s", physicalQuery);
+    /* Marker-wrapped (see WrapPassthroughExplainCommand) so the hook on the
+     * receiving worker falls through to a plain explain instead of
+     * recursing into the custom distributed planner (see the comment on
+     * Var_Explain_Passthrough_Marker in distributed_mobilitydb_explain
+     * above). */
+    StringInfo innerCommand = makeStringInfo();
+    appendStringInfo(innerCommand, "EXPLAIN (FORMAT JSON) %s", physicalQuery);
+    char *explainCommandText = WrapPassthroughExplainCommand(innerCommand->data);
 
     int spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
@@ -769,14 +895,17 @@ ExplainOnHostingWorker(char *physicalQuery, TaskNode *taskNode)
     appendStringInfo(dispatchQuery,
                      "SELECT jsonb_pretty(result::jsonb) FROM run_command_on_workers(%s) "
                      "WHERE nodename = %s AND nodeport = %d AND success",
-                     quote_literal_cstr(explainCommand->data),
+                     quote_literal_cstr(explainCommandText),
                      quote_literal_cstr(targetNode), taskNode->port);
     spi_result = SPI_execute(dispatchQuery->data, true, 1);
 
     char *planText = NULL;
     if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
     {
-        planText = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+        char *spiValue = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+        MemoryContext spiContext = MemoryContextSwitchTo(callerContext);
+        planText = pstrdup(spiValue);
+        MemoryContextSwitchTo(spiContext);
     }
 
     spi_result = SPI_finish();

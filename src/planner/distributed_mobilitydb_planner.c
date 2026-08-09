@@ -32,6 +32,10 @@
 #include "nodes/nodeFuncs.h"
 #include "general/spatiotemporal_processing.h"
 #include "general/rte.h"
+#include "utils/planner_utils.h"
+#include <utils/guc.h>
+#include <utils/lsyscache.h>
+#include <parser/parsetree.h>
 
 
 static void analyzeDistributedSpatiotemporalTables(List *rangeTableList,
@@ -40,6 +44,7 @@ static FromExpr * FindOwningJointree(Query *topQuery, Oid relid);
 static void PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan);
 static void checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
 static void ProcessQueryPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
+static bool HasExplicitTileKeyEquality(Query *parse, List *whereClauseList);
 static void ProcessPredicateClause(DistributedSpatiotemporalQueryPlan *distPlan, Node *clause);
 static bool SelectListPredicateWalker(Node *node, DistributedSpatiotemporalQueryPlan *distPlan);
 static void AnalyseSelectListPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan);
@@ -85,6 +90,16 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     PlannedStmt *result = NULL;
     bool needsSpatiotemporalPlanning = false;
     PlanInitialization(distPlan);
+
+    /* See Var_Same_Tile_Dispatch_Marker's / Var_Explain_Passthrough_Marker's
+     * comments -- both recognized here since either one signals "this query
+     * text was already resolved by our own dispatch code, don't re-plan
+     * it", regardless of which of our two hooks originally produced it. */
+    if (query_string != NULL &&
+        (strstr(query_string, Var_Same_Tile_Dispatch_Marker) != NULL ||
+         strstr(query_string, Var_Explain_Passthrough_Marker) != NULL))
+        return distributed_planner(parse, query_string, cursorOptions, boundParams);
+
     result = EarlyQueryCheck(parse, query_string, cursorOptions, boundParams);
     if (result != NULL)
         return result;
@@ -108,14 +123,45 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
      * (e.g. `length(trip)`, no sum()/aggregate wrapper) over a
      * shape-segmented table can't be answered as a plain per-row pushdown
      * -- a single trip's fragments are scattered across tiles, so that
-     * would return one row per fragment instead of one row per trip. Catch
-     * that here and hand the rewritten (explicit aggregate + GROUP BY)
-     * query straight to Citus' own distributed planner, which already
-     * correctly combines per-tile partial aggregates across a GROUP BY.
-     * Returns NULL (falls through to the normal pipeline below) for every
-     * other query shape -- joins, non-segmented tables, already-explicit
-     * aggregates, plain columns, etc.
+     * would return one row per fragment instead of one row per trip. Two
+     * rewrites handle this, for a bare call in the SELECT list
+     * (RewriteSegmentedDistFuncCalls) vs. the WHERE clause
+     * (RewriteWhereClauseDistFuncCalls, tried first) -- see below for why
+     * the order matters. Whichever succeeds gets handed straight to Citus'
+     * own distributed planner, which already correctly combines per-tile
+     * partial aggregates across a GROUP BY. Both return NULL (falls through
+     * to the normal pipeline below) for every query shape outside their own
+     * scope -- joins, non-segmented tables, already-explicit aggregates,
+     * plain columns, etc.
+     *
+     * RewriteWhereClauseDistFuncCalls goes first because it's the more
+     * complete handler when a query has both a WHERE-clause distfunc filter
+     * *and* a bare distfunc call in the SELECT list -- it now handles both
+     * together via its merge() layer (see its
+     * own comment). RewriteSegmentedDistFuncCalls only understands the
+     * SELECT-list half; tried first (as this used to run), it claims that
+     * query on the SELECT-list call alone and produces a rewrite that still
+     * evaluates the WHERE-clause filter per-fragment, wrongly excluding a
+     * trip whose complete value passes the filter but whose every
+     * individual fragment doesn't (reproduced directly: a bare distributed
+     * function call in the SELECT list alongside a WHERE-clause threshold
+     * filter on that same function returned 0 rows via that path even
+     * though exactly one trip's true, complete value passes the filter).
+     * RewriteWhereClauseDistFuncCalls itself requires
+     * the *entire* WHERE clause to be exactly one distfunc-vs-constant
+     * comparison (see its own scope limits) and returns NULL otherwise, so
+     * a query with only a SELECT-list distfunc call and no such WHERE
+     * clause correctly falls through to RewriteSegmentedDistFuncCalls
+     * unchanged.
      */
+    char *whereClauseRewrite = RewriteWhereClauseDistFuncCalls(parse, query_string, distPlan->tablesList);
+    if (whereClauseRewrite != NULL)
+    {
+        distPlan->segmentedRewriteQuery = whereClauseRewrite;
+        Query *rewrittenParse = ParseQueryString(whereClauseRewrite, NULL, 0);
+        return distributed_planner(rewrittenParse, whereClauseRewrite, cursorOptions, boundParams);
+    }
+
     char *segmentedRewriteExplainNotes = NULL;
     char *segmentedRewrite = RewriteSegmentedDistFuncCalls(parse, query_string, distPlan->tablesList,
                                                            &segmentedRewriteExplainNotes);
@@ -128,29 +174,10 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     }
 
     /*
-     * Same underlying problem, but the bare distributed-function call is a
-     * WHERE-clause filter (e.g. `WHERE length(trip) > 5000`) instead of a
-     * SELECT-list projection: evaluating it per-fragment against a
-     * segmented table's tiles can both wrongly admit and wrongly exclude
-     * rows, since no single fragment sees the trip's complete trajectory.
-     * Rewritten into a query that filters on the function's properly
-     * combined value instead (see RewriteWhereClauseDistFuncCalls for the
-     * full shape and scope limits) and handed to Citus directly, same
-     * pattern as the SELECT-list case above.
-     */
-    char *whereClauseRewrite = RewriteWhereClauseDistFuncCalls(parse, query_string, distPlan->tablesList);
-    if (whereClauseRewrite != NULL)
-    {
-        distPlan->segmentedRewriteQuery = whereClauseRewrite;
-        Query *rewrittenParse = ParseQueryString(whereClauseRewrite, NULL, 0);
-        return distributed_planner(rewrittenParse, whereClauseRewrite, cursorOptions, boundParams);
-    }
-
-    /*
      * An *explicit* aggregate wrapping a registered distributed function
      * over a replicated table's column (e.g.
-     * `SUM(length(atTime(t.Trip, p.Period))) ... GROUP BY l.Licence, ...`,
-     * BerlinMOD Q8) has the same underlying problem as the bare-call case
+     * `SUM(length(atTime(t.Trip, p.Period))) ... GROUP BY l.Licence, ...`)
+     * has the same underlying problem as the bare-call case
      * above, just already wrapped in a user-written aggregate/GROUP BY
      * instead of needing one synthesized: a trip replicated across N tiles
      * contributes to the aggregate N times instead of once. Rewritten into
@@ -177,12 +204,10 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
 
     /*
      * Same problem, one level down: the aggregate-over-distributed-function
-     * can just as easily live inside one of the query's own CTEs (e.g.
-     * `WITH Distances AS (SELECT ... SUM(length(atTime(...))) ... GROUP BY
-     * ...) SELECT ... MAX(Dist) ... FROM Distances`) rather than at the top
-     * level -- the check above never sees it, since the top-level query's
-     * own aggregate there (MAX(Dist)) takes a plain Var on the CTE's output
-     * column, not a call to a registered distributed function.
+     * can just as easily live inside one of the query's own CTEs rather
+     * than at the top level -- the check above never sees it, since the
+     * top-level query's own aggregate there takes a plain Var on the CTE's
+     * output column, not a call to a registered distributed function.
      */
     char *cteAggregateRewrite = RewriteReplicatedAggregateInCTEs(parse, query_string, distPlan->tablesList);
     if (cteAggregateRewrite != NULL)
@@ -211,8 +236,9 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
          * pronounced. PredicatePushDown runs its query independently
          * against every one of a table's tiles/shards and Citus unions the
          * per-shard results with no dedup of its own -- confirmed
-         * empirically on the BerlinMOD Q4/Q6 demo queries, which return
-         * ~13x the correct row count without this. All three strategies'
+         * empirically on a query joining a shape-segmented table against a
+         * reference table, which returned ~13x the correct row count
+         * without this. All three strategies'
          * coordinator-level output needs the same final deduplication
          * pass. */
         if (StrategiesInclude(distPlan->strategies, NonColocation) ||
@@ -277,6 +303,13 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
         if (!explain)
         {
             generalScan = QueryExecutor(distPlan, explain);
+            /* Debug: dmdb.log_final_query, off by default -- prints the composed SQL text
+             * handed to Citus's own distributed_planner, so it can be EXPLAIN ANALYZE'd
+             * directly outside the extension's own EXPLAIN handling (which doesn't pass
+             * through cleanly). */
+            const char *logFinalQuery = GetConfigOption("dmdb.log_final_query", true, false);
+            if (logFinalQuery != NULL && strcmp(logFinalQuery, "on") == 0)
+                elog(INFO, "FINAL QUERY: %s", generalScan->query_string->data);
             result = distributed_planner(generalScan->query, generalScan->query_string->data,
                                          cursorOptions, boundParams);
         }
@@ -314,9 +347,10 @@ GetSpatiotemporalDistributedPlan(CustomScan *customScan)
  * that actually surrounds this table instead of always the outermost
  * query's.
  *
- * Reproduced directly: for a query like "SELECT count(*) FROM (SELECT ...
- * WHERE ST_Intersects(...) ...) t", the outer query's own jointree has no
- * WHERE clause at all -- AnalyseCatalog's WhereClauseList() over it returns
+ * Reproduced directly: for a count wrapping a FROM-clause subquery whose
+ * own WHERE clause carries the real spatial predicate, the outer query's
+ * own jointree has no WHERE clause at all -- AnalyseCatalog's
+ * WhereClauseList() over it returns
  * an empty list, so its predicate-scanning loop (query_semantics.c) never
  * executes even once, leaving CatalogFilter at its palloc0 zero value
  * (candidates = 0) instead of the table's real tile count. That surfaced
@@ -387,10 +421,11 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
     Oid curr_relid = -1;
     /* diffCount/simCount need to know whether relid has appeared ANYWHERE
      * earlier in the range table, not just in the immediately preceding
-     * entry -- comparing only to curr_relid miscounted a self-join like
-     * "Trips t1, Licences1 l1, Trips t2" as three different tables instead
-     * of recognizing t2 as a repeat of t1, since t2 is compared against
-     * l1's relid rather than t1's. */
+     * entry -- comparing only to curr_relid miscounted a self-join with a
+     * reference table interleaved between the two self-joined aliases as
+     * three different tables instead of recognizing the second alias as a
+     * repeat of the first, since it's compared against the reference
+     * table's relid rather than the first alias's. */
     List *seenRelids = NIL;
     bool shapeType;
     List *rtes = NIL;
@@ -415,13 +450,25 @@ analyzeDistributedSpatiotemporalTables(List *rangeTableList,
         if (!rangeTableEntry->inFromCl) {
             continue;
         }
+        /* IsReshuffledTable() must run before, not nested inside, the
+         * IsDistributedSpatiotemporalTable() check below: a reshuffled
+         * table is an on-demand, transient artifact that by design is
+         * never registered in the spatiotemporal-tables catalog
+         * IsDistributedSpatiotemporalTable() looks up, so nested inside it
+         * this branch was unreachable -- a query directly self-joining a
+         * reshuffled table against its own base table always fell through
+         * to the plain-CitusRte branch instead,
+         * leaving only one table classified as STRte and making
+         * ColocationStrategyPlan's "requires two spatiotemporal tables"
+         * check fail. IsReshuffledTable() itself is a cheap name check
+         * with no such dependency, so it can run unconditionally here. */
+        if (IsReshuffledTable(rangeTableEntry->relid))
+        {
+            distPlan->queryContainsReshuffledTable = true;
+            return;
+        }
         if (IsDistributedSpatiotemporalTable(rangeTableEntry->relid))
         {
-            if(IsReshuffledTable(rangeTableEntry->relid))
-            {
-                distPlan->queryContainsReshuffledTable = true;
-                return;
-            }
             shapeType = DistributedColumnType(rangeTableEntry->relid);
             if (shapeType == SPATIAL || shapeType == SPATIOTEMPORAL)
             {
@@ -526,8 +573,7 @@ EarlyQueryCheck(Query *parse, const char *query_string, int cursorOptions, Param
         return result;
     /* parse->rtable only holds the OUTER query's own range table -- a query
      * that references its distributed spatiotemporal table exclusively
-     * inside a CTE (e.g. "WITH Temp AS (SELECT ... FROM trips_16t t1,
-     * trips_16t t2 ...) SELECT ... FROM Temp") has just an RTE_CTE entry
+     * inside a CTE, self-joining it there, has just an RTE_CTE entry
      * here, so this loop never saw the real table and always deferred such
      * queries straight to Citus' own planner -- which then rejects a
      * same-table self-join baked inside the CTE outright, since it has no
@@ -566,6 +612,7 @@ PlanInitialization(DistributedSpatiotemporalQueryPlan *distPlan)
     distPlan->tablesList->simCount = 0;
     distPlan->tablesList->nonStCount = 0;
     distPlan->queryContainsReshuffledTable = false;
+    distPlan->hasExplicitTileKeyEquality = false;
     distPlan->tablesList->tables = NIL;
     distPlan->postProcessing =  (PostProcessing *) palloc0(sizeof(PostProcessing));
     distPlan->postProcessing->distfuns = NIL;
@@ -588,11 +635,9 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
     ProcessQueryPredicates(parse, distPlan);
 
     /* A self-join whose spatiotemporal predicate lives entirely inside a
-     * CTE's own definition (e.g. Q10: "WITH Temp AS (SELECT ...
-     * whenTrue(tDwithin(t1.Trip, t2.Trip, 3.0)) ... FROM trips_16t t1, ...,
-     * trips_16t t2, ... ) SELECT ... FROM Temp") is invisible to the scan
-     * above, since parse->jointree/parse->targetList only cover the OUTER
-     * query -- the outer query here just references "Temp" once, with no
+     * CTE's own definition is invisible to the scan above, since
+     * parse->jointree/parse->targetList only cover the OUTER query -- the
+     * outer query there just references the CTE once, with no
      * spatiotemporal predicate of its own. Scan each CTE's own query the
      * same way so its self-join still gets a strategy chosen. */
     ListCell *cteCell;
@@ -605,17 +650,16 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
     }
 
     /* Same gap as the CTE case above, but for a FROM-clause derived table
-     * instead of a WITH clause -- e.g. "SELECT count(*) FROM (SELECT ...
-     * WHERE ST_Intersects(trajectory(t.Trip), p.Geom) ...) t". The
-     * predicate lives inside the subquery's own jointree, which the outer
-     * query's parse->jointree/parse->rtable never expose (the outer
-     * query's own rtable has just one RTE_SUBQUERY entry for "t"; the
-     * tables referenced inside it -- trips_16_crange, vehicles_ref,
-     * points_ref here -- only show up in that RTE's own ->subquery->rtable).
+     * instead of a WITH clause -- a spatial predicate inside a subquery,
+     * wrapped in an outer count. The predicate lives inside the subquery's
+     * own jointree, which the outer query's parse->jointree/parse->rtable
+     * never expose (the outer query's own rtable has just one
+     * RTE_SUBQUERY entry for the derived table; the tables referenced
+     * inside it only show up in that RTE's own ->subquery->rtable).
      * Reproduced directly: the identical inner query, run standalone,
      * chose PredicatePushDown and returned a full plan (Push Down Scan,
-     * task/worker details, real local EXPLAIN); wrapped in an outer
-     * "SELECT count(*) FROM (...) t", it fell through to
+     * task/worker details, real local EXPLAIN); wrapped in an outer count
+     * over the subquery, it fell through to
      * "Query Type: Full Scan" with an empty strategies list and a blank
      * "-> Query Plan:" section -- ProcessQueryPredicates was simply never
      * called on the subquery's own Query node, so no predicate was ever
@@ -632,6 +676,56 @@ checkQueryType(Query *parse, DistributedSpatiotemporalQueryPlan *distPlan)
         ProcessQueryPredicates(rte->subquery, distPlan);
     }
     /* TODO: The rest is excluded for now and will be added after testing the main features */
+}
+
+/*
+ * HasExplicitTileKeyEquality scans whereClauseList for an OpExpr equality
+ * between two Var nodes that both resolve to a column literally named
+ * tile_key, on two DIFFERENT range table entries -- i.e. the query itself
+ * already restricts a self-join to same-tile pairs via an explicit
+ * `t1.tile_key = t2.tile_key`-style equality, independent of
+ * whatever registered spatiotemporal predicate elsewhere in the same WHERE
+ * clause triggers strategy selection. ProcessPredicateClause's distance/
+ * intersection handling checks this before force-adding NonColocation for a
+ * self-join: a reshuffle exists specifically to catch matches whose rows
+ * sit in DIFFERENT tiles, which an explicit same-tile_key equality makes
+ * impossible by construction, so building it is pure wasted work whenever
+ * this returns true.
+ */
+static bool
+HasExplicitTileKeyEquality(Query *parse, List *whereClauseList)
+{
+    ListCell *clauseCell = NULL;
+    foreach(clauseCell, whereClauseList)
+    {
+        Node *clause = (Node *) lfirst(clauseCell);
+        if (!IsA(clause, OpExpr) || !NodeIsEqualsOpExpr(clause))
+            continue;
+
+        OpExpr *opExpr = (OpExpr *) clause;
+        if (list_length(opExpr->args) != 2)
+            continue;
+
+        Node *left = (Node *) linitial(opExpr->args);
+        Node *right = (Node *) lsecond(opExpr->args);
+        if (!IsA(left, Var) || !IsA(right, Var))
+            continue;
+
+        Var *leftVar = (Var *) left;
+        Var *rightVar = (Var *) right;
+        if (leftVar->varno == rightVar->varno)
+            continue; /* same range table entry, not a cross-table equality */
+
+        RangeTblEntry *leftRte = rt_fetch(leftVar->varno, parse->rtable);
+        RangeTblEntry *rightRte = rt_fetch(rightVar->varno, parse->rtable);
+        char *leftCol = get_attname(leftRte->relid, leftVar->varattno, true);
+        char *rightCol = get_attname(rightRte->relid, rightVar->varattno, true);
+        if (leftCol != NULL && rightCol != NULL &&
+            strcmp(leftCol, Var_Catalog_Tile_Key) == 0 &&
+            strcmp(rightCol, Var_Catalog_Tile_Key) == 0)
+            return true;
+    }
+    return false;
 }
 
 /*
@@ -657,6 +751,8 @@ ProcessQueryPredicates(Query *parse, DistributedSpatiotemporalQueryPlan *distPla
      * this query nor its CTEs/subqueries end up choosing one. */
     if (whereClauseList != NIL)
         distPlan->hasWhereClause = true;
+    if (HasExplicitTileKeyEquality(parse, whereClauseList))
+        distPlan->hasExplicitTileKeyEquality = true;
     /* Iterate over the where clause conditions */
     foreach(clauseCell, whereClauseList)
     {
@@ -716,7 +812,37 @@ ProcessPredicateClause(DistributedSpatiotemporalQueryPlan *distPlan, Node *claus
 
     if (IsIntersectionOperation(predicateOid))
     {
-        if (effectiveDiffCount > 1)
+        if (distPlan->tablesList->simCount >= 1)
+            AddStrategy(distPlan, Colocation);
+        /* simCount >= 1 (self-join, e.g. "trips t1, ..., trips t2 WHERE
+         * t2.Trip && expandSpace(t1.Trip, d)") always forces NonColocation
+         * on too, regardless of how many reference tables are also joined
+         * in and regardless of what the refCount-adjusted effectiveDiffCount
+         * says -- same reasoning as the matching fix in the
+         * IsDistanceOperation branch below: an intersection against a
+         * manually pre-expanded bbox is the same "might match across a tile
+         * boundary" situation a distance predicate is, just spelled with &&
+         * instead of eDwithin/tDwithin, and effectiveDiffCount can't tell
+         * "one spatiotemporal table referenced twice" apart from "one
+         * spatiotemporal table referenced once" once refCount is
+         * subtracted out of both. Without this, adding a Citus reference
+         * table to a self-join intersection query dropped it to
+         * Colocation-only (the original bare `else` below, whose own
+         * comment already called this shape out as "self-join" but only
+         * ever added Colocation for it), silently missing any match whose
+         * trajectories straddle a tile boundary -- reproduced directly on a
+         * `t2.Trip && expandSpace(t1.Trip, 3)` self-join once a reference
+         * table replaced a plain local table alongside it. */
+        if (distPlan->tablesList->simCount >= 1 && distPlan->hasExplicitTileKeyEquality)
+        {
+            /* Self-join, but the WHERE clause already pins it to same-tile
+             * pairs via an explicit tile_key = tile_key equality --
+             * Colocation (added above) already covers every row this query
+             * can match. NonColocation's reshuffle exists to catch matches
+             * whose rows sit in DIFFERENT tiles, which this predicate makes
+             * impossible by construction, so skip it. */
+        }
+        else if (effectiveDiffCount > 1 || distPlan->tablesList->simCount >= 1)
         {
             /* Intersection join between two distinct tables: must colocate them first. */
             AddStrategy(distPlan, NonColocation);
@@ -750,8 +876,35 @@ ProcessPredicateClause(DistributedSpatiotemporalQueryPlan *distPlan, Node *claus
          * distributed spatiotemporal table are reference tables (refCount > 0
          * guards this so behavior is untouched whenever no reference table is
          * involved), which Citus can push the predicate down to directly with
-         * no reshuffle needed. */
-        if (effectiveDiffCount > 1 || distPlan->tablesList->refCount == 0)
+         * no reshuffle needed.
+         *
+         * simCount >= 1 (a self-join, e.g. "trips t1, ..., trips t2") always
+         * forces NonColocation back on regardless of refCount: a distance
+         * predicate needs expandSpace()'d cross-tile matching (the Neighbor
+         * Scan a reshuffle sets up) to catch a pair whose trajectories
+         * straddle a tile boundary, independent of how many reference
+         * tables are also joined in. Without this, effectiveDiffCount/
+         * effectiveLength (both refCount-adjusted) can't tell "one
+         * spatiotemporal table, referenced twice" apart from "one
+         * spatiotemporal table, referenced once" -- both reduce to
+         * effectiveDiffCount<=1 once refCount is subtracted out, but only
+         * the latter is actually safe to treat as a single-table query.
+         * Reproduced directly: adding a Citus reference table to a
+         * self-join `eDwithin(t1.trip, t2.trip, d)` query made the query plan
+         * silently drop to "Query Type: Colocated" with only a Self Tiling
+         * Scan, no Neighbor Scan -- correct for same-tile matches, silently
+         * missing any pair whose trajectories are within d of each other
+         * but sit in different (even adjacent) tiles. */
+        if (distPlan->tablesList->simCount >= 1 && distPlan->hasExplicitTileKeyEquality)
+        {
+            /* See the matching comment in the IsIntersectionOperation
+             * branch above -- an explicit tile_key = tile_key equality
+             * already restricts this self-join to same-tile pairs, so the
+             * NonColocation reshuffle (built to catch cross-tile matches)
+             * can never contribute a row here. */
+        }
+        else if (effectiveDiffCount > 1 || distPlan->tablesList->refCount == 0 ||
+            distPlan->tablesList->simCount >= 1)
         {
             AddStrategy(distPlan, NonColocation);
         }
