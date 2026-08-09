@@ -136,16 +136,28 @@ DECLARE
     group_by_clause text;
     org_table_name_in varchar(250);
 BEGIN
-    -- The exploded-per-instant _temp table is crange_method's own point-based
-    -- preprocessing convention; hierarchical/period_method also support
-    -- point-based but weight against the original table directly, so this
-    -- swap is scoped to tiling.method='crange' (else "_temp does not exist").
-    IF tiling.method = 'crange' and tiling.isMobilityDB and tiling.internalType not in('point','polygon', 'instant') and tiling.granularity = 'point-based' THEN
-        org_table_name_in := table_name_in;
-        table_name_in := concat(table_name_in, '_temp');
-    ELSE
-        org_table_name_in := table_name_in;
-    END IF;
+    -- table_name_in is deliberately left as the plain original table for
+    -- EVERY granularity value, not just shape-based. An earlier version
+    -- swapped it to crange_method's exploded-per-instant _temp table
+    -- (groupCol, distCol only) for the point-based+crange case, on the
+    -- theory that data allocation should read from the same table
+    -- granularity detection weighted against -- broken on two counts,
+    -- confirmed by tracing an actual failure: (1) it rebuilt the _temp
+    -- name from table_name_in, but crange_method actually built it from
+    -- staged_source (the hash-staged copy), so the swapped name didn't
+    -- even resolve to a real table; (2) more fundamentally,
+    -- segmentation_and_allocation's sequence/sequenceset INSERT selects
+    -- org_table_columns -- every original column (e.g. vehicleid,
+    -- startdate, seqno), not just groupCol/distCol -- against whichever
+    -- table this swap points it at, so even a correctly-named _temp table
+    -- could never satisfy that SELECT list (it only has 2 columns).
+    -- Granularity only needs to influence *which bboxes* end up in
+    -- pg_dist_spatiotemporal_tiles (BinarySearch's own convergence
+    -- target, already granularity-aware) -- allocation itself just clips
+    -- every row against whatever bboxes are already there, agnostic to
+    -- how they were chosen, so it never needed its own copy of that
+    -- logic.
+    org_table_name_in := table_name_in;
     -- Set the shards count
     EXECUTE format('%s', concat('set citus.shard_count to ',tiling.numTiles));
     -- Create another table

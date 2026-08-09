@@ -1,5 +1,7 @@
 SET(LOCAL_FILES
         category1.sql
+        create_distfunction.sql
+        user_defined_functions.sql
         )
 
 foreach (f ${LOCAL_FILES})

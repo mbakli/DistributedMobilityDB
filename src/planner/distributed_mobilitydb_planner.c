@@ -163,12 +163,15 @@ distributed_mobilitydb_planner_internal(Query *parse, const char *query_string, 
     }
 
     char *segmentedRewriteExplainNotes = NULL;
+    char *segmentedRewritePostProcessingNotes = NULL;
     char *segmentedRewrite = RewriteSegmentedDistFuncCalls(parse, query_string, distPlan->tablesList,
-                                                           &segmentedRewriteExplainNotes);
+                                                           &segmentedRewriteExplainNotes,
+                                                           &segmentedRewritePostProcessingNotes);
     if (segmentedRewrite != NULL)
     {
         distPlan->segmentedRewriteQuery = segmentedRewrite;
         distPlan->segmentedRewriteExplainNotes = segmentedRewriteExplainNotes;
+        distPlan->segmentedRewritePostProcessingNotes = segmentedRewritePostProcessingNotes;
         Query *rewrittenParse = ParseQueryString(segmentedRewrite, NULL, 0);
         return distributed_planner(rewrittenParse, segmentedRewrite, cursorOptions, boundParams);
     }

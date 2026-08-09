@@ -378,6 +378,12 @@ ExplainSegmentedRewrite(DistributedSpatiotemporalQueryPlan *distPlan, ExplainSta
         }
         es->indent -= indent_group;
     }
+    if (distPlan->segmentedRewritePostProcessingNotes != NULL)
+    {
+        appendStringInfoSpaces(es->str, es->indent * indent_group);
+        appendStringInfo(es->str, "Post processing functions: %s\n",
+                         distPlan->segmentedRewritePostProcessingNotes);
+    }
     appendStringInfoSpaces(es->str, es->indent * indent_group);
     appendStringInfo(es->str, "Rewritten query: %s\n", distPlan->segmentedRewriteQuery);
     es->indent -= indent_group * 2;

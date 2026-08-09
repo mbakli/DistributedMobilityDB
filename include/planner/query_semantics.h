@@ -24,11 +24,18 @@ extern void analyseSelectClause(List *targetList, PostProcessing *postProcessing
  * Rewrites a bare distributed-function call over a segmented table into a
  * grouped-by-trip aggregate query; NULL if nothing to rewrite. On success,
  * *explainNotesOut is set to a human-readable, newline-joined description
- * of each rewritten function's worker/combiner/final ops and the op
- * actually applied (for EXPLAIN); left untouched on a NULL return.
+ * of each rewritten function's own worker/combiner/final ops and the op
+ * actually applied (for EXPLAIN); *postProcessingNotesOut is set to a
+ * newline-joined list of any plain scalar function(s) composed *around*
+ * one of those calls (e.g. numinstants in `numinstants(cumulativeLength
+ * (trip))`), kept separate so EXPLAIN can show them under their own
+ * heading rather than folding them into a registered function's own
+ * worker/combiner/final description; either may be left untouched (NULL)
+ * on a NULL return, and *postProcessingNotesOut may stay NULL even on
+ * success if no call in the query was composed with an outer function.
  */
 extern char *RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList,
-                                           char **explainNotesOut);
+                                           char **explainNotesOut, char **postProcessingNotesOut);
 
 /*
  * Rewrites a bare distributed-function call used as a WHERE-clause filter

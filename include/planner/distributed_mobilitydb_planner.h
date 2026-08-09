@@ -119,6 +119,18 @@ typedef struct DistributedSpatiotemporalQueryPlan
      */
     char *segmentedRewriteExplainNotes;
     /*
+     * Set alongside segmentedRewriteExplainNotes, but listing only the
+     * plain scalar function(s) composed *around* a registered distributed
+     * function's own call (e.g. numinstants in `numinstants
+     * (cumulativeLength(trip))`) -- kept separate from
+     * segmentedRewriteExplainNotes so EXPLAIN can show them under their own
+     * "Post processing functions" heading rather than folding them into a
+     * registered function's own worker/combiner/final line, where they'd
+     * misleadingly read as part of that function's own registration rather
+     * than a plain function applied after recombination.
+     */
+    char *segmentedRewritePostProcessingNotes;
+    /*
      * Set by ProcessQueryPredicates whenever a query (outer query, a CTE, or
      * a FROM-clause subquery) has a WHERE clause, regardless of whether any
      * conjunct turns out to be a registered spatiotemporal predicate. Lets

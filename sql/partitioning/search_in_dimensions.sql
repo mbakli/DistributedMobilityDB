@@ -97,6 +97,7 @@ DECLARE
     rounds integer;
     step float;
     check_step float;
+    targetsPointCount boolean;
 BEGIN
     rounds := 0;
     mobilitydb_bbox := NULL;
@@ -107,6 +108,21 @@ BEGIN
         step := 0.2;
         check_step := 0.05;
     END IF;
+    -- Which quantity this search converges the split point on: point/
+    -- vertex count (tileNumPoints) for a type whose per-row "weight" can
+    -- vary a lot -- MobilityDB sequence(set) trajectories' instant count,
+    -- or PostGIS linestrings/polygons' vertex count -- vs plain row count
+    -- (tileNumShapes) for every other type, where each row already IS one
+    -- point/instant so there's nothing to distinguish. Previously this was
+    -- just `tiling.isMobilityDB`, which made a row-count-balanced split
+    -- the ONLY reachable outcome for any PostGIS geometry table --
+    -- including linestring/polygon, which vary in vertex count exactly
+    -- the way a trajectory varies in instant count -- and made
+    -- tilingGranularityDetection's own shape-based/point-based check
+    -- tautological for them (it re-tests the same row-count balance this
+    -- search had already solved for).
+    targetsPointCount := (tiling.isMobilityDB AND tiling.internaltype IN ('sequence', 'sequenceset'))
+        OR (NOT tiling.isMobilityDB AND tiling.internaltype IN ('linestring', 'polygon', 'multilinestring', 'multipolygon'));
     IF dim = 1 THEN
         timePeriod := tstzrange(t1,t2);
         startT := t1;
@@ -185,6 +201,16 @@ BEGIN
                                                                               'WHERE setsrid(',tiling.distCol,',',tiling.srid,') && ''', mobilitydb_bbox,'''::stbox '))
                     INTO binValue;
             END IF;
+        ELSIF tiling.internaltype IN ('linestring', 'polygon', 'multilinestring', 'multipolygon') THEN
+            -- Mirrors the MobilityDB sequence(set) case above: count each
+            -- row's own vertices clipped to the candidate box, not the row
+            -- count, so the search actually converges toward a
+            -- vertex-balanced split for shapes whose complexity varies a
+            -- lot per row (e.g. a short residential street vs. a long
+            -- highway).
+            EXECUTE format('%s', concat('SELECT sum(st_npoints(st_intersection(',tiling.distCol,', ''', postgis_bbox,'''::geometry))) FROM ',tableName,' ' ||
+                                                                          'WHERE ',tiling.distCol,' && ''', postgis_bbox,'''::geometry'))
+                INTO binValue;
         ELSE
             EXECUTE format('%s', concat('SELECT count(*)
                 FROM ',tableName,' WHERE ',tiling.distCol,' && ''', postgis_bbox,'''::geometry'))
@@ -198,21 +224,21 @@ BEGIN
             step := step * 10.0;
             rounds := 0;
         end if;*/
-        IF not tiling.isMobilityDB AND binValue between (tileNumShapes - tileNumShapes * check_step) AND
+        IF not targetsPointCount AND binValue between (tileNumShapes - tileNumShapes * check_step) AND
             (tileNumShapes + tileNumShapes * check_step) THEN
             IF dim = 1 THEN
                 return midT::text;
             ELSE
                 return mid::text;
             END IF;
-        ELSIF tiling.isMobilityDB AND binValue between (tileNumPoints - tileNumPoints * check_step) AND
+        ELSIF targetsPointCount AND binValue between (tileNumPoints - tileNumPoints * check_step) AND
             (tileNumPoints + tileNumPoints * check_step) THEN
             IF dim = 1 THEN
                 return midT::text;
             ELSE
                 return mid::text;
             END IF;
-        ELSIF not tiling.isMobilityDB AND binValue < tileNumShapes THEN
+        ELSIF not targetsPointCount AND binValue < tileNumShapes THEN
             rounds := rounds + 1;
             IF dim = 1 THEN
                 midT := midT + (midT - t1) * step;
@@ -221,7 +247,7 @@ BEGIN
             ELSIF dim = 3 THEN
                 mid := mid + (mid - y1) * step;
             END IF;
-        ELSIF tiling.isMobilityDB AND binValue < tileNumPoints THEN
+        ELSIF targetsPointCount AND binValue < tileNumPoints THEN
             rounds := rounds + 1;
             IF dim = 1 THEN
                 midT := midT + (midT - t1) * step;
@@ -234,7 +260,7 @@ BEGIN
                 -- y1 := mid + stepVal;
                 -- y2 := endVal_temp;
             END IF;
-        ELSIF not tiling.isMobilityDB AND binValue > tileNumShapes THEN
+        ELSIF not targetsPointCount AND binValue > tileNumShapes THEN
             rounds := rounds + 1;
             IF dim = 1 THEN
                 midT := midT - (midT - t1) * step;
@@ -245,7 +271,7 @@ BEGIN
                 mid := mid - (mid - y1) * step;
                 -- y2 := mid - stepVal;
             END IF;
-        ELSIF  tiling.isMobilityDB AND binValue > tileNumPoints THEN
+        ELSIF  targetsPointCount AND binValue > tileNumPoints THEN
             rounds := rounds + 1;
             IF dim = 1 THEN
                 midT := midT - (midT - t1) * step;

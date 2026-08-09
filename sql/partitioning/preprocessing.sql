@@ -1,6 +1,7 @@
 CREATE OR REPLACE FUNCTION create_temporary_points_table(table_name_in varchar(250), tiling tiling, table_name_out varchar(250))
     RETURNS boolean AS $$
 DECLARE
+    index_base_name text;
 BEGIN
     -- Distribute the table using hash multirelation
     IF tiling.isMobilityDB THEN
@@ -19,9 +20,15 @@ BEGIN
     END IF;
 
 -- TODO: Distribute the table
-    EXECUTE format('%s', concat('CREATE INDEX ' , table_name_out , '_gist_idx on ' , table_name_out , '' ||
+    -- table_name_out can arrive schema-qualified (e.g. a hash-staged copy
+    -- in dist_mobilitydb.*) -- CREATE INDEX accepts that in its ON clause,
+    -- but not for the index's own name, which must be a bare identifier;
+    -- strip any schema prefix before appending the _gist_idx/_btree_idx
+    -- suffix, or the generated statement is a syntax error.
+    index_base_name := regexp_replace(table_name_out, '^.*\.', '');
+    EXECUTE format('%s', concat('CREATE INDEX ' , index_base_name , '_gist_idx on ' , table_name_out , '' ||
                                                                                                       ' using gist(' , tiling.distCol, ');'));
-    EXECUTE format('%s', concat('CREATE INDEX ' , table_name_out , '_btree_idx on ' , table_name_out , '' ||
+    EXECUTE format('%s', concat('CREATE INDEX ' , index_base_name , '_btree_idx on ' , table_name_out , '' ||
                                                                                                        ' using btree(',tiling.groupCol,');'));
     return true;
 END;

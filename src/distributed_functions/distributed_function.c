@@ -16,6 +16,7 @@
 #include "utils/planner_utils.h"
 #include "utils/helper_functions.h"
 #include <distributed/metadata_cache.h>
+#include <nodes/nodeFuncs.h>
 #include "distributed_functions/distributed_function.h"
 #include "general/general_types.h"
 #include "utils/builtins.h"
@@ -76,9 +77,35 @@ AddQOperation(Datum des, Datum cur)
 }
 
 /*
+ * ContainsAggrefWalker reports (via *found) whether expr contains an
+ * Aggref node anywhere in its tree, not just at the top level -- lets
+ * IsDistFunc recognize a genuine aggregate call even when composed inside
+ * another expression (e.g. `round(sum(length(Trip))::numeric, 2) AS
+ * length`), rather than only the exact `sum(length(Trip)) AS length` shape.
+ * The composing function(s) themselves need no special handling here: the
+ * downstream rewrite (RewriterDistFuncs) works by substituting resname's
+ * own text, not by re-deriving the expression's shape, so it's unaffected
+ * either way by what (if anything) wraps the Aggref -- this walker only
+ * decides whether a target entry is even worth handing to it.
+ */
+static bool
+ContainsAggrefWalker(Node *node, bool *found)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, Aggref))
+    {
+        *found = true;
+        return true;
+    }
+    return expression_tree_walker(node, ContainsAggrefWalker, found);
+}
+
+/*
  * IsDistFunc reports whether targetEntry is a genuine aggregate call (e.g.
- * `sum(length(Trip)) AS length`) whose result name matches a registered
- * distributed function's worker name.
+ * `sum(length(Trip)) AS length`, or that same call composed inside another
+ * expression, e.g. `round(sum(length(Trip))::numeric, 2) AS length`) whose
+ * result name matches a registered distributed function's worker name.
  *
  * The worker/combiner/final rewrite this feeds exists to recombine partial
  * per-tile results into one true total for a single (possibly
@@ -99,7 +126,9 @@ AddQOperation(Datum des, Datum cur)
 extern bool
 IsDistFunc(TargetEntry *targetEntry)
 {
-    if (!IsA(targetEntry->expr, Aggref))
+    bool containsAggref = false;
+    ContainsAggrefWalker((Node *) targetEntry->expr, &containsAggref);
+    if (!containsAggref)
         return false;
 
     ScanKeyData scanKey[1];
@@ -162,10 +191,25 @@ LookupDistFuncFinalOp(const char *workerFuncName)
 
 /*
  * LookupDistFuncCombinerOp mirrors LookupDistFuncFinalOp but returns the
- * registered "combiner" op instead (NULL if the catalog row has none --
- * every function in category1.sql today is a two-phase worker/final model
- * with no combiner). Used purely for EXPLAIN display, so the extra catalog
- * scan (vs folding this into LookupDistFuncFinalOp) doesn't matter.
+ * registered "combiner" column instead. Two-phase functions (worker/final
+ * only, e.g. length/sum, speed/merge) leave this NULL -- for those, EXPLAIN
+ * display is this value's only use.
+ *
+ * A non-NULL combiner instead names a real Postgres aggregate (registered
+ * via CREATE AGGREGATE, with its own SFUNC/COMBINEFUNC/FINALFUNC) that
+ * fully implements the function's own worker/combine/final recombination
+ * internally -- for these, this rewrite composes a call to the aggregate
+ * itself directly (BuildRecombinedFuncCall), rather than wrapping a bare
+ * per-row function call in a separate "final" op the way the two-phase
+ * case does; the "final" op has no meaning for a row like this and is left
+ * NULL. Needed for a function whose correct recombination isn't a single
+ * associative/commutative op applied to independently-meaningful
+ * per-fragment results (unlike sum/min/max/bool_or) -- e.g. a cumulative
+ * distance-over-time profile, where each subsequent fragment's own partial
+ * result has to be time-ordered and offset by every earlier fragment's
+ * running total before the pieces can be merged into one true value; see
+ * sql/distributed_functions/cumulative_length.sql for a full worked
+ * example of registering one.
  */
 extern char *
 LookupDistFuncCombinerOp(const char *workerFuncName)

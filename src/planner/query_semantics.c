@@ -27,6 +27,11 @@
 #include "distributed_functions/distributed_function.h"
 #include "general/rte.h"
 
+static char *BuildRecombinedFuncCall(const char *finalOp, const char *combinerOp, const char *funcName, const char *distCol);
+static bool ExtractDistFuncCore(Node *expr, List *rtable, STMultirelationCatalog *catalog,
+                                char **coreFuncName, char **coreFinalOp, char **coreCombinerOp,
+                                List **wrapperFuncNames);
+
 /*
  * TargetEntryReferencesGroupCol reports whether te's expression is a plain
  * Var referencing replicatedTable's own groupCol column (e.g. writing
@@ -99,6 +104,69 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
 }
 
 /*
+ * ExtractDistFuncCore walks a chain of nested unary function calls (e.g.
+ * `numinstants(cumulativelength(trip))`) down to its innermost call, looking
+ * for a registered distributed function invoked directly on catalog's own
+ * distCol at the bottom of the chain. Every function call encountered along
+ * the way down that isn't itself that bottom call is just a plain scalar
+ * wrapper meant to run against the bottom call's *combined* result, not a
+ * distributed function of its own -- e.g. numinstants() above only ever
+ * needs to see cumulativeLength's one true, already-reconstructed value,
+ * never a per-fragment partial one, so it must be applied after
+ * recombination rather than distributed itself.
+ *
+ * On success returns true and sets coreFuncName/coreFinalOp/coreCombinerOp
+ * to the bottom call's own registration (as looked up via
+ * LookupDistFuncFinalOp/LookupDistFuncCombinerOp) and wrapperFuncNames to
+ * the outer function names in innermost-to-outermost order -- i.e. the
+ * order to re-wrap them around the recombined core call in. Returns false
+ * (leaving the out-params untouched) for anything else: not a FuncExpr, more
+ * than one argument anywhere in the chain, or a Var at the bottom that isn't
+ * distCol or isn't itself registered.
+ */
+static bool
+ExtractDistFuncCore(Node *expr, List *rtable, STMultirelationCatalog *catalog,
+                    char **coreFuncName, char **coreFinalOp, char **coreCombinerOp,
+                    List **wrapperFuncNames)
+{
+    if (!IsA(expr, FuncExpr))
+        return false;
+
+    FuncExpr *funcExpr = (FuncExpr *) expr;
+    if (list_length(funcExpr->args) != 1)
+        return false;
+
+    char *funcName = get_func_name(funcExpr->funcid);
+    Node *arg = (Node *) linitial(funcExpr->args);
+
+    if (IsA(arg, Var))
+    {
+        Var *var = (Var *) arg;
+        RangeTblEntry *rte = rt_fetch(var->varno, rtable);
+        char *argColName = get_attname(rte->relid, var->varattno, false);
+        if (argColName == NULL || strcasecmp(argColName, catalog->distCol) != 0)
+            return false;
+
+        char *finalOp = LookupDistFuncFinalOp(funcName);
+        char *combinerOp = LookupDistFuncCombinerOp(funcName);
+        if (finalOp == NULL && combinerOp == NULL)
+            return false;
+
+        *coreFuncName = funcName;
+        *coreFinalOp = finalOp;
+        *coreCombinerOp = combinerOp;
+        *wrapperFuncNames = NIL;
+        return true;
+    }
+
+    if (!ExtractDistFuncCore(arg, rtable, catalog, coreFuncName, coreFinalOp, coreCombinerOp, wrapperFuncNames))
+        return false;
+
+    *wrapperFuncNames = lappend(*wrapperFuncNames, funcName);
+    return true;
+}
+
+/*
  * RewriteSegmentedDistFuncCalls detects a bare (non-aggregate) call to a
  * registered distributed function -- e.g. `length(trip)`, no sum()/
  * aggregate wrapper -- over a single shape-segmented distributed
@@ -149,7 +217,7 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  */
 extern char *
 RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList,
-                              char **explainNotesOut)
+                              char **explainNotesOut, char **postProcessingNotesOut)
 {
     if (tablesList == NULL || tablesList->length != 1)
         return NULL;
@@ -172,6 +240,7 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
 
     StringInfo selectList = makeStringInfo();
     StringInfo explainNotes = makeStringInfo();
+    List *postProcessingFuncNames = NIL;
     bool foundAny = false;
 
     ListCell *targetEntryCell = NULL;
@@ -207,35 +276,16 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
             continue;
         }
 
-        if (!IsA(targetEntry->expr, FuncExpr))
+        char *funcName = NULL;
+        char *finalOp = NULL;
+        char *combinerOp = NULL;
+        List *wrapperFuncNames = NIL;
+        if (!ExtractDistFuncCore((Node *) targetEntry->expr, parse->rtable, catalog,
+                                 &funcName, &finalOp, &combinerOp, &wrapperFuncNames))
             return NULL;
 
-        FuncExpr *funcExpr = (FuncExpr *) targetEntry->expr;
-        if (list_length(funcExpr->args) != 1 || !IsA(linitial(funcExpr->args), Var))
-            return NULL;
-
-        Var *arg = (Var *) linitial(funcExpr->args);
-        RangeTblEntry *rte = rt_fetch(arg->varno, parse->rtable);
-        char *argColName = get_attname(rte->relid, arg->varattno, false);
-        if (argColName == NULL || strcasecmp(argColName, catalog->distCol) != 0)
-            return NULL;
-
-        char *funcName = get_func_name(funcExpr->funcid);
-        char *finalOp = LookupDistFuncFinalOp(funcName);
-        if (finalOp == NULL)
-            return NULL;
-
-        char *combinerOp = LookupDistFuncCombinerOp(funcName);
-        if (explainNotes->len > 0)
-            appendStringInfoString(explainNotes, "\n");
-        appendStringInfo(explainNotes, "%s(%s): worker=%s, combiner=%s, final=%s",
-                         funcName, catalog->distCol, funcName,
-                         combinerOp != NULL ? combinerOp : "(none)", finalOp);
-
-        if (selectList->len > 0)
-            appendStringInfoString(selectList, ", ");
         /*
-         * Always wrapped in the registered final op (e.g. sum) -- NOT
+         * Always recombined via the registered final op -- NOT
          * conditioned on catalog->isMobilityDB the way this used to read.
          * The MobilityDB branch this replaced assumed a segmented
          * MobilityDB table's tiles hold full duplicate copies of each trip
@@ -251,10 +301,57 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
          * function's only prerequisite for reaching here at all is
          * catalog->segmentation being true (checked above), which is
          * exactly the condition under which the registered final op is a
-         * real aggregate over real partial values -- so it's always
-         * correct to wrap in it, regardless of isMobilityDB.
+         * real recombination over real partial values -- so it's always
+         * correct to recombine with it, regardless of isMobilityDB. See
+         * BuildRecombinedFuncCall for why the composition order itself
+         * depends on which kind of final op this particular function is
+         * registered with.
+         *
+         * wrapperFuncNames holds any plain scalar functions composed
+         * *around* the registered call (e.g. numinstants() around
+         * cumulativeLength()) -- applied here, in order, around the
+         * already-recombined core call, so they only ever see the trip's
+         * one true combined value rather than a per-fragment partial one.
+         * They're deliberately kept out of this call's own EXPLAIN line
+         * below (and out of the "Distributed functions" heading
+         * altogether): they're not registered distributed functions
+         * themselves and have no worker/combiner/final of their own to
+         * report -- folding them in there would misleadingly read as part
+         * of the *registered* function's own registration. Collected into
+         * postProcessingFuncNames instead, for its own "Post processing
+         * functions" heading further down.
          */
-        appendStringInfo(selectList, "%s(%s(%s)) as %s", finalOp, funcName, catalog->distCol,
+        char *recombined = BuildRecombinedFuncCall(finalOp, combinerOp, funcName, catalog->distCol);
+        ListCell *wrapperCell;
+        foreach(wrapperCell, wrapperFuncNames)
+        {
+            char *wrapperFuncName = (char *) lfirst(wrapperCell);
+            recombined = psprintf("%s(%s)", wrapperFuncName, recombined);
+
+            bool alreadyListed = false;
+            ListCell *seenCell;
+            foreach(seenCell, postProcessingFuncNames)
+            {
+                if (strcmp((char *) lfirst(seenCell), wrapperFuncName) == 0)
+                {
+                    alreadyListed = true;
+                    break;
+                }
+            }
+            if (!alreadyListed)
+                postProcessingFuncNames = lappend(postProcessingFuncNames, wrapperFuncName);
+        }
+
+        if (explainNotes->len > 0)
+            appendStringInfoString(explainNotes, "\n");
+        appendStringInfo(explainNotes, "%s(%s): worker=%s, combiner=%s, final=%s",
+                         funcName, catalog->distCol, funcName,
+                         combinerOp != NULL ? combinerOp : "(none)",
+                         finalOp != NULL ? finalOp : "(none)");
+
+        if (selectList->len > 0)
+            appendStringInfoString(selectList, ", ");
+        appendStringInfo(selectList, "%s as %s", recombined,
                          targetEntry->resname != NULL ? targetEntry->resname : funcName);
         foundAny = true;
     }
@@ -325,6 +422,18 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
                      selectList->data, core, catalog->groupCol, suffix);
     if (explainNotesOut != NULL)
         *explainNotesOut = explainNotes->data;
+    if (postProcessingNotesOut != NULL && postProcessingFuncNames != NIL)
+    {
+        StringInfo postProcessingNotes = makeStringInfo();
+        ListCell *nameCell;
+        foreach(nameCell, postProcessingFuncNames)
+        {
+            if (postProcessingNotes->len > 0)
+                appendStringInfoString(postProcessingNotes, ", ");
+            appendStringInfoString(postProcessingNotes, (char *) lfirst(nameCell));
+        }
+        *postProcessingNotesOut = postProcessingNotes->data;
+    }
     return newQuery->data;
 }
 
@@ -365,7 +474,8 @@ ReplicatedAggregateWalker(Node *node, ReplicatedAggregateSearch *search)
     {
         FuncExpr *funcExpr = (FuncExpr *) node;
         char *funcName = get_func_name(funcExpr->funcid);
-        if (funcName != NULL && LookupDistFuncFinalOp(funcName) != NULL)
+        if (funcName != NULL &&
+            (LookupDistFuncFinalOp(funcName) != NULL || LookupDistFuncCombinerOp(funcName) != NULL))
             search->foundDistFunc = true;
     }
     else if (IsA(node, Var))
@@ -406,6 +516,54 @@ ReplicatedAggregateWalker(Node *node, ReplicatedAggregateSearch *search)
  */
 
 /*
+ * BuildRecombinedFuncCall composes a registered distributed function's
+ * per-fragment calls back into one call over distCol's true, complete
+ * value. Three compositions exist, chosen by what's actually registered
+ * for funcName (LookupDistFuncFinalOp/LookupDistFuncCombinerOp), so this
+ * applies uniformly to any current or future registered function without
+ * any hardcoded per-function list:
+ *
+ * combinerOp set (a real Postgres aggregate, e.g. via CREATE AGGREGATE with
+ * its own SFUNC/COMBINEFUNC/FINALFUNC) -- the aggregate itself already
+ * knows how to recombine per-fragment partial state into the true value
+ * internally, so this just invokes it directly: "combinerOp(distCol)".
+ * finalOp is irrelevant here (typically NULL) and never consulted. Needed
+ * for a function whose correct recombination isn't a single op applied to
+ * independently-meaningful per-fragment results, and isn't just "reconstruct
+ * the source first" either -- e.g. a cumulative distance-over-time profile,
+ * whose per-fragment partial results have to be time-ordered and offset by
+ * every earlier fragment's own running total, not just concatenated or
+ * merged as-is.
+ *
+ * combinerOp unset, finalOp like sum/min/max/bool_or -- combines
+ * independently-correct per-fragment RESULTS: each fragment's own call
+ * already returns a meaningful partial answer (e.g. a fragment's own
+ * partial path length), and finalOp reduces those partial answers into the
+ * true total. Evaluating the function on each fragment first and combining
+ * its results afterward is exactly right: "finalOp(funcName(distCol))".
+ *
+ * combinerOp unset, finalOp "merge" -- the function itself has no
+ * meaningful per-fragment partial answer at all; it needs the *source*
+ * fragments reconstructed into the complete original value *before* it can
+ * run correctly. Evaluating such a function on each fragment independently
+ * and only merging the *results* afterward silently loses whatever it
+ * would have computed right at each tile boundary, since neither fragment
+ * alone ever sees both sides of it (a derivative-like computation over the
+ * boundary instant, for instance). For these, the source column itself is
+ * reconstructed first and the function runs once over that whole,
+ * reassembled value: "funcName(merge(distCol))".
+ */
+static char *
+BuildRecombinedFuncCall(const char *finalOp, const char *combinerOp, const char *funcName, const char *distCol)
+{
+    if (combinerOp != NULL)
+        return psprintf("%s(%s)", combinerOp, distCol);
+    if (strcmp(finalOp, "merge") == 0)
+        return psprintf("%s(merge(%s))", funcName, distCol);
+    return psprintf("%s(%s(%s))", finalOp, funcName, distCol);
+}
+
+/*
  * WrapDistColReference returns a copy of exprText with its first
  * identifier-boundary occurrence of distCol replaced by "merge(distCol)"
  * -- e.g. "trip" becomes "merge(trip)", "numinstants(trip)" becomes
@@ -439,34 +597,67 @@ WrapDistColReference(const char *exprText, const char *distCol)
 }
 
 /*
- * RewriteWhereClauseDistFuncCalls detects a bare (non-aggregate) call to a
- * registered distributed function used as a WHERE-clause filter -- e.g. a
- * distributed length function compared against a numeric threshold -- over
- * a single shape-segmented distributed spatiotemporal table. Evaluating
- * that per-fragment, the way a plain
- * pushdown would, is wrong: a trip split across several tiles has each
- * fragment see only part of the trajectory, so filtering each fragment
- * independently can both wrongly admit a trip whose *complete* value
- * doesn't actually pass the filter (e.g. one short fragment happens to
- * exceed a length threshold on its own) and wrongly exclude one whose
- * complete value does (no single fragment alone crosses the threshold, only
- * their sum) -- the same fragmentation problem RewriteSegmentedDistFuncCalls
- * fixes for the SELECT-list case, just triggered from the WHERE clause
- * instead.
+ * A single matched WHERE-clause conjunct: a bare call to a registered
+ * distributed function over the table's own distCol, compared against a
+ * constant. RewriteWhereClauseDistFuncCalls collects one of these per
+ * top-level AND-conjunct before building anything, so the whole rewrite
+ * can still bail out cleanly if a later conjunct doesn't match.
+ */
+typedef struct DistFuncFilterMatch
+{
+    char *funcName;
+    char *finalOp;    /* NULL when combinerOp is set instead -- see BuildRecombinedFuncCall */
+    char *combinerOp;
+    char *opName;
+    Const *constArg;
+    bool funcOnLeft;
+} DistFuncFilterMatch;
+
+/*
+ * RewriteWhereClauseDistFuncCalls detects one or more bare (non-aggregate)
+ * calls to registered distributed functions used as WHERE-clause filters --
+ * e.g. a distributed length function compared against a numeric threshold,
+ * possibly ANDed together with other such filters -- over a single
+ * shape-segmented distributed spatiotemporal table.
+ *
+ * A function registered with an additive final op (sum, min, max, bool_or)
+ * has a per-fragment result that's already independently meaningful --
+ * evaluating it per-fragment, the way a plain pushdown would, is wrong on
+ * its own: a trip split across several tiles has each fragment see only
+ * part of the trajectory, so filtering each fragment independently can
+ * both wrongly admit a trip whose *complete* value doesn't actually pass
+ * the filter and wrongly exclude one whose complete value does -- the same
+ * fragmentation problem RewriteSegmentedDistFuncCalls fixes for the
+ * SELECT-list case, just triggered from the WHERE clause instead. This
+ * rewrite recombines those into a proper per-group value first (via each
+ * function's own registered final op -- see BuildRecombinedFuncCall's own
+ * comment for why the composition differs by final op) and filters on
+ * that instead.
+ *
+ * A function registered with final op "merge" is deliberately left alone
+ * here, evaluated per-fragment exactly as a plain pushdown already would:
+ * unlike the additive case, reconstructing every fragment for every group
+ * just to filter on it is a real, measured cross-shard cost (one merge per
+ * distinct row identifier), and per-fragment filtering is accurate enough
+ * for this purpose even though the function's actual *value* still needs
+ * full reconstruction (which the SELECT-list case, RewriteSegmentedDistFunc
+ * Calls, still always does). See the matching loop below for exactly where
+ * this split happens.
  *
  * Rewritten into a two-level query: an inner query projecting the caller's
- * original plain (non-aggregate) target-list columns plus the function's
- * properly *combined* value (grouped by the table's own row identifier,
- * same worker/combiner/final technique as RewriteSegmentedDistFuncCalls),
- * and an outer query that filters on that combined value -- moving the
- * filter from a per-row WHERE to a post-combination one, effectively a
- * HAVING -- then re-projects the caller's original target list (so the
- * combined-value column never reaches the client), applying any of the
- * caller's own aggregates in the outer query, over the now-correctly-
- * filtered rows: a bare filtered projection, a plain count, and a distinct
- * count of the row identifier are all handled the same way, each getting
- * its own outer-query shape appropriate to what it originally asked for.
- * A caller's own aggregate is carried into the outer query as-is, and any
+ * original plain (non-aggregate) target-list columns plus each matched
+ * function's properly recombined value, one column per match (grouped by
+ * the table's own row identifier, same worker/combiner/final technique as
+ * RewriteSegmentedDistFuncCalls), and an outer query that filters on all of
+ * those recombined values, ANDed together -- moving the filter from a
+ * per-row WHERE to a post-combination one, effectively a HAVING -- then
+ * re-projects the caller's original target list (so the recombined-value
+ * columns never reach the client), applying any of the caller's own
+ * aggregates in the outer query, over the now-correctly-filtered rows: a
+ * bare filtered projection, a plain count, and a distinct count of the row
+ * identifier are all handled the same way, each getting its own
+ * outer-query shape appropriate to what it originally asked for. A
+ * caller's own aggregate is carried into the outer query as-is, and any
  * column it references (other than distCol -- see below) is pulled out
  * and projected into the inner query too, so the outer reference resolves;
  * safe despite the inner query's own GROUP BY groupCol, since groupCol is
@@ -475,18 +666,18 @@ WrapDistColReference(const char *exprText, const char *distCol)
  * aggregation or GROUP BY entry.
  *
  * Deliberately narrow, matching RewriteSegmentedDistFuncCalls's own scope
- * limits: single table, no join; the *entire* WHERE clause must be exactly
- * one comparison between a bare distfunc call over the table's distCol and
- * a constant (a combined WHERE clause would need its other conjuncts
- * relocated into the inner query's own WHERE, which this first version
- * doesn't attempt -- it bails out to NULL instead of risking a partially
- * wrong rewrite); no pre-existing GROUP BY/ORDER BY/HAVING (this rewrite
- * introduces its own); a caller's aggregate referencing distCol itself
- * (e.g. `count(distinct trip)`) bails out too -- the inner query's per-row
- * value for that column is one fragment's own value, not the trip's real
- * combined one, and this rewrite has no second combination layer to fix
- * that up. Returns NULL when the query doesn't match this shape -- the
- * caller falls back to whatever handling the query would otherwise get.
+ * limits: single table, no join; every top-level WHERE-clause conjunct must
+ * independently be exactly one comparison between a bare distfunc call over
+ * the table's distCol and a constant -- any conjunct that isn't recognized
+ * as that shape (a plain, non-distfunc filter mixed in, for instance) bails
+ * the whole rewrite out to NULL rather than risk relocating it incorrectly;
+ * no pre-existing GROUP BY/ORDER BY/HAVING (this rewrite introduces its
+ * own); a caller's aggregate referencing distCol itself bails out too --
+ * the inner query's per-row value for that column is one fragment's own
+ * value, not the trip's real combined one, and this rewrite has no second
+ * combination layer to fix that up. Returns NULL when the query doesn't
+ * match this shape -- the caller falls back to whatever handling the query
+ * would otherwise get.
  */
 extern char *
 RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultirelations *tablesList)
@@ -511,84 +702,18 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
         return NULL;
 
     List *whereClauseList = WhereClauseList(parse->jointree);
-    if (list_length(whereClauseList) != 1)
+    if (whereClauseList == NIL)
         return NULL;
-
-    Node *clause = (Node *) linitial(whereClauseList);
-    if (!IsA(clause, OpExpr))
-        return NULL;
-
-    OpExpr *opExpr = (OpExpr *) clause;
-    if (list_length(opExpr->args) != 2)
-        return NULL;
-
-    char *opName = get_opname(opExpr->opno);
-    if (opName == NULL)
-        return NULL;
-    bool isComparisonOp = strcmp(opName, "=") == 0 || strcmp(opName, "<>") == 0 ||
-                          strcmp(opName, "<") == 0 || strcmp(opName, "<=") == 0 ||
-                          strcmp(opName, ">") == 0 || strcmp(opName, ">=") == 0;
-    if (!isComparisonOp)
-        return NULL;
-
-    Node *leftArg = (Node *) linitial(opExpr->args);
-    Node *rightArg = (Node *) lsecond(opExpr->args);
-
-    FuncExpr *funcExpr;
-    Const *constArg;
-    bool funcOnLeft;
-    if (IsA(leftArg, FuncExpr) && IsA(rightArg, Const))
-    {
-        funcExpr = (FuncExpr *) leftArg;
-        constArg = (Const *) rightArg;
-        funcOnLeft = true;
-    }
-    else if (IsA(rightArg, FuncExpr) && IsA(leftArg, Const))
-    {
-        funcExpr = (FuncExpr *) rightArg;
-        constArg = (Const *) leftArg;
-        funcOnLeft = false;
-    }
-    else
-        return NULL;
-
-    if (constArg->constisnull)
-        return NULL;
-
-    if (list_length(funcExpr->args) != 1 || !IsA(linitial(funcExpr->args), Var))
-        return NULL;
-
-    Var *arg = (Var *) linitial(funcExpr->args);
-    RangeTblEntry *rte = rt_fetch(arg->varno, parse->rtable);
-    char *argColName = get_attname(rte->relid, arg->varattno, false);
-    if (argColName == NULL || strcasecmp(argColName, catalog->distCol) != 0)
-        return NULL;
-
-    char *funcName = get_func_name(funcExpr->funcid);
-    if (funcName == NULL)
-        return NULL;
-    char *finalOp = LookupDistFuncFinalOp(funcName);
-    if (finalOp == NULL)
-        return NULL;
-
-    /*
-     * Reproduced textually via the type's own output function plus an
-     * explicit cast, rather than trying to locate the constant's original
-     * source text in query_string -- robust regardless of how the constant
-     * was written (5000, '5000', a parameter that already got folded to a
-     * Const, etc.); the explicit ::type cast avoids the rewritten literal
-     * being parsed back with a different inferred type than the original
-     * (same reasoning as the STBOX-literal casts used elsewhere in this
-     * extension's dynamic SQL).
-     */
-    char *constText = DatumToString(constArg->constvalue, constArg->consttype);
-    char *constTypeName = format_type_be(constArg->consttype);
-    char *constTextWithCast = psprintf("%s::%s", constText, constTypeName);
 
     /*
      * Locate the SELECT list's own text span, same technique as
      * RewriteReplicatedAggregateQuery: skip leading whitespace, require
      * "select" (no DISTINCT/ALL -- not handled), everything up to " from ".
+     * Done before the WHERE-clause matching below (moved up from this
+     * rewrite's earlier, single-conjunct version) since locating the WHERE
+     * clause's own text span next needs fromKeyword already known, to
+     * scope the search past it the same way the final query assembly
+     * further down already does.
      */
     char *lowered = toLower((char *) query_string);
     char *cursor = lowered;
@@ -610,6 +735,170 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
 
     char *selectListText = TrimmedSubstring(query_string + selectListStart, query_string + selectListEnd);
     List *chunks = SplitTopLevelCommas(selectListText);
+
+    /*
+     * Locate the WHERE clause's own text span (scoped past fromKeyword,
+     * same as the final query assembly further down) and split it into
+     * per-conjunct text, positionally paired against whereClauseList's own
+     * parsed conjuncts below -- same "split text, pair positionally
+     * against the parsed list" technique the SELECT list's chunks above
+     * already use. Needed so a conjunct left as a plain per-fragment
+     * pushdown (the finalOp == "merge" case below) can be relocated into
+     * the inner query's own WHERE clause using its *original* text, rather
+     * than trying to deparse the parsed OpExpr back into SQL by hand
+     * (deparsing from this nested position has crashed the backend before
+     * -- see RewriteReplicatedAggregateQuery's own doc comment).
+     */
+    size_t whereSearchOffset = fromKeyword - lowered;
+    char *whereKeywordEarly = FindKeywordToken(lowered + whereSearchOffset, "where");
+    if (whereKeywordEarly == NULL)
+        return NULL;
+    size_t whereBodyOffset = (whereKeywordEarly - lowered) + strlen("where");
+    char *afterWhere = lowered + whereBodyOffset;
+    char *whereBodyEnd = FindTopLevelKeywordToken(afterWhere, "order by");
+    size_t whereBodyLen = (whereBodyEnd != NULL) ? (size_t) (whereBodyEnd - afterWhere) : strlen(afterWhere);
+    char *whereText = TrimmedSubstring(query_string + whereBodyOffset, query_string + whereBodyOffset + whereBodyLen);
+    size_t whereTextLen = strlen(whereText);
+    while (whereTextLen > 0 && (whereText[whereTextLen - 1] == ';' || isspace((unsigned char) whereText[whereTextLen - 1])))
+        whereText[--whereTextLen] = '\0';
+    List *whereConjunctTexts = SplitTopLevelConjuncts(whereText);
+    if (list_length(whereConjunctTexts) != list_length(whereClauseList))
+        return NULL;
+
+    /*
+     * One entry per top-level AND-conjunct, positionally paired against
+     * whereConjunctTexts above. A conjunct that doesn't match "bare
+     * distfunc call over distCol, compared against a constant" at all (a
+     * plain filter mixed in, a comparison against something other than a
+     * constant, etc.) bails the entire rewrite out, consistent with this
+     * function's existing conservative philosophy elsewhere. A conjunct
+     * that *does* match but whose function is registered with a "merge"
+     * final op is deliberately left as a plain per-fragment pushdown
+     * (passthroughConjunctTexts) instead of being pulled into the
+     * recombination machinery below -- unlike an additive final op (sum,
+     * min, max, bool_or), where a per-fragment result is already
+     * meaningful and simply needs combining, a "merge" function's
+     * per-fragment *filtering* usefulness doesn't require full source
+     * reconstruction the way computing its actual *value* does (the
+     * SELECT-list case, RewriteSegmentedDistFuncCalls, still always
+     * reconstructs first for that reason) -- and reconstructing every
+     * fragment for every group just to filter is a real, measured cost
+     * (cross-shard, one merge per distinct row identifier) this rewrite
+     * shouldn't force onto a query that doesn't need it.
+     */
+    List *matches = NIL;
+    List *passthroughConjunctTexts = NIL;
+    ListCell *clauseCell = list_head(whereClauseList);
+    ListCell *textCell = list_head(whereConjunctTexts);
+    while (clauseCell != NULL)
+    {
+        Node *clause = (Node *) lfirst(clauseCell);
+        char *conjunctText = (char *) lfirst(textCell);
+
+        if (!IsA(clause, OpExpr))
+            return NULL;
+
+        OpExpr *opExpr = (OpExpr *) clause;
+        if (list_length(opExpr->args) != 2)
+            return NULL;
+
+        char *opName = get_opname(opExpr->opno);
+        if (opName == NULL)
+            return NULL;
+        /*
+         * Not restricted to plain scalar comparisons: a registered
+         * function returning a temporal value (e.g. a distributed speed
+         * function producing a temporal float) is ordinarily compared via
+         * MobilityDB's own "ever"/"always" operators rather than a plain
+         * scalar one -- both families are accepted here uniformly; the AST
+         * shape check below (bare distfunc call vs. a constant) is what
+         * actually bounds this rewrite's scope, not the specific operator
+         * used.
+         */
+        bool isComparisonOp = strcmp(opName, "=") == 0 || strcmp(opName, "<>") == 0 ||
+                              strcmp(opName, "<") == 0 || strcmp(opName, "<=") == 0 ||
+                              strcmp(opName, ">") == 0 || strcmp(opName, ">=") == 0 ||
+                              strcmp(opName, "?=") == 0 || strcmp(opName, "?<>") == 0 ||
+                              strcmp(opName, "?<") == 0 || strcmp(opName, "?<=") == 0 ||
+                              strcmp(opName, "?>") == 0 || strcmp(opName, "?>=") == 0 ||
+                              strcmp(opName, "%=") == 0 || strcmp(opName, "%<>") == 0 ||
+                              strcmp(opName, "%<") == 0 || strcmp(opName, "%<=") == 0 ||
+                              strcmp(opName, "%>") == 0 || strcmp(opName, "%>=") == 0;
+        if (!isComparisonOp)
+            return NULL;
+
+        Node *leftArg = (Node *) linitial(opExpr->args);
+        Node *rightArg = (Node *) lsecond(opExpr->args);
+
+        FuncExpr *funcExpr;
+        Const *constArg;
+        bool funcOnLeft;
+        if (IsA(leftArg, FuncExpr) && IsA(rightArg, Const))
+        {
+            funcExpr = (FuncExpr *) leftArg;
+            constArg = (Const *) rightArg;
+            funcOnLeft = true;
+        }
+        else if (IsA(rightArg, FuncExpr) && IsA(leftArg, Const))
+        {
+            funcExpr = (FuncExpr *) rightArg;
+            constArg = (Const *) leftArg;
+            funcOnLeft = false;
+        }
+        else
+            return NULL;
+
+        if (constArg->constisnull)
+            return NULL;
+
+        if (list_length(funcExpr->args) != 1 || !IsA(linitial(funcExpr->args), Var))
+            return NULL;
+
+        Var *arg = (Var *) linitial(funcExpr->args);
+        RangeTblEntry *rte = rt_fetch(arg->varno, parse->rtable);
+        char *argColName = get_attname(rte->relid, arg->varattno, false);
+        if (argColName == NULL || strcasecmp(argColName, catalog->distCol) != 0)
+            return NULL;
+
+        char *funcName = get_func_name(funcExpr->funcid);
+        if (funcName == NULL)
+            return NULL;
+        char *finalOp = LookupDistFuncFinalOp(funcName);
+        char *combinerOp = LookupDistFuncCombinerOp(funcName);
+        if (finalOp == NULL && combinerOp == NULL)
+            return NULL;
+
+        /*
+         * Only the plain "merge" final op (no registered combinerOp) is
+         * left as a per-fragment passthrough -- see this function's own
+         * doc comment. A registered combinerOp (a real Postgres aggregate,
+         * e.g. cumulativeLength) never is: unlike a bare merge() of the
+         * source, its own worker/combine/final recombination is the only
+         * way to get a meaningful value out of it at all, so per-fragment
+         * filtering on it isn't just cheaper-but-approximate the way
+         * per-fragment speed filtering is -- it's simply wrong.
+         */
+        if (combinerOp == NULL && strcmp(finalOp, "merge") == 0)
+        {
+            passthroughConjunctTexts = lappend(passthroughConjunctTexts, conjunctText);
+        }
+        else
+        {
+            DistFuncFilterMatch *match = (DistFuncFilterMatch *) palloc(sizeof(DistFuncFilterMatch));
+            match->funcName = funcName;
+            match->finalOp = finalOp;
+            match->combinerOp = combinerOp;
+            match->opName = opName;
+            match->constArg = constArg;
+            match->funcOnLeft = funcOnLeft;
+            matches = lappend(matches, match);
+        }
+
+        clauseCell = lnext(whereClauseList, clauseCell);
+        textCell = lnext(whereConjunctTexts, textCell);
+    }
+    if (matches == NIL)
+        return NULL;
 
     StringInfo innerSelectList = makeStringInfo();
     StringInfo outerSelectList = makeStringInfo();
@@ -811,31 +1100,49 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
     }
 
     /*
-     * Always wrap in the registered final op and GROUP BY groupCol -- NOT
-     * conditioned on catalog->isMobilityDB the way RewriteSegmentedDistFunc
-     * Calls's SELECT-list rewrite is (its doc comment claims a
-     * segmented+isMobilityDB table's tiles hold full duplicate copies, so a
-     * plain unwrapped call plus DISTINCT ON suffices). Empirically false for
-     * a genuinely-clipped table (isMobilityDB=true, segmentation=true): its tiles
-     * hold genuinely disjoint, clipped fragments -- sum(length(trip)) GROUP
-     * BY tripid over it reproduces the true untiled length (confirmed
-     * against the source table to the available floating-point precision),
-     * while any single fragment's raw length() is far smaller. A DISTINCT
-     * ON here would silently filter on one arbitrary fragment's partial
-     * value instead of the trip's real one. RewriteSegmentedDistFuncCalls's
-     * own DISTINCT ON path likely has the same bug for this same data
-     * shape, but that's a pre-existing SELECT-list issue left alone here --
-     * out of scope for this WHERE-clause rewrite.
+     * Always recombined via each match's own registered final op and
+     * GROUP BY groupCol -- NOT conditioned on catalog->isMobilityDB the way
+     * RewriteSegmentedDistFuncCalls's SELECT-list rewrite is (its doc
+     * comment claims a segmented+isMobilityDB table's tiles hold full
+     * duplicate copies, so a plain unwrapped call plus DISTINCT ON
+     * suffices). Empirically false for a genuinely-clipped table
+     * (isMobilityDB=true, segmentation=true): its tiles hold genuinely
+     * disjoint, clipped fragments -- sum(length(trip)) GROUP BY tripid over
+     * it reproduces the true untiled length (confirmed against the source
+     * table to the available floating-point precision), while any single
+     * fragment's raw length() is far smaller. A DISTINCT ON here would
+     * silently filter on one arbitrary fragment's partial value instead of
+     * the trip's real one. RewriteSegmentedDistFuncCalls's own DISTINCT ON
+     * path likely has the same bug for this same data shape, but that's a
+     * pre-existing SELECT-list issue left alone here -- out of scope for
+     * this WHERE-clause rewrite. One recombined column per match, each
+     * under its own synthetic alias so the outer WHERE below can AND them
+     * together independently.
      */
-    StringInfo filterExpr = makeStringInfo();
-    appendStringInfo(filterExpr, "%s(%s(%s))", finalOp, funcName, catalog->distCol);
+    StringInfo innerFilterCols = makeStringInfo();
+    ListCell *matchCell;
+    int matchIdx = 0;
+    foreach(matchCell, matches)
+    {
+        DistFuncFilterMatch *match = (DistFuncFilterMatch *) lfirst(matchCell);
+        if (innerFilterCols->len > 0)
+            appendStringInfoString(innerFilterCols, ", ");
+        appendStringInfo(innerFilterCols, "%s as __dmdb_wc_filter_%d",
+                         BuildRecombinedFuncCall(match->finalOp, match->combinerOp, match->funcName, catalog->distCol),
+                         matchIdx);
+        matchIdx++;
+    }
 
     /*
      * Preserve the FROM clause text verbatim (same "find ' from '"
      * technique used throughout this file), stopping at the query's own
-     * WHERE keyword -- the single predicate this rewrite already extracted
-     * (confirmed above to be the *entire* WHERE clause) is what's being
-     * relocated, so nothing of it needs to survive into the inner query.
+     * WHERE keyword -- every conjunct this rewrite pulled into
+     * recombination (matches) is what's being relocated into the outer
+     * filter below, so none of *those* need to survive into the inner
+     * query; any passthrough conjunct (passthroughConjunctTexts) is
+     * spliced back into the inner query's own WHERE right below instead,
+     * unchanged, so it's still evaluated per-fragment exactly as a plain
+     * pushdown would.
      */
     size_t fromOffset = fromKeyword - lowered;
     char *loweredTail = lowered + fromOffset;
@@ -849,6 +1156,21 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
     while (fromTextLen > 0 && (fromText[fromTextLen - 1] == ';' || isspace((unsigned char) fromText[fromTextLen - 1])))
         fromText[--fromTextLen] = '\0';
 
+    StringInfo innerWhereClause = makeStringInfo();
+    if (passthroughConjunctTexts != NIL)
+    {
+        appendStringInfoString(innerWhereClause, " where ");
+        ListCell *ptCell;
+        bool firstPassthrough = true;
+        foreach(ptCell, passthroughConjunctTexts)
+        {
+            if (!firstPassthrough)
+                appendStringInfoString(innerWhereClause, " and ");
+            appendStringInfoString(innerWhereClause, (char *) lfirst(ptCell));
+            firstPassthrough = false;
+        }
+    }
+
     /*
      * innerSelectList can be empty -- e.g. a bare count(*) alongside a
      * distfunc-based WHERE filter has no plain column, only the aggregate
@@ -857,18 +1179,52 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
      */
     StringInfo innerQuery = makeStringInfo();
     if (innerSelectList->len > 0)
-        appendStringInfo(innerQuery, "select %s, %s as __dmdb_wc_filter %s group by %s",
-                         innerSelectList->data, filterExpr->data, fromText, catalog->groupCol);
+        appendStringInfo(innerQuery, "select %s, %s %s%s group by %s",
+                         innerSelectList->data, innerFilterCols->data, fromText,
+                         innerWhereClause->data, catalog->groupCol);
     else
-        appendStringInfo(innerQuery, "select %s as __dmdb_wc_filter %s group by %s",
-                         filterExpr->data, fromText, catalog->groupCol);
+        appendStringInfo(innerQuery, "select %s %s%s group by %s",
+                         innerFilterCols->data, fromText,
+                         innerWhereClause->data, catalog->groupCol);
+
+    /*
+     * Each match's recombined column is filtered against its own original
+     * constant/operator, ANDed together -- reproducing exactly what the
+     * original WHERE clause's own top-level AND already expressed, just
+     * evaluated post-recombination instead of per-fragment.
+     */
+    StringInfo outerWhere = makeStringInfo();
+    matchIdx = 0;
+    foreach(matchCell, matches)
+    {
+        DistFuncFilterMatch *match = (DistFuncFilterMatch *) lfirst(matchCell);
+        /*
+         * Reproduced textually via the type's own output function plus an
+         * explicit cast, rather than trying to locate the constant's
+         * original source text in query_string -- robust regardless of how
+         * the constant was written (5000, '5000', a parameter that already
+         * got folded to a Const, etc.); the explicit ::type cast avoids the
+         * rewritten literal being parsed back with a different inferred
+         * type than the original (same reasoning as the STBOX-literal
+         * casts used elsewhere in this extension's dynamic SQL).
+         */
+        char *constText = DatumToString(match->constArg->constvalue, match->constArg->consttype);
+        char *constTypeName = format_type_be(match->constArg->consttype);
+        char *constTextWithCast = psprintf("%s::%s", constText, constTypeName);
+        char *filterCol = psprintf("__dmdb_wc_filter_%d", matchIdx);
+
+        if (outerWhere->len > 0)
+            appendStringInfoString(outerWhere, " and ");
+        appendStringInfo(outerWhere, "%s %s %s",
+                         match->funcOnLeft ? filterCol : constTextWithCast,
+                         match->opName,
+                         match->funcOnLeft ? constTextWithCast : filterCol);
+        matchIdx++;
+    }
 
     StringInfo outerQuery = makeStringInfo();
-    appendStringInfo(outerQuery, "select %s from (%s) as dmdb_wc_sub where %s %s %s",
-                     outerSelectList->data, innerQuery->data,
-                     funcOnLeft ? "__dmdb_wc_filter" : constTextWithCast,
-                     opName,
-                     funcOnLeft ? constTextWithCast : "__dmdb_wc_filter");
+    appendStringInfo(outerQuery, "select %s from (%s) as dmdb_wc_sub where %s",
+                     outerSelectList->data, innerQuery->data, outerWhere->data);
 
     /*
      * ORDER BY (LIMIT/OFFSET too, if present) is carried over as raw text
