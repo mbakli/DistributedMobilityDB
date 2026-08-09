@@ -63,12 +63,13 @@ TargetEntryReferencesGroupCol(TargetEntry *te, Query *parse, STMultirelation *re
  * along a plain pass-through column such as a join key. So if the target
  * list mixes a registered function (e.g. length()) with any other column,
  * treating that function as distributed collapses the whole result down to
- * one aggregated row and silently drops every other column (e.g.
- * "SELECT t1.tripid, t2.tripid, length(t2.trip) FROM ... WHERE eIntersects(...)"
- * returned only length). Only engage the distributed-function rewrite when
- * every projected column is itself a registered function, matching the
- * single-aggregate queries (e.g. "SELECT sum(length(Trip)) FROM trips_50t")
- * it's actually designed for; otherwise leave the functions as plain
+ * one aggregated row and silently drops every other column (e.g. a
+ * distance-predicate join projecting both sides' row identifiers alongside
+ * a registered function call returned only the function's own result,
+ * dropping the identifiers). Only engage the distributed-function rewrite
+ * when every projected column is itself a registered function, matching
+ * the single-aggregate queries it's actually designed for; otherwise leave
+ * the functions as plain
  * per-row calls pushed down with the rest of the query.
  */
 extern void
@@ -102,13 +103,10 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * registered distributed function -- e.g. `length(trip)`, no sum()/
  * aggregate wrapper -- over a single shape-segmented distributed
  * spatiotemporal table, and returns a rewritten query string turning it
- * into an ordinary SQL grouped aggregate, e.g.:
- *
- *   select length(trip) from trips_50t
- *   -> select sum(length(trip)) as length from trips_50t group by tripid
- *
- * so Citus' own native distributed GROUP BY/aggregate pushdown -- already
- * proven correct for `sum(length(trip)) as length` without a GROUP BY --
+ * into an ordinary SQL grouped aggregate: the bare call is wrapped in the
+ * table's registered final op and a GROUP BY on the table's row identifier
+ * is added, so Citus' own native distributed GROUP BY/aggregate pushdown --
+ * already proven correct for a single aggregate with no GROUP BY --
  * combines each trip's per-tile fragments into one row per trip, instead
  * of every row silently collapsing into a single global total (see
  * IsDistFunc's comment for why a bare call collides with that mechanism in
@@ -119,7 +117,7 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * on that flag, using a plain unwrapped call + DISTINCT ON instead on the
  * theory that a segmented MobilityDB table's tiles hold full duplicate
  * copies of each trip rather than disjoint fragments. Empirically false
- * for at least trips_9t (isMobilityDB=true, segmentation=true): its tiles
+ * for a genuinely-clipped table (isMobilityDB=true, segmentation=true): its tiles
  * hold genuinely disjoint, clipped fragments -- sum(length(trip)) GROUP BY
  * tripid over it reproduces the true untiled length, while DISTINCT ON
  * would silently keep one arbitrary fragment's partial value instead. This
@@ -129,9 +127,9 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  *
  * GROUP BY doesn't require its key to be projected, so groupCol is never
  * added to the SELECT list on its own -- if the caller wants it in the
- * output (e.g. `select tripid, numinstants(trip) from t where tripid=312`,
- * to tell which trip a row belongs to when running an unfiltered query
- * over many trips), it must already be there in the original target list;
+ * output, to tell which trip a row belongs to when running an unfiltered
+ * query over many trips, it must already be there in the original target
+ * list;
  * an explicit reference to it is recognized and passed through as-is
  * rather than triggering a bail-out. Any *other* plain column reference
  * isn't something this rewrite knows how to group by safely, so it still
@@ -141,8 +139,8 @@ analyseSelectClause(List *targetList, PostProcessing *postProcessing)
  * Deliberately scoped to a single table with no join, and a target list
  * made up solely of bare distributed-function calls (plus, optionally, an
  * explicit groupCol reference) over that table's own spatiotemporal
- * column: that covers the reported bug ("select length(trip) from any
- * distributed table") without the complexity of a general
+ * column: that covers a bare distributed-function call over any
+ * distributed table without the complexity of a general
  * arbitrary-target-list/join rewrite. Returns NULL when there's nothing to
  * rewrite (not a single-table query, table isn't segmented, no groupCol on
  * record, the target list isn't purely bare distfunc calls over that
@@ -184,9 +182,9 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
             continue;
 
         /*
-         * A plain reference to the table's own group column (e.g. writing
-         * `SELECT tripid, numinstants(trip) FROM ...` explicitly, instead
-         * of relying on some implicit projection) is passed through as-is
+         * A plain reference to the table's own group column, projected
+         * explicitly alongside a distributed-function call rather than
+         * relying on some implicit projection, is passed through as-is
          * -- GROUP BY doesn't require its key to be projected at all, so
          * this rewrite never adds groupCol to the SELECT list on its own;
          * it only appears in the output if the caller's own target list
@@ -243,8 +241,8 @@ RewriteSegmentedDistFuncCalls(Query *parse, const char *query_string, STMultirel
          * MobilityDB table's tiles hold full duplicate copies of each trip
          * (shape_segmentation.sql's sequence/sequenceset branch doing a
          * bbox-overlap repack with no clipping), so a plain unwrapped call
-         * plus DISTINCT ON was enough to dedupe. Empirically false for at
-         * least trips_9t (isMobilityDB=true, segmentation=true): its tiles
+         * plus DISTINCT ON was enough to dedupe. Empirically false for a
+         * genuinely-clipped table (isMobilityDB=true, segmentation=true): its tiles
          * hold genuinely disjoint, clipped fragments -- sum(length(trip))
          * GROUP BY tripid over it reproduces the true untiled length
          * (confirmed against the source table to available floating-point
@@ -408,10 +406,44 @@ ReplicatedAggregateWalker(Node *node, ReplicatedAggregateSearch *search)
  */
 
 /*
+ * WrapDistColReference returns a copy of exprText with its first
+ * identifier-boundary occurrence of distCol replaced by "merge(distCol)"
+ * -- e.g. "trip" becomes "merge(trip)", "numinstants(trip)" becomes
+ * "numinstants(merge(trip))" -- so a caller expression that needs distCol's
+ * real, complete value (not one tile's own fragment) gets it by having the
+ * merge() reconstruction substituted in place of the bare reference, then
+ * runs unchanged over that reconstructed value. Returns NULL if distCol
+ * isn't found (bounded) anywhere in exprText.
+ *
+ * The search runs against a lowercased scratch copy purely to locate the
+ * identifier case-insensitively (FindIdentifierToken requires already-
+ * lowercased input); the returned copy preserves exprText's original
+ * casing outside of the substituted span, since lowering is a 1:1,
+ * length-preserving byte mapping so the same offset applies to both.
+ */
+static char *
+WrapDistColReference(const char *exprText, const char *distCol)
+{
+    char *lowered = toLower((char *) exprText);
+    char *loweredDistCol = toLower((char *) distCol);
+    char *pos = FindIdentifierToken(lowered, loweredDistCol);
+    if (pos == NULL)
+        return NULL;
+    size_t offset = pos - lowered;
+    size_t distColLen = strlen(distCol);
+    StringInfo result = makeStringInfo();
+    appendBinaryStringInfo(result, exprText, offset);
+    appendStringInfo(result, "merge(%.*s)", (int) distColLen, exprText + offset);
+    appendStringInfoString(result, exprText + offset + distColLen);
+    return result->data;
+}
+
+/*
  * RewriteWhereClauseDistFuncCalls detects a bare (non-aggregate) call to a
- * registered distributed function used as a WHERE-clause filter -- e.g.
- * `WHERE length(trip) > 5000` -- over a single shape-segmented distributed
- * spatiotemporal table. Evaluating that per-fragment, the way a plain
+ * registered distributed function used as a WHERE-clause filter -- e.g. a
+ * distributed length function compared against a numeric threshold -- over
+ * a single shape-segmented distributed spatiotemporal table. Evaluating
+ * that per-fragment, the way a plain
  * pushdown would, is wrong: a trip split across several tiles has each
  * fragment see only part of the trajectory, so filtering each fragment
  * independently can both wrongly admit a trip whose *complete* value
@@ -430,27 +462,10 @@ ReplicatedAggregateWalker(Node *node, ReplicatedAggregateSearch *search)
  * filter from a per-row WHERE to a post-combination one, effectively a
  * HAVING -- then re-projects the caller's original target list (so the
  * combined-value column never reaches the client), applying any of the
- * caller's own aggregates (e.g. count(*)) in the outer query, over the
- * now-correctly-filtered rows. E.g.:
- *
- *   select tripid from trips_50t where length(trip) > 5000
- *   -> select tripid from (
- *        select tripid as tripid, sum(length(trip)) as __dmdb_wc_filter
- *        from trips_50t group by tripid
- *      ) as dmdb_wc_sub where __dmdb_wc_filter > 5000::numeric
- *
- *   select count(*) from trips_50t where length(trip) > 5000
- *   -> select count(*) as count from (
- *        select sum(length(trip)) as __dmdb_wc_filter
- *        from trips_50t group by tripid
- *      ) as dmdb_wc_sub where __dmdb_wc_filter > 5000::numeric
- *
- *   select count(distinct tripid) from trips_50t where length(trip) > 5000
- *   -> select count(distinct tripid) as count from (
- *        select tripid as tripid, sum(length(trip)) as __dmdb_wc_filter
- *        from trips_50t group by tripid
- *      ) as dmdb_wc_sub where __dmdb_wc_filter > 5000::numeric
- *
+ * caller's own aggregates in the outer query, over the now-correctly-
+ * filtered rows: a bare filtered projection, a plain count, and a distinct
+ * count of the row identifier are all handled the same way, each getting
+ * its own outer-query shape appropriate to what it originally asked for.
  * A caller's own aggregate is carried into the outer query as-is, and any
  * column it references (other than distCol -- see below) is pulled out
  * and projected into the inner query too, so the outer reference resolves;
@@ -478,7 +493,12 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
 {
     if (tablesList == NULL || tablesList->length != 1)
         return NULL;
-    if (parse->groupClause != NIL || parse->sortClause != NIL || parse->havingQual != NULL)
+    /* A pre-existing GROUP BY/HAVING would conflict with the GROUP BY
+     * groupCol this rewrite introduces itself further below -- ORDER BY
+     * doesn't have that problem (handled separately, near the end, once
+     * the outermost query it needs to attach to actually exists) so it's
+     * not bailed out here. */
+    if (parse->groupClause != NIL || parse->havingQual != NULL)
         return NULL;
 
     Rte *rteNode = (Rte *) linitial(tablesList->tables);
@@ -598,6 +618,24 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
      * target entry already projects under its own alias) doesn't get
      * projected again under a second, redundant alias. */
     List *innerProjectedCols = NIL;
+    /*
+     * A target-list entry that plainly (non-aggregate) selects distCol
+     * itself, alongside a distfunc-based WHERE-clause filter, can't be
+     * satisfied by the two-level filtering query below the way
+     * any other column can: that query's per-row distCol value is only one
+     * tile's own fragment, never the row's true, complete value, and there
+     * is no fixing that up inside it. Such an entry is deferred out of the
+     * filtering query (mergeAliases records the alias(es) it needs to come
+     * back under) and satisfied by a third query layer instead: re-fetch
+     * every fragment for each qualifying groupCol value from the base
+     * table and run MobilityDB's own merge() aggregate over distCol,
+     * GROUP BY groupCol -- the same "reconstruct the true value from its
+     * tiles" idea sum(length(trip)) GROUP BY groupCol already applies to a
+     * derived scalar above, just applied to distCol itself instead of a
+     * number computed from it.
+     */
+    bool needsMerge = false;
+    StringInfo finalSelectList = makeStringInfo();
 
     ListCell *tlCell;
     ListCell *chunkCell = list_head(chunks);
@@ -615,6 +653,60 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
         chunkCell = lnext(chunks, chunkCell);
 
         /*
+         * A target-list entry -- aggregate or plain -- referencing distCol
+         * itself (directly or nested inside some other expression) can't be
+         * satisfied by the two-level filtering query below: its own per-row
+         * distCol value is only one tile's own fragment of a segmented row,
+         * never the row's true combined value.
+         *
+         * A bare or wrapped plain reference to distCol itself -- the common
+         * case: retrieving distCol's own true value, or something computed
+         * from it, for the rows that matched a distfunc-based filter -- is
+         * handled below by textually substituting merge(distCol) for
+         * distCol's own reference inside te's expression text
+         * (WrapDistColReference) and deferring that into a third query
+         * layer (see needsMerge below) -- this used to fall into the
+         * ordinary plain-entry branch further down, which projected te's
+         * text into the inner query as a bare column with no GROUP BY entry
+         * or aggregate wrapping it, producing an invalid "column ... must
+         * appear in the GROUP BY clause" query. An aggregate referencing
+         * distCol itself still bails out: the merge() layer only reconstructs
+         * distCol's own complete value, it doesn't know how to run an
+         * aggregate over that reconstruction in the same pass.
+         */
+        List *entryVars = pull_var_clause((Node *) te->expr,
+                                          PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS);
+        bool referencesDistCol = false;
+        ListCell *entryVarCell;
+        foreach(entryVarCell, entryVars)
+        {
+            Var *var = (Var *) lfirst(entryVarCell);
+            if (var->varno <= 0 || (int) var->varno > list_length(parse->rtable))
+                return NULL;
+            RangeTblEntry *varRte = rt_fetch(var->varno, parse->rtable);
+            if (varRte->rtekind != RTE_RELATION)
+                return NULL;
+            char *varColName = get_attname(varRte->relid, var->varattno, false);
+            if (varColName == NULL)
+                return NULL;
+            if (strcasecmp(varColName, catalog->distCol) == 0)
+                referencesDistCol = true;
+        }
+        if (referencesDistCol)
+        {
+            if (IsA(te->expr, Aggref))
+                return NULL;
+            char *wrapped = WrapDistColReference(chunkText, catalog->distCol);
+            if (wrapped == NULL)
+                return NULL;
+            needsMerge = true;
+            if (finalSelectList->len > 0)
+                appendStringInfoString(finalSelectList, ", ");
+            appendStringInfo(finalSelectList, "%s as %s", wrapped, te->resname);
+            continue;
+        }
+
+        /*
          * An aggregate belongs only in the outer query, over the inner
          * subquery's already-combined-and-filtered rows -- e.g. count(*)
          * needs to count qualifying trips, not run per-tripid-group inside
@@ -629,12 +721,6 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
          * groupCol is the table's own primary key, so Postgres's
          * functional-dependency rule lets any other same-table column be
          * projected without its own aggregation or GROUP BY entry.
-         *
-         * The one column this can't safely handle is distCol itself (e.g.
-         * `count(distinct trip)`): the inner query's per-row value for it
-         * is one fragment's own value, not the trip's real combined one,
-         * and this rewrite has no second combination layer to fix that up
-         * -- bail out rather than risk a plausible-looking wrong answer.
          */
         if (IsA(te->expr, Aggref))
         {
@@ -645,16 +731,8 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
             foreach(varCell, aggVars)
             {
                 Var *var = (Var *) lfirst(varCell);
-                if (var->varno <= 0 || (int) var->varno > list_length(parse->rtable))
-                    return NULL;
                 RangeTblEntry *varRte = rt_fetch(var->varno, parse->rtable);
-                if (varRte->rtekind != RTE_RELATION)
-                    return NULL;
                 char *varColName = get_attname(varRte->relid, var->varattno, false);
-                if (varColName == NULL)
-                    return NULL;
-                if (strcasecmp(varColName, catalog->distCol) == 0)
-                    return NULL;
 
                 bool alreadyProjected = false;
                 ListCell *projCell;
@@ -678,6 +756,9 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
             if (outerSelectList->len > 0)
                 appendStringInfoString(outerSelectList, ", ");
             appendStringInfo(outerSelectList, "%s as %s", chunkText, te->resname);
+            if (finalSelectList->len > 0)
+                appendStringInfoString(finalSelectList, ", ");
+            appendStringInfo(finalSelectList, "%s as %s", chunkText, te->resname);
             continue;
         }
 
@@ -688,9 +769,46 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
         if (outerSelectList->len > 0)
             appendStringInfoString(outerSelectList, ", ");
         appendStringInfoString(outerSelectList, te->resname);
+        /* finalSelectList re-derives this column fresh from the base table
+         * (fromText) in the merge query below rather than reusing te's
+         * chunkText verbatim -- safe since it's plain, non-distCol, and
+         * functionally dependent on groupCol just like it already is in the
+         * filtering query's own GROUP BY groupCol. */
+        if (finalSelectList->len > 0)
+            appendStringInfoString(finalSelectList, ", ");
+        appendStringInfo(finalSelectList, "%s as %s", chunkText, te->resname);
     }
-    if (chunkCell != NULL || outerSelectList->len == 0)
+    if (chunkCell != NULL || (outerSelectList->len == 0 && !needsMerge))
         return NULL;
+
+    /*
+     * needsMerge's filtering query only needs groupCol as a correlation
+     * key for the merge query's WHERE ... IN below -- add it if no target
+     * entry already projected it (the common case of projecting distCol
+     * alone, which has nothing else in outerSelectList at all).
+     */
+    if (needsMerge)
+    {
+        bool groupColAlreadyProjected = false;
+        ListCell *projCell;
+        foreach(projCell, innerProjectedCols)
+        {
+            if (strcasecmp((char *) lfirst(projCell), catalog->groupCol) == 0)
+            {
+                groupColAlreadyProjected = true;
+                break;
+            }
+        }
+        if (!groupColAlreadyProjected)
+        {
+            if (innerSelectList->len > 0)
+                appendStringInfoString(innerSelectList, ", ");
+            appendStringInfo(innerSelectList, "%s as %s", catalog->groupCol, catalog->groupCol);
+            if (outerSelectList->len > 0)
+                appendStringInfoString(outerSelectList, ", ");
+            appendStringInfoString(outerSelectList, catalog->groupCol);
+        }
+    }
 
     /*
      * Always wrap in the registered final op and GROUP BY groupCol -- NOT
@@ -698,7 +816,7 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
      * Calls's SELECT-list rewrite is (its doc comment claims a
      * segmented+isMobilityDB table's tiles hold full duplicate copies, so a
      * plain unwrapped call plus DISTINCT ON suffices). Empirically false for
-     * at least trips_9t (isMobilityDB=true, segmentation=true): its tiles
+     * a genuinely-clipped table (isMobilityDB=true, segmentation=true): its tiles
      * hold genuinely disjoint, clipped fragments -- sum(length(trip)) GROUP
      * BY tripid over it reproduces the true untiled length (confirmed
      * against the source table to the available floating-point precision),
@@ -732,10 +850,10 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
         fromText[--fromTextLen] = '\0';
 
     /*
-     * innerSelectList can be empty -- e.g. `SELECT count(*) FROM ... WHERE
-     * length(trip) > 5000` has no plain column, only the aggregate (routed
-     * to outerSelectList above) -- in which case a leading ", " would
-     * produce invalid SQL ("select , sum(...) as __dmdb_wc_filter ...").
+     * innerSelectList can be empty -- e.g. a bare count(*) alongside a
+     * distfunc-based WHERE filter has no plain column, only the aggregate
+     * (routed to outerSelectList above) -- in which case a leading ", "
+     * would produce invalid SQL (a comma with nothing before it).
      */
     StringInfo innerQuery = makeStringInfo();
     if (innerSelectList->len > 0)
@@ -751,38 +869,95 @@ RewriteWhereClauseDistFuncCalls(Query *parse, const char *query_string, STMultir
                      funcOnLeft ? "__dmdb_wc_filter" : constTextWithCast,
                      opName,
                      funcOnLeft ? constTextWithCast : "__dmdb_wc_filter");
-    return outerQuery->data;
+
+    /*
+     * ORDER BY (LIMIT/OFFSET too, if present) is carried over as raw text
+     * from the original query rather than rebuilt from parse->sortClause
+     * the way RewriteSegmentedDistFuncCalls does it further below -- that
+     * rebuild exists there because its own rewritten query's FROM clause
+     * differs from the original, so a sort key's original text may no
+     * longer resolve and has to be re-targeted at the rewrite's own
+     * aliases. This rewrite's outermost query (outerQuery/finalQuery)
+     * always queries fromText verbatim -- the exact same FROM-clause text,
+     * same table, same alias if any, as the original query -- so any
+     * column reference in the original ORDER BY resolves identically
+     * there, whether or not that column made it into the SELECT list
+     * (Postgres already allows ordering a GROUP BY query by any column
+     * functionally dependent on the grouping key, e.g. ordering by the
+     * table's own row identifier when groupCol is that same identifier --
+     * the common case this fixes: reproduced directly with a distfunc-based
+     * WHERE filter alongside an ORDER BY on the row identifier, which
+     * previously bailed out of this rewrite entirely on sortClause != NIL
+     * and fell back to RewriteSegmentedDistFuncCalls's WHERE-clause-blind
+     * handling instead, silently dropping trips whose complete value
+     * passes the filter but whose every individual fragment doesn't -- the
+     * same wrong-results class of bug this whole rewrite exists to fix,
+     * just re-opened by the sortClause bail-out). A sort key referencing
+     * distCol itself has no obviously correct single interpretation here
+     * (ordering by a whole reconstructed trajectory?) and bails out rather
+     * than guess.
+     */
+    StringInfo orderBySuffix = makeStringInfo();
+    if (parse->sortClause != NIL)
+    {
+        char *orderByKeyword = FindTopLevelKeywordToken(whereKeyword, "order by");
+        if (orderByKeyword == NULL)
+            return NULL;
+        size_t orderByOffset = orderByKeyword - lowered;
+        char *orderByText = pstrdup(query_string + orderByOffset);
+        size_t orderByLen = strlen(orderByText);
+        while (orderByLen > 0 && (orderByText[orderByLen - 1] == ';' || isspace((unsigned char) orderByText[orderByLen - 1])))
+            orderByText[--orderByLen] = '\0';
+        char *loweredOrderBy = toLower(orderByText);
+        if (FindIdentifierToken(loweredOrderBy, toLower(catalog->distCol)) != NULL)
+            return NULL;
+        appendStringInfo(orderBySuffix, " %s", orderByText);
+    }
+
+    if (!needsMerge)
+    {
+        appendStringInfoString(outerQuery, orderBySuffix->data);
+        return outerQuery->data;
+    }
+
+    /*
+     * outerQuery above only determines *which* groupCol values qualify --
+     * it was never asked to project distCol's real value (see the
+     * referencesDistCol check earlier). This third layer re-fetches every
+     * fragment for each qualifying groupCol value straight from the base
+     * table and merges them back into distCol's true, complete value,
+     * finally satisfying the caller's original target list -- finalSelectList
+     * already holds every entry (both the plain columns re-derived fresh
+     * here, functionally dependent on groupCol just like they already were
+     * in outerQuery, and each deferred distCol reference rewritten to its
+     * merge()-wrapped form by WrapDistColReference above).
+     */
+    StringInfo finalQuery = makeStringInfo();
+    appendStringInfo(finalQuery, "select %s %s where %s in (select %s from (%s) as dmdb_wc_qualifying) group by %s",
+                     finalSelectList->data,
+                     fromText,
+                     catalog->groupCol, catalog->groupCol, outerQuery->data,
+                     catalog->groupCol);
+    appendStringInfoString(finalQuery, orderBySuffix->data);
+    return finalQuery->data;
 }
 
 /*
- * RewriteReplicatedAggregateQuery detects an explicit aggregate (e.g.
- * `SUM(length(atTime(t.Trip, p.Period)))`) whose argument references both
- * a registered distributed function and a replicated table's column, and
- * rewrites the query into a two-level shape: an inner query that
- * DISTINCT-deduplicates on the replicated table's own row identifier
+ * RewriteReplicatedAggregateQuery detects an explicit aggregate (e.g. a sum
+ * of a registered distributed function's result) whose argument references
+ * both that registered distributed function and a replicated table's
+ * column, and rewrites the query into a two-level shape: an inner query
+ * that DISTINCT-deduplicates on the replicated table's own row identifier
  * (groupCol) before computing the aggregate's argument once per row, and
  * an outer query that applies the original aggregate/GROUP BY over that
- * already-deduplicated result, e.g.:
- *
- *   select l.licence, p.periodid, p.period, sum(length(atTime(t.trip, p.period))) as dist
- *   from trips_16t t, licences1 l, periods1 p
- *   where t.vehicleid = l.vehicleid and t.trip && p.period
- *   group by l.licence, p.periodid, p.period
- *   ->
- *   select licence, periodid, period, sum(agg_input) as dist
- *   from (
- *     select distinct tripid, l.licence as licence, p.periodid as periodid, p.period as period,
- *       length(atTime(t.trip, p.period)) as agg_input
- *     from trips_16t t, licences1 l, periods1 p
- *     where t.vehicleid = l.vehicleid and t.trip && p.period
- *   ) as dedup_agg
- *   group by licence, periodid, period
+ * already-deduplicated result.
  *
  * Without this, a row belonging to a trip replicated across N tiles
  * contributes to the SUM N times (once per tile) instead of once, silently
- * multiplying the result -- confirmed empirically comparing BerlinMOD Q8
- * against trips_16t vs. the non-distributed source table `trips` (~4.3x
- * inflated, matching how many tiles the affected trips' bboxes touch).
+ * multiplying the result -- confirmed empirically comparing this predicate
+ * shape against a distributed table vs. the non-distributed source table
+ * (~4.3x inflated, matching how many tiles the affected trips' bboxes
+ * touch).
  *
  * Deliberately narrow: only triggers when there's a GROUP BY (an
  * ungrouped, single-aggregate query is already handled correctly by
@@ -894,8 +1069,8 @@ RewriteReplicatedAggregateQuery(Query *parse, const char *query_string, STMultir
      * two different trips that happen to produce identical output on every
      * *other* projected column (e.g. same licence/period/length by
      * coincidence) -- but only added here if the caller's own target list
-     * doesn't already project it explicitly (e.g. `SELECT t.tripid, ...`);
-     * otherwise the inner subquery would end up with two same-named output
+     * doesn't already project it explicitly; otherwise the inner subquery
+     * would end up with two same-named output
      * columns, making that name ambiguous from the outer query.
      */
     bool groupColProjected = false;
@@ -966,16 +1141,15 @@ RewriteReplicatedAggregateQuery(Query *parse, const char *query_string, STMultir
         }
 
         /*
-         * Any *other* aggregate in the target list (e.g. a plain `count(*)`
+         * Any *other* aggregate in the target list (e.g. a plain count
          * alongside the replicated one this rewrite is handling) can't be
          * treated as a pass-through column the way a plain Var can: the code
          * below embeds te's raw SQL text into the inner query's own
-         * `SELECT DISTINCT ...` list, which has no GROUP BY at all --
+         * SELECT DISTINCT list, which has no GROUP BY at all --
          * mixing an aggregate into that list produces invalid SQL ("column
          * ... must appear in the GROUP BY clause or be used in an aggregate
-         * function", reproduced directly with
-         * `SELECT tile_key, count(*), sum(numInstants(trip)) FROM t GROUP BY
-         * tile_key` against a real segmented MobilityDB table). This
+         * function", reproduced directly against a real segmented
+         * MobilityDB table). This
          * function's own doc comment already scopes it to "only the first
          * qualifying Aggref found is rewritten" -- bailing out here when a
          * second, unrelated aggregate is present is consistent with that,
@@ -1122,7 +1296,7 @@ RewriteReplicatedAggregateQuery(Query *parse, const char *query_string, STMultir
     StringInfo innerQuery = makeStringInfo();
     /* fromWhereText already starts with "from " (see fromOffset above), so
      * no literal "from" is added here -- doing so produced "... from from
-     * trips_16t ..." as invalid SQL. */
+     * Trips ..." as invalid SQL. */
     appendStringInfo(innerQuery, "select distinct %s %s", innerSelectList->data, fromWhereText);
 
     StringInfo outerQuery = makeStringInfo();
@@ -1192,20 +1366,15 @@ FindCTEBodySpan(const char *query_string, const char *cteName, const char **body
 
 /*
  * RewriteReplicatedAggregateInCTEs generalizes RewriteReplicatedAggregateQuery
- * to reach *inside* a query's own CTEs -- e.g.
- *   WITH Distances AS (
- *     SELECT p.PeriodId, p.Period, t.VehicleId,
- *       SUM(length(atTime(t.Trip, p.Period))) AS Dist
- *     FROM trips_16t t, periods_ref p
- *     WHERE t.Trip && p.Period
- *     GROUP BY p.PeriodId, p.Period, t.VehicleId
- *   )
- *   SELECT PeriodId, Period, MAX(Dist) AS MaxDist FROM Distances
- *   GROUP BY PeriodId, Period ORDER BY PeriodId
- * has the exact same replication-overcounting problem as BerlinMOD Q8
- * (SUM(length(atTime(...))) over a replicated table, per-tile-copy
- * overcounted instead of deduplicated) -- just one level down, inside the
- * CTE, rather than at the top level. RewriteReplicatedAggregateQuery only
+ * to reach *inside* a query's own CTEs: a CTE whose own body computes a
+ * replicated-table aggregate (the same shape RewriteReplicatedAggregateQuery
+ * handles at the top level -- an aggregate over a registered distributed
+ * function's result, referencing a replicated table's column) has the exact
+ * same replication-overcounting problem, just one level down, inside the
+ * CTE, rather than at the top level, even when the outer query's own
+ * aggregate (e.g. a MAX over the CTE's own output column) has no
+ * distributed function call in sight from up there.
+ * RewriteReplicatedAggregateQuery only
  * ever looked at the top-level query's own targetList/groupClause, so it
  * never saw this shape at all (the top level's own aggregate, MAX(Dist),
  * takes a plain Var on the CTE's *output* column -- no distributed

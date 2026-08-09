@@ -137,6 +137,50 @@ SplitTopLevelCommas(const char *text)
 }
 
 /*
+ * SplitTopLevelConjuncts splits text on " and " keywords that are not
+ * nested inside parentheses, the same left-to-right/whitespace-trimmed
+ * chunking style as SplitTopLevelCommas but keyword- rather than
+ * character-based -- mirrors FindTopLevelKeywordToken's paren-depth and
+ * whitespace-boundary checks so "sandwich" or a parenthesized OR-group
+ * isn't misread as (or split at) a top-level "and".
+ */
+extern List *
+SplitTopLevelConjuncts(const char *text)
+{
+    List *chunks = NIL;
+    int depth = 0;
+    const char *chunkStart = text;
+    const char *p = text;
+    while (*p != '\0')
+    {
+        if (*p == '(')
+        {
+            depth++;
+            p++;
+        }
+        else if (*p == ')')
+        {
+            depth--;
+            p++;
+        }
+        else if (depth == 0 && strncmp(p, "and", 3) == 0 &&
+                 (p == text || isspace((unsigned char) p[-1])) &&
+                 isspace((unsigned char) p[3]))
+        {
+            chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
+            p += 3;
+            chunkStart = p;
+        }
+        else
+        {
+            p++;
+        }
+    }
+    chunks = lappend(chunks, TrimmedSubstring(chunkStart, p));
+    return chunks;
+}
+
+/*
  * extract_between returns a newly allocated copy of the substring of str
  * found strictly between markers p1 and p2, or NULL if either marker isn't
  * found (or allocation fails).
@@ -230,6 +274,30 @@ FindKeywordToken(const char *lowered, const char *keyword)
  * CTE body) for a keyword belonging to the outermost/final SELECT, such as
  * a trailing ORDER BY/LIMIT that applies to the query as a whole.
  */
+/*
+ * FindIdentifierToken finds the first case-insensitive occurrence of
+ * `identifier` in `lowered` bounded by non-identifier characters (or
+ * string start/end) on both sides -- see the header comment for why this
+ * differs from FindKeywordToken.
+ */
+extern char *
+FindIdentifierToken(const char *lowered, const char *identifier)
+{
+    size_t idLen = strlen(identifier);
+    const char *cursor = lowered;
+    while ((cursor = strstr(cursor, identifier)) != NULL)
+    {
+        bool precededByBoundary = (cursor == lowered) ||
+            !(isalnum((unsigned char) cursor[-1]) || cursor[-1] == '_');
+        bool followedByBoundary =
+            !(isalnum((unsigned char) cursor[idLen]) || cursor[idLen] == '_');
+        if (precededByBoundary && followedByBoundary)
+            return (char *) cursor;
+        cursor++;
+    }
+    return NULL;
+}
+
 extern char *
 FindTopLevelKeywordToken(const char *lowered, const char *keyword)
 {
