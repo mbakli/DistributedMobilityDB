@@ -233,6 +233,23 @@ BEGIN
         ELSIF tiling.internaltype in ('instant','point') THEN
             RAISE INFO 'Run-time for multirelation:%', (clock_timestamp() - start_time);
         END IF;
+        -- table_name_out itself was never indexed anywhere in this pipeline
+        -- -- only the reshuffled copy Neighbor Scan builds on demand gets a
+        -- GIST index, via IndexReshuffledData() in multi_phase_executor.c.
+        -- Colocation-strategy (Self Tiling Scan) queries run directly
+        -- against table_name_out, so without this they fall back to a full
+        -- unindexed cross-tile scan -- reproduced directly: a 392-row single
+        -- tile self-join ran ~10.5s unindexed, with EXPLAIN (ANALYZE)
+        -- confirming no index-based plan was even available (forcing
+        -- enable_seqscan=off still produced a Seq Scan). Same %I/gist
+        -- pattern stage_hash_distributed_source already uses for its own
+        -- staged copy (data_allocation.sql).
+        start_time := clock_timestamp();
+        EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING gist (%I)',
+                       concat(table_name_out, '_', tiling.distCol, '_gist_idx'), table_name_out, tiling.distCol);
+        EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I USING btree (%I)',
+                       concat(table_name_out, '_', tiling.groupCol, '_btree_idx'), table_name_out, tiling.groupCol);
+        RAISE INFO 'Run-time for indexing %:%', table_name_out, (clock_timestamp() - start_time);
     END IF;
     -- IF EXISTS: only crange's point-based preprocessing creates this _temp
     -- table; other methods' point-based support never creates it. Named

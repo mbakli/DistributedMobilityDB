@@ -52,6 +52,21 @@ extern char *FindKeywordToken(const char *lowered, const char *keyword);
  */
 extern char *FindTopLevelKeywordToken(const char *lowered, const char *keyword);
 
+/*
+ * Finds the first case-insensitive occurrence of `identifier` in `lowered`
+ * bounded by non-identifier characters (or string start/end) on both sides
+ * -- unlike FindKeywordToken, which only tolerates whitespace boundaries,
+ * this also treats punctuation immediately adjacent to the identifier
+ * (parens, commas, dots, operators, ...) as a valid boundary, needed to
+ * locate a bare column reference embedded in an expression like
+ * "numinstants(trip)" or "trip,othercol" where nothing separates it from
+ * what follows by whitespace. Also guards against matching inside a longer
+ * identifier that merely contains `identifier` as a substring (e.g.
+ * "roundtrip" when searching for "trip"). `lowered` must already be
+ * lowercased; `identifier` must already be lowercase.
+ */
+extern char *FindIdentifierToken(const char *lowered, const char *identifier);
+
 /* True if val is a NULL/zero Datum (no value set). */
 extern bool IsDatumEmpty(Datum val);
 
@@ -72,4 +87,12 @@ extern char *TrimmedSubstring(const char *start, const char *end);
  * `atTime(t.Trip, p.Period)`) as a top-level separator.
  */
 extern List *SplitTopLevelCommas(const char *text);
+
+/*
+ * Splits text on top-level " and " keywords (case-insensitive, not nested
+ * inside parentheses, whitespace-bounded) -- e.g. breaking a WHERE clause's
+ * text into one chunk per top-level conjunct, the way SplitTopLevelCommas
+ * breaks a SELECT list into one chunk per entry.
+ */
+extern List *SplitTopLevelConjuncts(const char *text);
 #endif /* HELPER_FUNCTIONS_H */

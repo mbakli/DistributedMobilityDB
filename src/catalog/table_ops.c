@@ -22,6 +22,7 @@
 #include <distributed/metadata_utility.h>
 #include <catalog/pg_extension.h>
 #include <utils/lsyscache.h>
+#include <utils/builtins.h>
 #include <executor/spi.h>
 #include <access/genam.h>
 
@@ -138,7 +139,6 @@ GetSpatiotemporalCol(Oid relationId)
 {
     int spi_result;
     bool isNull = false;
-    char *result = NULL;
     /* Connect */
     spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
@@ -152,18 +152,33 @@ GetSpatiotemporalCol(Oid relationId)
                      get_rel_name(relationId));
 
     spi_result = SPI_execute(catalogQuery->data, true, 1);
-    /* Same bug as DistributedColumnType above (and already fixed in GetLocalIndex/GetShapeCol
-     * below): a stale/mismatched relationId<->tableName lookup legitimately returns zero rows,
-     * and SPI_tuptable->vals[0] must not be read in that case -- confirmed under gdb, SIGSEGV
-     * inside SPI_getbinval, reached from here via analyzeDistributedSpatiotemporalTables ->
-     * GetMultirelationInfo on every query against a table this lookup failed to match. */
-    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+    /*
+     * A stale/mismatched relationId<->tableName lookup legitimately returns zero rows here --
+     * SPI_tuptable->vals[0] must not be read in that case (SIGSEGV inside SPI_getbinval,
+     * reproduced under gdb, reached from here via analyzeDistributedSpatiotemporalTables ->
+     * GetMultirelationInfo on every query against a table this lookup failed to match).
+     *
+     * SPI_copytuple (unlike DatumToString/SPI_getvalue) allocates in the context that was
+     * current before SPI_connect(), so row/rowDescriptor stay valid past SPI_finish() --
+     * rendering the actual C string via DatumToString is deferred until after SPI_finish()
+     * below (mirroring GetRandomTileId/GetDBName in nodes.c) so it isn't palloc'd inside the
+     * SPI-owned context SPI_finish() is about to delete. Calling DatumToString before
+     * SPI_finish() (as this used to) returned a pointer into memory freed the instant
+     * SPI_finish() ran -- reproduced in practice: multirelation->col (this function's result,
+     * stored by GetMultirelationInfo) read back as garbage bytes by the time it was used much
+     * later at execution time in IndexReshuffledData, formatted straight into a CREATE INDEX
+     * statement ("CREATE INDEX ..._idx on ... USING GIST(<garbage>)").
+     */
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    Datum distcol = (Datum) 0;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
     {
-        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
-        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
-        Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
-        if (!isNull)
-            result = DatumToString(distcol, TEXTOID);
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
+        distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
+        found = !isNull;
     }
     /* Always paired with SPI_connect() above -- the previous version returned NULL directly on a
      * non-SPI_OK_SELECT result without ever calling this, leaking the SPI connection. */
@@ -172,7 +187,9 @@ GetSpatiotemporalCol(Oid relationId)
     {
         elog(ERROR, "Could not disconnect from database using SPI");
     }
-    return result;
+    if (!found)
+        return NULL;
+    return DatumToString(distcol, TEXTOID);
 }
 
 /*
@@ -213,9 +230,17 @@ IsDistributedSpatiotemporalTable(Oid relationId)
 extern char *
 GetLocalIndex(Oid relationId, char * col)
 {
+    /* col is NULL for any table with no shape/geometry column (GetShapeCol's
+     * legitimate "no such column" result) -- there can be no shape index to
+     * look up in that case. Without this check, the NULL flowed straight
+     * into the query text below via %s, which glibc renders as the literal
+     * string "(null)" rather than a real column name, producing a query
+     * that always fails ("attname = '(null)'" never matches). */
+    if (col == NULL)
+        return NULL;
+
     int spi_result;
     bool isNull = false;
-    char *result = NULL;
     /* Connect */
     spi_result = SPI_connect();
     if (spi_result != SPI_OK_CONNECT)
@@ -225,6 +250,12 @@ GetLocalIndex(Oid relationId, char * col)
 
     /* Execute the query, noting the readonly status of this SQL */
     StringInfo catalogQuery = makeStringInfo();
+    /* Schema-qualified: get_rel_name() alone returns the bare table name,
+     * so the '%s'::regclass cast below silently failed to resolve any
+     * table living outside search_path (e.g. dist_mobilitydb.*) with
+     * "relation ... does not exist" -- even though the table exists. */
+    char *qualifiedName = quote_qualified_identifier(
+        get_namespace_name(get_rel_namespace(relationId)), get_rel_name(relationId));
     appendStringInfo(catalogQuery, "select ic.relname as index_name\n"
                                    "        from pg_index ix\n"
                                    "join pg_class ic on ix.indexrelid = ic.oid\n"
@@ -232,26 +263,44 @@ GetLocalIndex(Oid relationId, char * col)
                                    "where ix.indrelid = '%s'::regclass\n"
                                    "        and attname = '%s'\n"
                                    "        and not ix.indisunique;",
-                     get_rel_name(relationId), col);
+                     qualifiedName, col);
 
     spi_result = SPI_execute(catalogQuery->data, true, 1);
     /* A table with no qualifying (non-unique) index legitimately returns zero
      * rows here -- reading SPI_tuptable->vals[0] in that case dereferences
-     * past the (empty) result set. */
-    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+     * past the (empty) result set.
+     *
+     * ic.relname is Postgres' `name` type: a fixed NAMEDATALEN-byte,
+     * NUL-padded array with no varlena length header, stored by reference --
+     * unlike a genuine text/varlena Datum, SPI_getbinval's raw pointer for
+     * it already IS a plain C string, which is why the original
+     * `result = (char *) localIndex;` raw cast happened to render correctly.
+     * It's still rendered through DatumToString(..., NAMEOID) here (not
+     * TEXTOID -- textout expects a varlena length header this data doesn't
+     * have, and would misread it) purely so the extraction follows the same
+     * deferred-until-after-SPI_finish() pattern as GetSpatiotemporalCol
+     * above, rather than relying on the caller knowing `name`'s raw Datum
+     * already happens to be directly usable.
+     */
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    Datum localIndex = (Datum) 0;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
     {
-        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
-        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
-        Datum localIndex = SPI_getbinval(row, rowDescriptor, 1, &isNull);
-        if (!isNull)
-            result = (char *) localIndex;
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
+        localIndex = SPI_getbinval(row, rowDescriptor, 1, &isNull);
+        found = !isNull;
     }
     spi_result = SPI_finish();
     if (spi_result != SPI_OK_FINISH)
     {
         elog(ERROR, "Could not disconnect from database using SPI");
     }
-    return result;
+    if (!found)
+        return NULL;
+    return DatumToString(localIndex, NAMEOID);
 }
 
 /*
@@ -279,20 +328,30 @@ GetShapeCol(Oid relationId)
     /* Read back the PROJ text. getDistributedCol() legitimately returns
      * NULL for a plain (non-spatiotemporal) table, e.g. a reference table
      * joined alongside a distributed one -- calling DatumToString on that
-     * NULL Datum crashed instead of just reporting "no shape column". */
-    char *result = NULL;
-    if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+     * NULL Datum crashed instead of just reporting "no shape column".
+     *
+     * DatumToString itself is deferred until after SPI_finish() below (see
+     * the matching comment in GetSpatiotemporalCol above) -- calling it
+     * while still connected palloc's its rendered string inside the
+     * SPI-owned context that SPI_finish() deletes, leaving a dangling
+     * pointer as this function's result. */
+    HeapTuple row = NULL;
+    TupleDesc rowDescriptor = NULL;
+    Datum distcol = (Datum) 0;
+    bool found = (spi_result == SPI_OK_SELECT && SPI_processed > 0);
+    if (found)
     {
-        TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
-        HeapTuple row = SPI_copytuple(SPI_tuptable->vals[0]);
-        Datum distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
-        if (!isNull)
-            result = DatumToString(distcol, TEXTOID);
+        row = SPI_copytuple(SPI_tuptable->vals[0]);
+        rowDescriptor = SPI_tuptable->tupdesc;
+        distcol = SPI_getbinval(row, rowDescriptor, 1, &isNull);
+        found = !isNull;
     }
     spi_result = SPI_finish();
     if (spi_result != SPI_OK_FINISH)
     {
         elog(ERROR, "Could not disconnect from database using SPI");
     }
-    return result;
+    if (!found)
+        return NULL;
+    return DatumToString(distcol, TEXTOID);
 }

@@ -153,5 +153,45 @@ CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions(
 );
 ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_dist_functions
 SET SCHEMA pg_catalog;
+
+-- Tracks, per (base table, distance threshold), the row count the
+-- reshuffled/colocated table (built by createReshuffledTable/ColocateRte in
+-- multi_phase_executor.c) was last copied from. A real (non-EXPLAIN)
+-- NonColocation-strategy query used to drop/recreate/re-copy/re-index that
+-- whole table on every single execution, even back-to-back against an
+-- unchanged base table -- measured as 48s of a 175s total run against a
+-- 69,839-row table. Before paying that cost again, the executor re-counts
+-- the base table (cheap: a parallel per-shard COUNT(*)) and compares it
+-- against base_row_count here; a match means the base table hasn't
+-- grown/shrunk since, so the existing reshuffled table is reused as-is.
+-- This is a row-count fingerprint, not a full content hash: it catches
+-- size-changing INSERT/DELETE workloads (this project's actual usage
+-- pattern -- a table built once via create_spatiotemporal_distributed_table,
+-- then queried repeatedly) but not a same-row-count in-place UPDATE.
+--
+-- distance is part of the key, not an afterthought: for a distance
+-- predicate (eDwithin/etc), DistanceReshufflingPlan (planner_strategies.c)
+-- bakes the query's own distance threshold directly into the tile-pairing
+-- query that decides which rows get duplicated across tile boundaries --
+-- two queries against the same base table with different thresholds need
+-- genuinely different reshuffled tables. Keying the cache on base_table_oid
+-- alone (as a first version of this cache did) would let a later query with
+-- a larger threshold silently reuse a table built for a smaller one and
+-- miss cross-tile matches it should have found. -1 is the sentinel for "not
+-- a distance predicate" (OtherReshufflingPlan, e.g. plain intersection --
+-- its reshuffling doesn't depend on any distance value at all), kept
+-- distinct from a real, legitimate eDwithin(..., 0) threshold.
+CREATE TABLE dist_mobilitydb.pg_dist_spatiotemporal_reshuffle_cache(
+    base_table_oid oid NOT NULL,
+    distance double precision NOT NULL DEFAULT -1,
+    reshuffled_table text NOT NULL,
+    base_row_count bigint NOT NULL,
+    cached_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (base_table_oid, distance)
+);
+
+ALTER TABLE dist_mobilitydb.pg_dist_spatiotemporal_reshuffle_cache
+SET SCHEMA pg_catalog;
+
 ALTER TYPE dist_mobilitydb.tiling
 SET SCHEMA pg_catalog;
